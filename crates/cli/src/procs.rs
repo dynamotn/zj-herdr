@@ -65,9 +65,11 @@ pub fn pane_from_env<'a>(vars: impl IntoIterator<Item = (&'a str, &'a str)>) -> 
 
 /// Pick the agent processes out of a process table.
 ///
-/// A process whose ancestor is an agent of the same kind is a helper of that
-/// agent (Codex's node launcher starts the native binary, for instance) and
-/// is folded into it rather than listed twice.
+/// A process whose direct parent is a script launcher of the same kind is
+/// that launcher's native helper (Codex's node launcher starts the native
+/// binary, for instance) and is folded into it rather than listed twice.
+/// Any other agent below an agent, such as one started by another agent's
+/// shell tool, is an agent in its own right and is listed.
 pub fn find_agents(procs: &[RawProc], self_pid: u32, sampled_at: u64) -> Vec<ProcInfo> {
     let by_pid: HashMap<u32, &RawProc> = procs.iter().map(|p| (p.pid, p)).collect();
     let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
@@ -93,7 +95,14 @@ pub fn find_agents(procs: &[RawProc], self_pid: u32, sampled_at: u64) -> Vec<Pro
     let mut found: Vec<ProcInfo> = kinds
         .iter()
         .filter(|(pid, spec)| {
-            !ancestors(**pid).any(|a| kinds.get(&a).is_some_and(|k| k.kind == spec.kind))
+            let parent = by_pid[pid].ppid.filter(|pp| pp != *pid);
+            let helper = parent.is_some_and(|pp| {
+                kinds.get(&pp).is_some_and(|k| k.kind == spec.kind)
+                    && by_pid
+                        .get(&pp)
+                        .is_some_and(|p| agents::is_script_launcher(&p.name, &p.argv))
+            });
+            !helper
         })
         .map(|(&pid, &spec)| {
             let p = by_pid[&pid];
@@ -270,6 +279,19 @@ mod tests {
         let found = find_agents(&[launcher, native], 999, 0);
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].pid, 10);
+    }
+
+    #[test]
+    fn lists_agents_started_by_other_agents() {
+        let outer = proc(10, 1, &["claude"]);
+        let shell = proc(11, 10, &["/bin/zsh", "-c", "claude -p hi"]);
+        let inner = proc(12, 11, &["claude", "-p", "hi"]);
+        let direct = proc(13, 10, &["claude", "-p", "again"]);
+        let codex = proc(20, 1, &["codex"]);
+        let sub_codex = proc(21, 20, &["codex", "exec", "x"]);
+        let found = find_agents(&[outer, shell, inner, direct, codex, sub_codex], 999, 0);
+        let pids: Vec<u32> = found.iter().map(|p| p.pid).collect();
+        assert_eq!(pids, vec![10, 12, 13, 20, 21]);
     }
 
     #[test]

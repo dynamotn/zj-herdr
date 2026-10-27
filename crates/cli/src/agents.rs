@@ -108,6 +108,13 @@ fn is_interpreter(name: &str) -> bool {
     })
 }
 
+/// Whether the process is an interpreter running a script (`node .../codex`)
+/// rather than a native binary. Such a script may hand off to a native
+/// helper of its own kind.
+pub fn is_script_launcher(name: &str, argv: &[String]) -> bool {
+    is_interpreter(name) || argv.first().is_some_and(|a| is_interpreter(a))
+}
+
 /// Identify an agent from a process name, executable path and argv.
 pub fn identify(name: &str, exe: Option<&str>, argv: &[String]) -> Option<&'static AgentSpec> {
     if let Some(spec) = by_name(name).or_else(|| exe.and_then(by_name)) {

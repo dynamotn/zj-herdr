@@ -164,7 +164,8 @@ impl Registry {
 
     /// Block until the agent matching `selector` is in `state`. Selectors
     /// like `dev:3` or a pid can match on several machines; agents on
-    /// `local` win.
+    /// `local` win. The last known state of an agent on an unreachable
+    /// machine is stale, so it never satisfies a wait.
     pub fn wait_for(
         &self,
         selector: &str,
@@ -172,20 +173,23 @@ impl Registry {
         timeout: Option<Duration>,
         local: &str,
     ) -> Result<Agent, String> {
-        let deadline = timeout.map(|t| Instant::now() + t);
+        // A deadline past what `Instant` can hold is no deadline at all.
+        let deadline = timeout.and_then(|t| Instant::now().checked_add(t));
         let mut inner = self.lock();
         loop {
             let mut matches = inner
                 .machines
                 .iter()
-                .flat_map(|m| &m.agents)
-                .filter(|a| a.matches(selector));
+                .flat_map(|m| m.agents.iter().map(move |a| (a, m.status)))
+                .filter(|(a, _)| a.matches(selector));
             let first = matches.next();
             let found = first
-                .filter(|a| a.machine == local)
-                .or_else(|| matches.find(|a| a.machine == local))
+                .filter(|(a, _)| a.machine == local)
+                .or_else(|| matches.find(|(a, _)| a.machine == local))
                 .or(first);
-            if let Some(agent) = found.filter(|a| a.state == state) {
+            if let Some((agent, _)) =
+                found.filter(|(a, status)| a.state == state && *status == MachineStatus::Ok)
+            {
                 return Ok(agent.clone());
             }
             inner = match deadline {
@@ -193,8 +197,13 @@ impl Registry {
                 Some(d) => {
                     let left = d.saturating_duration_since(Instant::now());
                     if left.is_zero() {
-                        let now =
-                            found.map_or("not found".to_string(), |a| format!("is {}", a.state));
+                        let now = match found {
+                            None => "not found".to_string(),
+                            Some((a, MachineStatus::Unreachable)) => {
+                                format!("was {} when {} became unreachable", a.state, a.machine)
+                            }
+                            Some((a, MachineStatus::Ok)) => format!("is {}", a.state),
+                        };
                         return Err(format!(
                             "timed out waiting for {selector} to be {state} (it {now})"
                         ));
@@ -342,6 +351,49 @@ mod tests {
             .wait_for("7", AgentState::Idle, Some(Duration::from_millis(30)), "m")
             .unwrap_err();
         assert!(err.contains("is working"), "{err}");
+    }
+
+    #[test]
+    fn wait_ignores_stale_state_on_unreachable_machines() {
+        let reg = Arc::new(Registry::default());
+        let far = |state| {
+            let mut a = agent(7, state, 0);
+            a.machine = "far".into();
+            a.id = Agent::make_id("far", 7);
+            Machine {
+                name: "far".into(),
+                ..machine(vec![a])
+            }
+        };
+        reg.publish(far(AgentState::Idle), 0);
+        reg.mark_unreachable(far(AgentState::Idle), "timeout".into());
+        let err = reg
+            .wait_for(
+                "far/7",
+                AgentState::Idle,
+                Some(Duration::from_millis(30)),
+                "m",
+            )
+            .unwrap_err();
+        assert!(err.contains("unreachable"), "{err}");
+
+        let waiter = {
+            let reg = Arc::clone(&reg);
+            std::thread::spawn(move || {
+                reg.wait_for("far/7", AgentState::Idle, Some(Duration::from_secs(5)), "m")
+            })
+        };
+        std::thread::sleep(Duration::from_millis(50));
+        reg.publish(far(AgentState::Idle), 1);
+        assert_eq!(waiter.join().unwrap().unwrap().machine, "far");
+    }
+
+    #[test]
+    fn wait_survives_huge_timeouts() {
+        let reg = Registry::default();
+        reg.publish(machine(vec![agent(1, AgentState::Idle, 0)]), 0);
+        let got = reg.wait_for("m/1", AgentState::Idle, Some(Duration::MAX), "m");
+        assert_eq!(got.unwrap().pid, 1);
     }
 
     #[test]

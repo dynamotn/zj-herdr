@@ -10,7 +10,7 @@ use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::Duration;
 
-use zj_herdr_core::{prompt_reply, PluginCommand, CMD_SCHEMA};
+use zj_herdr_core::{prompt_reply, AgentState, PluginCommand, CMD_SCHEMA};
 
 use crate::api::{self, Request, Response};
 use crate::paths;
@@ -162,12 +162,13 @@ pub fn respond(ctx: &Context, req: Request) -> Response {
             state,
             timeout,
         } => {
-            match ctx.registry.wait_for(
-                &agent,
-                state,
-                timeout.map(Duration::from_secs_f64),
-                &ctx.machine,
-            ) {
+            let timeout = match timeout.map(Duration::try_from_secs_f64).transpose() {
+                Ok(t) => t,
+                Err(_) => {
+                    return Response::error("timeout must be a non-negative number of seconds")
+                }
+            };
+            match ctx.registry.wait_for(&agent, state, timeout, &ctx.machine) {
                 Ok(agent) => Response {
                     agent: Some(agent),
                     ..Response::ok()
@@ -199,13 +200,20 @@ pub fn respond(ctx: &Context, req: Request) -> Response {
 
 fn prompt(ctx: &Context, selector: &str, mut text: String, submit: bool) -> Result<(), String> {
     // Pane selectors like `dev:3` can exist on several machines; mean ours.
-    let matches = ctx.registry.find_all(selector);
+    // An exited agent is kept as `done` for a while, but its pane may now
+    // hold a shell or another program, so it is never a prompt target.
+    let matches: Vec<_> = ctx
+        .registry
+        .find_all(selector)
+        .into_iter()
+        .filter(|a| a.state != AgentState::Done)
+        .collect();
     let agent = matches
         .iter()
         .find(|a| a.machine == ctx.machine)
         .or(matches.first())
         .cloned()
-        .ok_or_else(|| format!("no agent matches {selector:?}"))?;
+        .ok_or_else(|| format!("no running agent matches {selector:?}"))?;
     if agent.machine != ctx.machine {
         return Err(format!(
             "{} is on {}; prompting remote agents is not supported",

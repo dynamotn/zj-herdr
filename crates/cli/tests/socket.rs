@@ -290,7 +290,7 @@ fn prompt_goes_to_the_plugin_by_name() {
     let err = d.request(prompt("far/20", "x", false)).unwrap_err();
     assert!(err.contains("remote"), "{err}");
     let err = d.request(prompt("nobody", "x", false)).unwrap_err();
-    assert!(err.contains("no agent"), "{err}");
+    assert!(err.contains("no running agent"), "{err}");
 }
 
 #[test]
@@ -311,6 +311,23 @@ fn prompt_fails_unless_the_plugin_acknowledges_it() {
     *d.fake.reply.lock().unwrap() = Some(format!("{PROMPT_NACK} permissions not granted\n"));
     let err = d.request(prompt("10", "x", true)).unwrap_err();
     assert!(err.contains("permissions not granted"), "{err}");
+}
+
+#[test]
+fn prompt_refuses_an_exited_agent() {
+    let d = Daemon::new();
+    d.registry.publish(
+        machine("box", vec![agent("box", 10, AgentState::Idle, dev_pane())]),
+        1,
+    );
+    // The agent exits; it is retained as `done` but its pane is a shell now.
+    d.registry.publish(machine("box", vec![]), 2);
+    let calls = d.fake.calls.lock().unwrap().len();
+    for selector in ["box/10", "dev:3"] {
+        let err = d.request(prompt(selector, "rm -rf x", true)).unwrap_err();
+        assert!(err.contains("no running agent"), "{err}");
+    }
+    assert_eq!(d.fake.calls.lock().unwrap().len(), calls);
 }
 
 #[test]

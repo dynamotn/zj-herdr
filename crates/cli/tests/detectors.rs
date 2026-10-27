@@ -322,3 +322,45 @@ fn scanner_never_gives_two_claudes_the_same_transcript() {
     ids.sort();
     assert_eq!(ids, vec![None, Some("s1"), Some("s2")]);
 }
+
+#[test]
+fn scanner_shares_codex_rollouts_between_agents_in_one_cwd() {
+    let (tmp, _) = codex_tree();
+    let mut scanner = Scanner::with_detectors(
+        "box".into(),
+        vec![Box::new(CodexDetector::new(tmp.path().to_path_buf()))],
+    );
+    let codex = |pid, start_time| {
+        let mut p = raw(pid, 1, &["codex"], 0.0);
+        p.cwd = Some("/work/codex-proj".into());
+        p.start_time = start_time;
+        p
+    };
+    // 101 wrote the old rollout, 102 the new one; 103 started after both
+    // were last written and has not written anything yet.
+    let procs = [
+        codex(101, T0 - 7200),
+        codex(102, T0 - 1800),
+        codex(103, T0 + 100),
+    ];
+    let scan = scanner.scan_from(&procs, T0 + 200);
+    let id = |pid: u32| {
+        scan.agents
+            .iter()
+            .find(|a| a.pid == pid)
+            .unwrap()
+            .session_id
+            .as_deref()
+    };
+    assert_eq!(id(101), Some("0196a1b2-0000-7e5f-8a9b-0c1d2e3f4a5b"));
+    assert_eq!(id(102), Some("0196a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b"));
+    assert_eq!(id(103), None);
+}
+
+#[test]
+fn codex_started_after_its_cwds_rollouts_inherits_none() {
+    let (_tmp, detector) = codex_tree();
+    let mut p = proc("codex", "/work/codex-proj", T0 + 200, 0.0);
+    p.start_time = T0 + 100;
+    assert!(detector.detect(&p).is_none());
+}

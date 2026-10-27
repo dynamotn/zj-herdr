@@ -71,7 +71,7 @@ pub fn parse_request(line: &str) -> Result<Request, String> {
     match &req {
         Request::Wait {
             timeout: Some(t), ..
-        } if !t.is_finite() || *t < 0.0 => {
+        } if std::time::Duration::try_from_secs_f64(*t).is_err() => {
             Err("bad request: timeout must be a non-negative number of seconds".into())
         }
         Request::Spawn { command, .. } if command.argv().is_empty() => {
@@ -191,6 +191,7 @@ mod tests {
             r#"{"op":"fly"}"#,
             r#"{"op":"wait","agent":"a","state":"sleeping"}"#,
             r#"{"op":"wait","agent":"a","state":"idle","timeout":-1}"#,
+            r#"{"op":"wait","agent":"a","state":"idle","timeout":1e300}"#,
             r#"{"op":"wait","state":"idle"}"#,
             r#"{"op":"spawn","session":"s","command":[]}"#,
         ] {

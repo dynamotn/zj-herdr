@@ -84,20 +84,22 @@ pub fn files_with_times(dir: &Path, ext: &str) -> Vec<FileTimes> {
         .filter_map(Result::ok)
         .map(|e| e.path())
         .filter(|p| p.extension().is_some_and(|e| e == ext))
-        .filter_map(|path| {
-            let meta = fs::metadata(&path).ok()?;
-            let secs = |t: std::io::Result<std::time::SystemTime>| {
-                t.ok()?.duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs())
-            };
-            let modified = secs(meta.modified())?;
-            let created = secs(meta.created()).unwrap_or(modified).min(modified);
-            Some(FileTimes {
-                path,
-                created,
-                modified,
-            })
-        })
+        .filter_map(file_times)
         .collect()
+}
+
+fn file_times(path: PathBuf) -> Option<FileTimes> {
+    let meta = fs::metadata(&path).ok()?;
+    let secs = |t: std::io::Result<std::time::SystemTime>| {
+        t.ok()?.duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs())
+    };
+    let modified = secs(meta.modified())?;
+    let created = secs(meta.created()).unwrap_or(modified).min(modified);
+    Some(FileTimes {
+        path,
+        created,
+        modified,
+    })
 }
 
 // ---------------------------------------------------------------- Claude Code
@@ -208,8 +210,9 @@ pub fn claude_last_turn(entries: impl Iterator<Item = Value>) -> LastTurn {
 
 // ---------------------------------------------------------------------- Codex
 
-/// All `rollout-*.jsonl` files under the Codex sessions tree, newest first.
-pub fn codex_rollouts(root: &Path) -> Vec<(u64, PathBuf)> {
+/// All `rollout-*.jsonl` files under the Codex sessions tree, most recently
+/// written first.
+pub fn codex_rollouts(root: &Path) -> Vec<FileTimes> {
     let mut found = Vec::new();
     let mut dirs = vec![(root.to_path_buf(), 0)];
     while let Some((dir, depth)) = dirs.pop() {
@@ -229,13 +232,11 @@ pub fn codex_rollouts(root: &Path) -> Vec<(u64, PathBuf)> {
                     .file_name()
                     .is_some_and(|n| n.to_string_lossy().starts_with("rollout-"))
             {
-                if let Some(m) = modified_secs(&path) {
-                    found.push((m, path));
-                }
+                found.extend(file_times(path));
             }
         }
     }
-    found.sort_by(|a, b| b.cmp(a));
+    found.sort_by(|a, b| (b.modified, &b.path).cmp(&(a.modified, &a.path)));
     found
 }
 

@@ -95,19 +95,19 @@ fn flag_value<'a>(argv: &'a [String], flags: &[&str]) -> Option<&'a str> {
     })
 }
 
-/// A Claude process competing for the transcripts in its project directory.
+/// An agent process competing for the transcripts recorded for its cwd.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ClaudeClaimant {
+pub struct Claimant {
     pub pid: u32,
     pub start_time: u64,
-    /// Transcript named by `--resume`/`--session-id`, if the process is
-    /// still writing to it.
+    /// Transcript named on the command line (`--resume`, `codex resume`).
     pub explicit: Option<PathBuf>,
 }
 
-/// Share the transcripts of one project directory out between the Claude
-/// processes running there, so that two agents in the same cwd are never
-/// both given the newest file.
+/// Share the transcripts of one cwd out between the agent processes of one
+/// family running there, so that two agents in the same cwd are never both
+/// given the newest file, and an agent never inherits a file whose last write
+/// came before it started (unless named on its command line).
 ///
 /// Files are replayed in creation order. Each goes to a process that was
 /// already running when it was created, preferring one with no transcript
@@ -116,7 +116,7 @@ pub struct ClaudeClaimant {
 /// A process keeps the most recently written of the files it was given.
 /// Processes left without one (`--continue` reopens an older file) take the
 /// newest unclaimed file written since they started.
-pub fn assign_claude(claimants: &[ClaudeClaimant], files: &[FileTimes]) -> HashMap<u32, PathBuf> {
+pub fn assign_transcripts(claimants: &[Claimant], files: &[FileTimes]) -> HashMap<u32, PathBuf> {
     let mut owned: HashMap<u32, Vec<&FileTimes>> = HashMap::new();
     let mut taken: Vec<&Path> = Vec::new();
     for c in claimants {
@@ -130,7 +130,7 @@ pub fn assign_claude(claimants: &[ClaudeClaimant], files: &[FileTimes]) -> HashM
             taken.push(&f.path);
         }
     }
-    let replayed: Vec<&ClaudeClaimant> = claimants
+    let replayed: Vec<&Claimant> = claimants
         .iter()
         .filter(|c| !owned.contains_key(&c.pid))
         .collect();
@@ -189,12 +189,12 @@ impl ClaudeDetector {
         }
     }
 
-    fn claimant(proc: &ProcInfo, dir: &Path) -> ClaudeClaimant {
+    fn claimant(proc: &ProcInfo, dir: &Path) -> Claimant {
         // An explicit session wins while the agent keeps writing to it.
         let explicit = flag_value(&proc.argv, &["--resume", "-r", "--session-id"])
             .map(|id| dir.join(format!("{id}.jsonl")))
             .filter(|path| transcript::modified_secs(path).is_some_and(|m| m >= proc.start_time));
-        ClaudeClaimant {
+        Claimant {
             pid: proc.pid,
             start_time: proc.start_time,
             explicit,
@@ -203,7 +203,7 @@ impl ClaudeDetector {
 
     fn assign(&self, procs: &[&ProcInfo]) -> HashMap<u32, Option<PathBuf>> {
         let mut out: HashMap<u32, Option<PathBuf>> = procs.iter().map(|p| (p.pid, None)).collect();
-        let mut by_dir: HashMap<PathBuf, Vec<ClaudeClaimant>> = HashMap::new();
+        let mut by_dir: HashMap<PathBuf, Vec<Claimant>> = HashMap::new();
         for proc in procs {
             if let Some(cwd) = proc.cwd.as_deref() {
                 let dir = transcript::claude_project_dir(&self.projects, cwd);
@@ -213,7 +213,7 @@ impl ClaudeDetector {
         }
         for (dir, claimants) in by_dir {
             let files = transcript::files_with_times(&dir, "jsonl");
-            for (pid, path) in assign_claude(&claimants, &files) {
+            for (pid, path) in assign_transcripts(&claimants, &files) {
                 out.insert(pid, Some(path));
             }
         }
@@ -250,11 +250,15 @@ impl Detector for ClaudeDetector {
 /// Session id and recorded cwd of a rollout.
 type RolloutMeta = (String, Option<String>);
 
-/// Codex: newest `<sessions>/**/rollout-*.jsonl` recorded for the same cwd.
+/// Codex: the `<sessions>/**/rollout-*.jsonl` recorded for the process's cwd,
+/// shared out between concurrent Codex processes by [`assign_transcripts`].
 pub struct CodexDetector {
     pub sessions: PathBuf,
     /// First-line metadata never changes, so read it once per file.
     meta: Mutex<HashMap<PathBuf, Option<RolloutMeta>>>,
+    /// Rollout per pid from the last [`Detector::prepare`]; `None` means the
+    /// process was considered and given none.
+    assigned: Mutex<HashMap<u32, Option<PathBuf>>>,
 }
 
 impl CodexDetector {
@@ -262,6 +266,7 @@ impl CodexDetector {
         CodexDetector {
             sessions,
             meta: Mutex::new(HashMap::new()),
+            assigned: Mutex::new(HashMap::new()),
         }
     }
 
@@ -272,6 +277,77 @@ impl CodexDetector {
             .or_insert_with(|| transcript::codex_meta(path))
             .clone()
     }
+
+    /// The session id after `resume` in argv.
+    fn resumed(proc: &ProcInfo) -> Option<&str> {
+        proc.argv
+            .iter()
+            .position(|a| a == "resume")
+            .and_then(|i| proc.argv.get(i + 1))
+            .map(String::as_str)
+            .filter(|id| !id.starts_with('-'))
+    }
+
+    fn assign(&self, procs: &[&ProcInfo]) -> HashMap<u32, Option<PathBuf>> {
+        let mut out: HashMap<u32, Option<PathBuf>> = procs.iter().map(|p| (p.pid, None)).collect();
+        if procs.is_empty() {
+            return out;
+        }
+        // Newest first, so an explicit id resolves to its latest rollout.
+        let rollouts: Vec<(FileTimes, RolloutMeta)> = transcript::codex_rollouts(&self.sessions)
+            .into_iter()
+            .filter_map(|f| {
+                let meta = self.meta(&f.path)?;
+                Some((f, meta))
+            })
+            .collect();
+        let mut by_cwd: HashMap<String, Vec<Claimant>> = HashMap::new();
+        for proc in procs {
+            let Some(cwd) = proc.cwd.as_deref() else {
+                continue;
+            };
+            let explicit = Self::resumed(proc).and_then(|want| {
+                rollouts
+                    .iter()
+                    .find(|(_, (id, _))| id == want)
+                    .map(|(f, _)| f.path.clone())
+            });
+            by_cwd
+                .entry(cwd.to_string_lossy().into_owned())
+                .or_default()
+                .push(Claimant {
+                    pid: proc.pid,
+                    start_time: proc.start_time,
+                    explicit,
+                });
+        }
+        for (cwd, claimants) in by_cwd {
+            let files: Vec<FileTimes> = rollouts
+                .iter()
+                .filter(|(f, (_, rec_cwd))| {
+                    rec_cwd.as_deref() == Some(cwd.as_str())
+                        || claimants
+                            .iter()
+                            .any(|c| c.explicit.as_ref() == Some(&f.path))
+                })
+                .map(|(f, _)| f.clone())
+                .collect();
+            for (pid, path) in assign_transcripts(&claimants, &files) {
+                out.insert(pid, Some(path));
+            }
+        }
+        out
+    }
+
+    fn rollout_path(&self, proc: &ProcInfo) -> Option<PathBuf> {
+        let mut assigned = self.assigned.lock().unwrap_or_else(|e| e.into_inner());
+        if !assigned.contains_key(&proc.pid) {
+            // Not seen by `prepare` (a one-off call): judge it on its own.
+            let alone = self.assign(&[proc]);
+            assigned.extend(alone);
+        }
+        assigned.get(&proc.pid).cloned().flatten()
+    }
 }
 
 impl Detector for CodexDetector {
@@ -279,23 +355,14 @@ impl Detector for CodexDetector {
         "codex"
     }
 
+    fn prepare(&self, procs: &[&ProcInfo]) {
+        let fresh = self.assign(procs);
+        *self.assigned.lock().unwrap_or_else(|e| e.into_inner()) = fresh;
+    }
+
     fn detect(&self, proc: &ProcInfo) -> Option<AgentStatus> {
-        let cwd = proc.cwd.as_deref()?.to_string_lossy().into_owned();
-        let resumed = proc
-            .argv
-            .iter()
-            .position(|a| a == "resume")
-            .and_then(|i| proc.argv.get(i + 1))
-            .filter(|id| !id.starts_with('-'));
-        let rollouts = transcript::codex_rollouts(&self.sessions);
-        let (path, id) = rollouts.into_iter().find_map(|(_, path)| {
-            let (id, rec_cwd) = self.meta(&path)?;
-            let hit = match resumed {
-                Some(want) => &id == want,
-                None => rec_cwd.as_deref() == Some(cwd.as_str()),
-            };
-            hit.then_some((path, id))
-        })?;
+        let path = self.rollout_path(proc)?;
+        let (id, _) = self.meta(&path)?;
         Some(status(proc, transcript::read_codex(&path, id)?))
     }
 }
@@ -405,8 +472,8 @@ mod tests {
         }
     }
 
-    fn claimant(pid: u32, start_time: u64) -> ClaudeClaimant {
-        ClaudeClaimant {
+    fn claimant(pid: u32, start_time: u64) -> Claimant {
+        Claimant {
             pid,
             start_time,
             explicit: None,
@@ -440,7 +507,7 @@ mod tests {
             file("b", 210, 300),
             file("old", 10, 20),
         ];
-        let map = assign_claude(&[claimant(1, 100), claimant(2, 200)], &files);
+        let map = assign_transcripts(&[claimant(1, 100), claimant(2, 200)], &files);
         assert_eq!(owner(&map, 1), Some("a"));
         assert_eq!(owner(&map, 2), Some("b"));
     }
@@ -449,7 +516,7 @@ mod tests {
     fn a_process_without_its_own_transcript_gets_none() {
         // B has not been prompted yet, so it has written nothing.
         let files = [file("a", 110, 400)];
-        let map = assign_claude(&[claimant(1, 100), claimant(2, 200)], &files);
+        let map = assign_transcripts(&[claimant(1, 100), claimant(2, 200)], &files);
         assert_eq!(owner(&map, 1), Some("a"));
         assert_eq!(owner(&map, 2), None);
     }
@@ -462,7 +529,7 @@ mod tests {
             file("b", 210, 500),
             file("a2", 300, 450),
         ];
-        let map = assign_claude(&[claimant(1, 100), claimant(2, 200)], &files);
+        let map = assign_transcripts(&[claimant(1, 100), claimant(2, 200)], &files);
         assert_eq!(owner(&map, 1), Some("a2"));
         assert_eq!(owner(&map, 2), Some("b"));
     }
@@ -476,7 +543,7 @@ mod tests {
         ];
         let mut resumer = claimant(1, 100);
         resumer.explicit = Some(PathBuf::from("resumed"));
-        let map = assign_claude(&[resumer, claimant(2, 200)], &files);
+        let map = assign_transcripts(&[resumer, claimant(2, 200)], &files);
         assert_eq!(owner(&map, 1), Some("resumed"));
         assert_eq!(owner(&map, 2), Some("continued"));
     }

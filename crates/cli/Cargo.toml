@@ -1,0 +1,21 @@
+[package]
+name = "zj-herdr"
+description = "Hook-free agent runtime for Zellij: state detection, socket API and CLI"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "zj-herdr"
+path = "src/main.rs"
+
+[dependencies]
+zj-herdr-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+clap = { version = "4", features = ["derive"] }
+libc = "0.2"
+toml = { version = "1", default-features = false, features = ["parse", "serde"] }
+sysinfo = { version = "0.38", default-features = false, features = ["system"] }
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,0 +1,6 @@
+{"timestamp":"2025-05-01T09:00:00.000Z","type":"session_meta","payload":{"id":"0196a1b2-0000-7e5f-8a9b-0c1d2e3f4a5b","cwd":"/work/codex-proj","cli_version":"0.40.0"}}
+{"timestamp":"2025-05-01T09:00:01.000Z","type":"event_msg","payload":{"type":"user_message","message":"hello"}}
+{"timestamp":"2025-05-01T09:00:02.000Z","type":"response_item","payload":{"type":"function_call","name":"shell","arguments":"{}","call_id":"call_1"}}
+{"timestamp":"2025-05-01T09:00:03.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_1","output":"ok"}}
+{"timestamp":"2025-05-01T09:00:04.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hi."}]}}
+{"timestamp":"2025-05-01T09:00:05.000Z","type":"event_msg","payload":{"type":"task_complete","last_agent_message":"Hi."}}

@@ -1,0 +1,69 @@
+// zj-herdr: example Zellij configuration.
+//
+// Merge these blocks into ~/.config/zellij/config.kdl. Build the plugin with
+//   cargo build -p zj-herdr-plugin --target wasm32-wasip1 --release
+// and copy target/wasm32-wasip1/release/zj_herdr.wasm to the location below.
+
+plugins {
+    zj_herdr location="file:~/.config/zellij/plugins/zj_herdr.wasm" {
+        // Stay open after Enter or an attention jump (for a pinned pane).
+        // pinned "false"
+
+        // `zj-herdr prompt` pipes to this alias (the daemon's `plugin`
+        // setting, "zj_herdr" by default) with deliver_prompts "true" added,
+        // which Zellij loads as its own floating instance. Do not set
+        // deliver_prompts here: every picker pane would type each prompt.
+
+        // Used once at load to fetch the first snapshot without waiting for
+        // the daemon's next push. Use an absolute path if Zellij's PATH
+        // does not include it.
+        // zj_herdr_bin "zj-herdr"
+    }
+}
+
+keybinds {
+    shared_except "locked" {
+        // Open the floating picker: j/k or arrows move, Enter jumps,
+        // n/p cycle attention, Esc or q hides it.
+        bind "Alt a" {
+            LaunchOrFocusPlugin "zj_herdr" {
+                floating true
+                move_to_focused_tab true
+            }
+        }
+        // Jump to the next / previous agent that needs you
+        // (blocked first, then idle), across sessions. If the plugin is not
+        // loaded yet, it is launched floating, never as a tiled pane, and
+        // hides itself after the jump (or at once when nobody needs you).
+        bind "Alt ]" {
+            MessagePlugin "zj_herdr" {
+                name "zj_herdr.cmd.v1"
+                payload "attention-next"
+                floating true
+            }
+        }
+        bind "Alt [" {
+            MessagePlugin "zj_herdr" {
+                name "zj_herdr.cmd.v1"
+                payload "attention-prev"
+                floating true
+            }
+        }
+    }
+}
+
+// Optional: a pinned, narrow agent list in a layout. Its configuration
+// differs from the alias above, so Zellij treats it as a separate instance;
+// prompts and attention keys keep going to the alias.
+//
+// layout {
+//     pane split_direction="vertical" {
+//         pane
+//         pane size=44 {
+//             plugin location="zj_herdr" {
+//                 pinned "true"
+//                 deliver_prompts "false"
+//             }
+//         }
+//     }
+// }

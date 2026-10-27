@@ -1,0 +1,14 @@
+[package]
+name = "zj-herdr-plugin"
+description = "Zellij plugin for zj-herdr: combined agent list and attention jumps"
+version.workspace = true
+edition.workspace = true
+
+# Builds `zj_herdr.wasm` with `--target wasm32-wasip1`.
+[[bin]]
+name = "zj_herdr"
+path = "src/main.rs"
+
+[dependencies]
+zj-herdr-core.workspace = true
+zellij-tile = "0.45"

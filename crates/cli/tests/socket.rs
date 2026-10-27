@@ -1,0 +1,435 @@
+//! The socket API end to end, against a fake Zellij.
+//!
+//! Connections use `UnixStream::pair()` so the protocol is tested even where
+//! binding a socket file is not allowed; `bind` itself has its own test.
+
+use std::io::{BufRead, BufReader, ErrorKind, Write};
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::UnixStream;
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
+
+use zj_herdr::api::{CommandLine, Event, Request};
+use zj_herdr::client;
+use zj_herdr::registry::Registry;
+use zj_herdr::server::{self, Context};
+use zj_herdr::zellij::Zellij;
+use zj_herdr_core::{
+    Agent, AgentState, Machine, MachineStatus, Pane, PluginCommand, CMD_SCHEMA, PROMPT_ACK,
+    PROMPT_NACK,
+};
+
+#[derive(Default)]
+struct FakeZellij {
+    calls: Mutex<Vec<String>>,
+    /// What the plugin writes back to `deliver`; `None` means an ack.
+    reply: Mutex<Option<String>>,
+}
+
+impl Zellij for FakeZellij {
+    fn sessions(&self) -> Result<Vec<String>, String> {
+        Ok(vec!["dev".into()])
+    }
+    fn pipe(&self, session: &str, name: &str, payload: &str) -> Result<(), String> {
+        let call = format!("pipe {session} {name} {payload}");
+        self.calls.lock().unwrap().push(call);
+        Ok(())
+    }
+    fn deliver(
+        &self,
+        session: &str,
+        plugin: &str,
+        name: &str,
+        payload: &str,
+    ) -> Result<String, String> {
+        let call = format!("deliver {session} {plugin} {name} {payload}");
+        self.calls.lock().unwrap().push(call);
+        let reply = self.reply.lock().unwrap().clone();
+        Ok(reply.unwrap_or_else(|| format!("{PROMPT_ACK}\n")))
+    }
+    fn run(&self, session: &str, cwd: Option<&str>, command: &[String]) -> Result<(), String> {
+        let call = format!("run {session} {cwd:?} {}", command.join(" "));
+        self.calls.lock().unwrap().push(call);
+        Ok(())
+    }
+}
+
+fn agent(machine: &str, pid: u32, state: AgentState, pane: Option<Pane>) -> Agent {
+    Agent {
+        id: Agent::make_id(machine, pid),
+        machine: machine.into(),
+        kind: "claude".into(),
+        pid,
+        cwd: Some("/w".into()),
+        state,
+        since: 0,
+        pane,
+        session_id: None,
+    }
+}
+
+fn machine(name: &str, agents: Vec<Agent>) -> Machine {
+    Machine {
+        name: name.into(),
+        ssh: None,
+        status: MachineStatus::Ok,
+        error: None,
+        agents,
+    }
+}
+
+fn dev_pane() -> Option<Pane> {
+    Some(Pane {
+        session: "dev".into(),
+        pane_id: 3,
+    })
+}
+
+struct Daemon {
+    registry: Arc<Registry>,
+    fake: Arc<FakeZellij>,
+    ctx: Arc<Context>,
+}
+
+impl Daemon {
+    fn new() -> Self {
+        let registry = Arc::new(Registry::default());
+        let fake = Arc::new(FakeZellij::default());
+        let ctx = Arc::new(Context {
+            registry: Arc::clone(&registry),
+            zellij: fake.clone(),
+            machine: "box".into(),
+            plugin: "zj_herdr".into(),
+        });
+        Daemon {
+            registry,
+            fake,
+            ctx,
+        }
+    }
+
+    /// A client stream whose other end is served by the daemon.
+    fn connect(&self) -> UnixStream {
+        let (client, server_end) = UnixStream::pair().unwrap();
+        let ctx = Arc::clone(&self.ctx);
+        thread::spawn(move || server::handle(server_end, &ctx));
+        client
+    }
+
+    fn request(&self, req: Request) -> Result<zj_herdr::api::Response, String> {
+        client::request_on(self.connect(), &req)
+    }
+
+    fn last_call(&self) -> String {
+        self.fake
+            .calls
+            .lock()
+            .unwrap()
+            .last()
+            .cloned()
+            .unwrap_or_default()
+    }
+}
+
+fn prompt(agent: &str, text: &str, submit: bool) -> Request {
+    Request::Prompt {
+        agent: agent.into(),
+        text: text.into(),
+        submit,
+    }
+}
+
+#[test]
+fn only_the_owning_user_is_served() {
+    let (a, _b) = UnixStream::pair().unwrap();
+    let me = zj_herdr::paths::uid();
+    assert_eq!(server::peer_uid(&a).unwrap(), me);
+    server::authorize(&a, me).unwrap();
+    let err = server::authorize(&a, me.wrapping_add(1)).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::PermissionDenied);
+}
+
+#[test]
+fn client_refuses_a_listener_running_as_someone_else() {
+    let (a, _b) = UnixStream::pair().unwrap();
+    let me = zj_herdr::paths::uid();
+    client::check_peer(&a, me).unwrap();
+    let err = client::check_peer(&a, me.wrapping_add(1)).unwrap_err();
+    assert!(err.contains("refusing"), "{err}");
+}
+
+#[test]
+fn sticky_dir_behind_a_link_of_ours_is_accepted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let real = tmp.path().join("private-tmp");
+    std::fs::create_dir(&real).unwrap();
+    std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o1777)).unwrap();
+    let link = tmp.path().join("tmp");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let me = zj_herdr::paths::uid();
+    zj_herdr::paths::check_socket_dir(&link, me).unwrap();
+    assert!(zj_herdr::paths::check_socket_dir(&link, me.wrapping_add(1)).is_err());
+}
+
+#[test]
+fn bind_refuses_a_shared_directory_without_sticky_bit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let shared = tmp.path().join("shared");
+    std::fs::create_dir(&shared).unwrap();
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let err = server::bind(&shared.join("s.sock")).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::PermissionDenied);
+    assert!(err.to_string().contains("writable by other users"), "{err}");
+}
+
+#[test]
+fn bind_refuses_to_replace_something_that_is_not_its_socket() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("zj-herdr-1.sock");
+    std::fs::write(&path, "planted").unwrap();
+    let err = server::bind(&path).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::PermissionDenied);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "planted");
+}
+
+#[test]
+fn bind_accepts_a_sticky_shared_directory_like_tmp() {
+    let tmp = tempfile::tempdir().unwrap();
+    let shared = tmp.path().join("tmp");
+    std::fs::create_dir(&shared).unwrap();
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o1777)).unwrap();
+    let path = shared.join("zj-herdr-1.sock");
+    match server::bind(&path) {
+        Err(e)
+            if e.kind() == ErrorKind::PermissionDenied && !e.to_string().contains("refusing") =>
+        {
+            eprintln!("skipped: this environment forbids binding Unix sockets ({e})");
+        }
+        other => {
+            other.unwrap();
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+    }
+}
+
+#[test]
+fn bound_socket_is_private_and_not_stolen() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("s.sock");
+    let listener = match server::bind(&path) {
+        Err(e) if e.kind() == ErrorKind::PermissionDenied => {
+            eprintln!("skipped: this environment forbids binding Unix sockets ({e})");
+            return;
+        }
+        other => other.unwrap(),
+    };
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+    // Reachable through the linked name, with the staging dir cleaned up.
+    UnixStream::connect(&path).unwrap();
+    let left: Vec<_> = std::fs::read_dir(tmp.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(left, vec![std::ffi::OsString::from("s.sock")]);
+    assert!(
+        server::bind(&path).is_err(),
+        "a second daemon must not take over the socket"
+    );
+    drop(listener);
+    // Nobody listens any more: the stale file is replaced.
+    server::bind(&path).unwrap();
+}
+
+#[test]
+fn list_returns_every_machine() {
+    let d = Daemon::new();
+    d.registry.publish(
+        machine("box", vec![agent("box", 10, AgentState::Idle, dev_pane())]),
+        1,
+    );
+    d.registry.publish(
+        machine("far", vec![agent("far", 20, AgentState::Idle, dev_pane())]),
+        1,
+    );
+    let state = d.request(Request::List).unwrap().state.unwrap();
+    assert_eq!(state.agents().count(), 2);
+    assert_eq!(state.machines.len(), 2);
+}
+
+#[test]
+fn prompt_goes_to_the_plugin_by_name() {
+    let d = Daemon::new();
+    d.registry.publish(
+        machine("box", vec![agent("box", 10, AgentState::Idle, dev_pane())]),
+        1,
+    );
+    d.registry.publish(
+        machine("far", vec![agent("far", 20, AgentState::Idle, dev_pane())]),
+        1,
+    );
+
+    d.request(prompt("box/10", "go on", true)).unwrap();
+    let expected = PluginCommand::Prompt {
+        pane_id: 3,
+        text: "go on\r".into(),
+    }
+    .to_json();
+    assert_eq!(
+        d.last_call(),
+        format!("deliver dev zj_herdr {CMD_SCHEMA} {expected}")
+    );
+
+    // `dev:3` exists on both machines; a pane selector means the local one.
+    d.request(prompt("dev:3", "again", false)).unwrap();
+    let expected = PluginCommand::Prompt {
+        pane_id: 3,
+        text: "again".into(),
+    }
+    .to_json();
+    assert_eq!(
+        d.last_call(),
+        format!("deliver dev zj_herdr {CMD_SCHEMA} {expected}")
+    );
+
+    let err = d.request(prompt("far/20", "x", false)).unwrap_err();
+    assert!(err.contains("remote"), "{err}");
+    let err = d.request(prompt("nobody", "x", false)).unwrap_err();
+    assert!(err.contains("no running agent"), "{err}");
+}
+
+#[test]
+fn prompt_fails_unless_the_plugin_acknowledges_it() {
+    let d = Daemon::new();
+    d.registry.publish(
+        machine("box", vec![agent("box", 10, AgentState::Idle, dev_pane())]),
+        1,
+    );
+
+    *d.fake.reply.lock().unwrap() = Some(String::new());
+    let err = d.request(prompt("10", "x", true)).unwrap_err();
+    assert!(
+        err.contains("not delivered") && err.contains("acknowledged"),
+        "{err}"
+    );
+
+    *d.fake.reply.lock().unwrap() = Some(format!("{PROMPT_NACK} permissions not granted\n"));
+    let err = d.request(prompt("10", "x", true)).unwrap_err();
+    assert!(err.contains("permissions not granted"), "{err}");
+}
+
+#[test]
+fn prompt_refuses_an_exited_agent() {
+    let d = Daemon::new();
+    d.registry.publish(
+        machine("box", vec![agent("box", 10, AgentState::Idle, dev_pane())]),
+        1,
+    );
+    // The agent exits; it is retained as `done` but its pane is a shell now.
+    d.registry.publish(machine("box", vec![]), 2);
+    let calls = d.fake.calls.lock().unwrap().len();
+    for selector in ["box/10", "dev:3"] {
+        let err = d.request(prompt(selector, "rm -rf x", true)).unwrap_err();
+        assert!(err.contains("no running agent"), "{err}");
+    }
+    assert_eq!(d.fake.calls.lock().unwrap().len(), calls);
+}
+
+#[test]
+fn prompt_needs_a_pane() {
+    let d = Daemon::new();
+    d.registry.publish(
+        machine("box", vec![agent("box", 10, AgentState::Idle, None)]),
+        1,
+    );
+    let err = d.request(prompt("10", "x", true)).unwrap_err();
+    assert!(err.contains("not running inside Zellij"), "{err}");
+}
+
+#[test]
+fn spawn_runs_in_the_session() {
+    let d = Daemon::new();
+    let spawn = Request::Spawn {
+        session: "dev".into(),
+        cwd: Some("/w".into()),
+        command: CommandLine::Argv(vec!["claude".into()]),
+    };
+    d.request(spawn).unwrap();
+    assert_eq!(d.last_call(), "run dev Some(\"/w\") claude");
+}
+
+#[test]
+fn wait_and_subscribe_see_changes() {
+    let d = Daemon::new();
+    d.registry.publish(
+        machine(
+            "box",
+            vec![agent("box", 10, AgentState::Working, dev_pane())],
+        ),
+        1,
+    );
+
+    let wait = Request::Wait {
+        agent: "10".into(),
+        state: AgentState::Blocked,
+        timeout: Some(5.0),
+    };
+    let wait_conn = d.connect();
+    let waiter = thread::spawn(move || client::request_on(wait_conn, &wait));
+    let sub_conn = d.connect();
+    let events = thread::spawn(move || {
+        let mut seen = Vec::new();
+        client::subscribe_on(sub_conn, |e| {
+            seen.push(e);
+            seen.len() < 2
+        })
+        .unwrap();
+        seen
+    });
+    thread::sleep(Duration::from_millis(100));
+    d.registry.publish(
+        machine(
+            "box",
+            vec![agent("box", 10, AgentState::Blocked, dev_pane())],
+        ),
+        2,
+    );
+
+    let got = waiter.join().unwrap().unwrap().agent.unwrap();
+    assert_eq!(got.state, AgentState::Blocked);
+    let seen = events.join().unwrap();
+    assert!(matches!(&seen[0], Event::Snapshot { .. }));
+    assert!(matches!(
+        &seen[1],
+        Event::Change {
+            from: Some(AgentState::Working),
+            ..
+        }
+    ));
+
+    let err = d
+        .request(Request::Wait {
+            agent: "10".into(),
+            state: AgentState::Idle,
+            timeout: Some(0.05),
+        })
+        .unwrap_err();
+    assert!(err.contains("timed out"), "{err}");
+}
+
+#[test]
+fn malformed_lines_get_an_error_and_the_connection_stays_open() {
+    let d = Daemon::new();
+    let mut stream = d.connect();
+    stream.write_all(b"not json\n{\"op\":\"list\"}\n").unwrap();
+    let mut lines = BufReader::new(stream).lines();
+    let first = lines.next().unwrap().unwrap();
+    assert!(
+        first.contains("\"ok\":false") && first.contains("bad request"),
+        "{first}"
+    );
+    let second = lines.next().unwrap().unwrap();
+    assert!(second.contains("\"ok\":true"), "{second}");
+}

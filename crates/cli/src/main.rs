@@ -247,6 +247,13 @@ fn run(cli: Cli) -> Result<(), String> {
                     Event::Change { agent, from } => {
                         println!("{}", output::change_line(agent, *from))
                     }
+                    Event::Machine {
+                        name,
+                        status,
+                        error,
+                    } => {
+                        println!("{}", output::machine_line(name, *status, error.as_deref()))
+                    }
                 }
             }
             true

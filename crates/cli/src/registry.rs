@@ -33,10 +33,17 @@ impl Tracker {
         for mut agent in fresh {
             match self.agents.remove(&agent.id) {
                 Some(prev) if prev.state == agent.state => agent.since = prev.since,
-                prev => changes.push(Change {
-                    agent: agent.clone(),
-                    from: prev.map(|p| p.state),
-                }),
+                prev => {
+                    // The scanner's `since` is the last transcript write; a
+                    // transition we saw happened now.
+                    if prev.is_some() {
+                        agent.since = now;
+                    }
+                    changes.push(Change {
+                        agent: agent.clone(),
+                        from: prev.map(|p| p.state),
+                    });
+                }
             }
             next.insert(agent.id.clone(), agent);
         }
@@ -73,6 +80,23 @@ struct Inner {
     subscribers: Vec<Sender<String>>,
 }
 
+fn machine_line(m: &Machine) -> String {
+    api::to_line(&Event::Machine {
+        name: m.name.clone(),
+        status: m.status,
+        error: m.error.clone(),
+    })
+}
+
+/// Send lines to every subscriber, dropping those that hung up.
+fn broadcast(inner: &mut Inner, lines: &[String]) {
+    if !lines.is_empty() {
+        inner
+            .subscribers
+            .retain(|tx| lines.iter().all(|l| tx.send(l.clone()).is_ok()));
+    }
+}
+
 /// Shared between the scan loop, the remote pollers and socket clients.
 #[derive(Default)]
 pub struct Registry {
@@ -92,9 +116,13 @@ impl Registry {
         let changes = tracker.update(std::mem::take(&mut machine.agents), now);
         machine.agents = tracker.agents();
         let mut recovered = false;
+        let mut lines = Vec::new();
         match inner.machines.iter_mut().find(|m| m.name == machine.name) {
             Some(slot) => {
                 recovered = slot.status != machine.status;
+                if recovered {
+                    lines.push(machine_line(&machine));
+                }
                 *slot = machine;
             }
             None => inner.machines.push(machine),
@@ -103,20 +131,13 @@ impl Registry {
         if !changes.is_empty() || recovered {
             inner.changes += 1;
         }
-        if !changes.is_empty() {
-            let lines: Vec<String> = changes
-                .iter()
-                .map(|c| {
-                    api::to_line(&Event::Change {
-                        agent: c.agent.clone(),
-                        from: c.from,
-                    })
-                })
-                .collect();
-            inner
-                .subscribers
-                .retain(|tx| lines.iter().all(|l| tx.send(l.clone()).is_ok()));
-        }
+        lines.extend(changes.iter().map(|c| {
+            api::to_line(&Event::Change {
+                agent: c.agent.clone(),
+                from: c.from,
+            })
+        }));
+        broadcast(&mut inner, &lines);
         self.changed.notify_all();
         changes
     }
@@ -135,7 +156,9 @@ impl Registry {
         slot.status = MachineStatus::Unreachable;
         slot.error = Some(error);
         if fresh {
+            let line = machine_line(slot);
             inner.changes += 1;
+            broadcast(&mut inner, &[line]);
         }
         self.changed.notify_all();
     }
@@ -270,9 +293,32 @@ mod tests {
             .is_empty());
         assert_eq!(t.agents()[0].since, 100);
 
+        // A transition dates from when it was seen, not the scanner's time.
         let changes = t.update(vec![agent(1, AgentState::Blocked, 90)], 110);
         assert_eq!(changes[0].from, Some(AgentState::Working));
-        assert_eq!(t.agents()[0].since, 90);
+        assert_eq!(changes[0].agent.since, 110);
+        assert_eq!(t.agents()[0].since, 110);
+    }
+
+    #[test]
+    fn subscribers_hear_machines_go_and_come_back() {
+        let reg = Registry::default();
+        reg.publish(machine(vec![]), 0);
+        let (tx, rx) = mpsc::channel();
+        reg.subscribe(tx);
+        rx.recv().unwrap();
+        reg.mark_unreachable(machine(vec![]), "timeout".into());
+        let line = rx.recv().unwrap();
+        assert!(
+            line.contains("\"event\":\"machine\"") && line.contains("\"unreachable\""),
+            "{line}"
+        );
+        // Still unreachable: nothing new to say.
+        reg.mark_unreachable(machine(vec![]), "timeout".into());
+        assert!(rx.try_recv().is_err());
+        reg.publish(machine(vec![]), 1);
+        let line = rx.recv().unwrap();
+        assert!(line.contains("\"status\":\"ok\""), "{line}");
     }
 
     #[test]

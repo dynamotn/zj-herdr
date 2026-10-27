@@ -29,6 +29,15 @@ pub fn agent_line(agent: &Agent) -> String {
     ))
 }
 
+/// `box unreachable: timeout` or `box ok`
+pub fn machine_line(name: &str, status: MachineStatus, error: Option<&str>) -> String {
+    clean(&match (status, error) {
+        (MachineStatus::Unreachable, Some(e)) => format!("{name} unreachable: {e}"),
+        (MachineStatus::Unreachable, None) => format!("{name} unreachable"),
+        (MachineStatus::Ok, _) => format!("{name} ok"),
+    })
+}
+
 /// `box/123 claude idle -> blocked dev:3 /w/proj`
 pub fn change_line(agent: &Agent, from: Option<AgentState>) -> String {
     let from = from.map_or_else(|| "new".to_string(), |s| s.to_string());

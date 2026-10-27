@@ -229,6 +229,10 @@ impl Plugin {
     /// Type a prompt from the daemon and answer on its CLI pipe, if any.
     fn prompt(&mut self, pipe: Option<String>, pane_id: u32, text: String) {
         if !self.permitted {
+            // Keep the CLI waiting until the permissions are answered.
+            if let Some(id) = &pipe {
+                block_cli_pipe_input(id);
+            }
             self.queued_prompts.push((pipe, pane_id, text));
             return;
         }

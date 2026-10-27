@@ -12,7 +12,7 @@
 //! a stream of [`Event`] lines.
 
 use serde::{Deserialize, Serialize};
-use zj_herdr_core::{Agent, AgentState, StateV1};
+use zj_herdr_core::{Agent, AgentState, MachineStatus, StateV1};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -127,6 +127,12 @@ pub enum Event {
         agent: Agent,
         /// `None` when the agent just appeared.
         from: Option<AgentState>,
+    },
+    /// A machine became unreachable or came back.
+    Machine {
+        name: String,
+        status: MachineStatus,
+        error: Option<String>,
     },
 }
 

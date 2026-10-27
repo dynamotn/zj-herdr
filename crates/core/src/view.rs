@@ -14,7 +14,10 @@ pub enum Row<'a> {
 }
 
 fn session_of(agent: &Agent) -> &str {
-    agent.pane.as_ref().map_or(NO_SESSION, |p| p.session.as_str())
+    agent
+        .pane
+        .as_ref()
+        .map_or(NO_SESSION, |p| p.session.as_str())
 }
 
 /// Blocked first, then idle, then the rest; longest-waiting first.
@@ -92,7 +95,13 @@ mod tests {
     use super::*;
     use crate::Pane;
 
-    fn agent(machine: &str, pid: u32, state: AgentState, since: u64, session: Option<&str>) -> Agent {
+    fn agent(
+        machine: &str,
+        pid: u32,
+        state: AgentState,
+        since: u64,
+        session: Option<&str>,
+    ) -> Agent {
         Agent {
             id: Agent::make_id(machine, pid),
             machine: machine.into(),

@@ -32,16 +32,20 @@ and derives a state:
 
 Transcripts read:
 
-- Claude Code: the newest `~/.claude/projects/<cwd-slug>/*.jsonl`
-  (`$CLAUDE_CONFIG_DIR` is honoured; `--resume <id>` picks that file).
+- Claude Code: the newest `~/.claude/projects/<cwd-slug>/*.jsonl`, where the
+  slug is the cwd with `/` and `.` replaced by `-` (falling back to Claude's
+  own form, which also replaces `_` and other symbols). `$CLAUDE_CONFIG_DIR`
+  is honoured and `--resume <id>` picks that file. When several Claude
+  agents share a cwd, each transcript goes to the process that was running
+  when it was created, so two agents never report the same session.
 - Codex: the newest `~/.codex/sessions/**/rollout-*.jsonl` recorded for the
   process cwd (`$CODEX_HOME` is honoured; `codex resume <id>` picks that one).
 - Other agents: CPU only, so they show `working` or `idle`, never `blocked`.
 
 Only the shape of each entry is read, never message text. Known limits: a
 quiet tool (a long `sleep`, a stalled download) awaiting no permission looks
-`blocked`, and two Claude agents in the same directory share the newest
-transcript unless started with `--resume`/`--session-id`.
+`blocked`, and when two Claude agents in one directory both `/clear` at
+about the same time their new transcripts can be swapped.
 
 ## Install
 
@@ -60,11 +64,12 @@ zj-herdr daemon
 ```
 
 It rescans every second, serves `$XDG_RUNTIME_DIR/zj-herdr.sock` (falling
-back to `$TMPDIR/zj-herdr-$UID/zj-herdr.sock`; override with `--socket` or
+back to `$TMPDIR/zj-herdr-$UID.sock`; override with `--socket` or
 `$ZJ_HERDR_SOCKET`), and pushes state to every running Zellij session with
-`zellij pipe --name zj_herdr.state.v1`. The socket is mode 0600 in a
-directory that must be ours and not writable by others, and the daemon
-serves only connections from its own uid.
+`zellij pipe --name zj_herdr.state.v1`. The socket is mode 0600, in a
+directory that is either private or shared with the sticky bit (`/tmp`).
+A socket path owned by another user is refused by both the daemon and the
+CLI, and the daemon serves only connections from its own uid.
 
 ## Zellij config
 
@@ -85,12 +90,21 @@ first snapshot with `zj-herdr list --json`). Plugin options:
 | Option | Default | Meaning |
 |---|---|---|
 | `pinned` | `false` | stay open after a jump (for a pane in a layout) |
-| `deliver_prompts` | `true` | type prompts from `zj-herdr prompt`; keep it on in only one instance per session |
+| `deliver_prompts` | `true` | type prompts from `zj-herdr prompt` sent to this instance |
 | `zj_herdr_bin` | `zj-herdr` | binary used for the first snapshot |
 
 Pipe commands (`zellij pipe --name zj_herdr.cmd.v1 -- <payload>`):
 `attention-next`, `attention-prev`, `toggle`, and
 `{"cmd":"prompt","pane_id":N,"text":"..."}`.
+
+`zj-herdr prompt` runs `zellij --session S action pipe --plugin zj_herdr
+--floating-plugin true` in the agent's session, so Zellij loads the plugin
+there if the picker was never opened (it hides itself again afterwards). The
+plugin answers `zj_herdr.prompt.delivered` once the text is typed; without
+that answer the command fails rather than report success. The first time
+the plugin loads in a session, Zellij asks for its permissions in the
+floating pane, and the prompt waits for them. Set `plugin = "..."` at the
+top of `config.toml` if your alias or plugin URL differs.
 
 ## CLI
 
@@ -134,6 +148,8 @@ versioned `zj_herdr.state.v1` format from `crates/core`.
 List hosts in `~/.config/zj-herdr/config.toml`:
 
 ```toml
+# plugin = "zj_herdr"     # Zellij alias or URL that types prompts
+
 [[remote]]
 name = "l30n4rd0d4v1nc1"
 ssh = "l30n4rd0d4v1nc1"   # a Host alias from ~/.ssh/config

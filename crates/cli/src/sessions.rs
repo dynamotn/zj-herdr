@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use zj_herdr_core::{Agent, AgentState};
@@ -66,11 +66,51 @@ impl Store {
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Store::default()),
             Err(e) => return Err(format!("{}: {e}", path.display())),
         };
-        let store: Store = serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+        Self::parse(&text).map_err(|e| format!("{}: {e}", path.display()))
+    }
+
+    fn parse(text: &str) -> Result<Self, String> {
+        let store: Store = serde_json::from_str(text).map_err(|e| e.to_string())?;
         if store.schema != SESSIONS_SCHEMA {
-            return Err(format!("{}: unsupported schema {:?}", path.display(), store.schema));
+            return Err(format!("unsupported schema {:?}", store.schema));
         }
         Ok(store)
+    }
+
+    /// Load for the daemon, which will overwrite the file on its next save.
+    /// A file that exists but cannot be parsed is first moved aside, to a
+    /// name no earlier copy uses; if it cannot be read or moved, this fails
+    /// rather than start empty and lose the records.
+    pub fn load_or_set_aside(path: &Path) -> Result<(Self, Option<PathBuf>), String> {
+        let text = match fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok((Store::default(), None)),
+            Err(e) => return Err(format!("{}: {e}", path.display())),
+        };
+        let reason = match Self::parse(&text) {
+            Ok(store) => return Ok((store, None)),
+            Err(reason) => reason,
+        };
+        let aside = (0..1000)
+            .map(|n| match n {
+                0 => path.with_extension("json.unreadable"),
+                n => path.with_extension(format!("json.unreadable.{n}")),
+            })
+            .find(|p| fs::symlink_metadata(p).is_err())
+            .ok_or_else(|| {
+                format!(
+                    "{}: {reason}; no free name to move it aside",
+                    path.display()
+                )
+            })?;
+        fs::rename(path, &aside).map_err(|e| {
+            format!(
+                "{}: {reason}; cannot move it to {} ({e}), refusing to start over it",
+                path.display(),
+                aside.display()
+            )
+        })?;
+        Ok((Store::default(), Some(aside)))
     }
 
     /// Write atomically so a crash never leaves half a file.
@@ -79,7 +119,10 @@ impl Store {
             fs::create_dir_all(dir)?;
         }
         let tmp = path.with_extension("json.tmp");
-        fs::write(&tmp, serde_json::to_string_pretty(self).expect("store serializes"))?;
+        fs::write(
+            &tmp,
+            serde_json::to_string_pretty(self).expect("store serializes"),
+        )?;
         fs::rename(&tmp, path)
     }
 
@@ -103,7 +146,11 @@ impl Store {
                 session_id: session_id.clone(),
                 updated_at: now,
             };
-            if self.panes.get(&rec.key()).is_none_or(|old| !old.same_session(&rec)) {
+            if self
+                .panes
+                .get(&rec.key())
+                .is_none_or(|old| !old.same_session(&rec))
+            {
                 self.panes.insert(rec.key(), rec);
                 changed = true;
             }
@@ -117,9 +164,15 @@ impl Store {
     pub fn plan(&self, session: Option<&str>, live: &[Agent]) -> (Vec<Plan>, Vec<String>) {
         let mut plans = Vec::new();
         let mut skipped = Vec::new();
-        for rec in self.panes.values().filter(|r| session.is_none_or(|s| r.session == s)) {
+        for rec in self
+            .panes
+            .values()
+            .filter(|r| session.is_none_or(|s| r.session == s))
+        {
             let running = live.iter().any(|a| {
-                a.state != AgentState::Done && a.kind == rec.kind && a.session_id.as_ref() == Some(&rec.session_id)
+                a.state != AgentState::Done
+                    && a.kind == rec.kind
+                    && a.session_id.as_ref() == Some(&rec.session_id)
             });
             if running {
                 skipped.push(format!(
@@ -147,7 +200,14 @@ mod tests {
     use super::*;
     use zj_herdr_core::Pane;
 
-    fn agent(pid: u32, kind: &str, session: &str, pane: u32, sid: Option<&str>, state: AgentState) -> Agent {
+    fn agent(
+        pid: u32,
+        kind: &str,
+        session: &str,
+        pane: u32,
+        sid: Option<&str>,
+        state: AgentState,
+    ) -> Agent {
         Agent {
             id: Agent::make_id("box", pid),
             machine: "box".into(),
@@ -174,7 +234,10 @@ mod tests {
         ];
         assert!(store.record(&agents, 10));
         assert_eq!(store.panes.keys().collect::<Vec<_>>(), ["dev:1"]);
-        assert!(!store.record(&agents, 20), "unchanged sessions are not rewritten");
+        assert!(
+            !store.record(&agents, 20),
+            "unchanged sessions are not rewritten"
+        );
         assert_eq!(store.panes["dev:1"].updated_at, 10);
 
         let replaced = vec![agent(4, "codex", "dev", 1, Some("r2"), AgentState::Working)];
@@ -188,9 +251,53 @@ mod tests {
         let path = tmp.path().join("state/zj-herdr/sessions.json");
         assert_eq!(Store::load(&path).unwrap(), Store::default());
         let mut store = Store::default();
-        store.record(&[agent(1, "claude", "dev", 1, Some("c1"), AgentState::Idle)], 5);
+        store.record(
+            &[agent(1, "claude", "dev", 1, Some("c1"), AgentState::Idle)],
+            5,
+        );
         store.save(&path).unwrap();
         assert_eq!(Store::load(&path).unwrap(), store);
+        assert_eq!(Store::load_or_set_aside(&path).unwrap(), (store, None));
+    }
+
+    #[test]
+    fn unreadable_store_is_moved_aside_without_clobbering() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("sessions.json");
+        fs::write(&path, "{ not json").unwrap();
+        let (store, aside) = Store::load_or_set_aside(&path).unwrap();
+        assert_eq!(store, Store::default());
+        assert_eq!(
+            aside.as_deref(),
+            Some(tmp.path().join("sessions.json.unreadable").as_path())
+        );
+        assert!(!path.exists());
+
+        fs::write(&path, "{ also bad").unwrap();
+        let (_, aside) = Store::load_or_set_aside(&path).unwrap();
+        assert_eq!(
+            aside.unwrap(),
+            tmp.path().join("sessions.json.unreadable.1")
+        );
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("sessions.json.unreadable")).unwrap(),
+            "{ not json"
+        );
+    }
+
+    #[test]
+    fn store_that_cannot_be_moved_aside_is_an_error() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("locked");
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("sessions.json");
+        fs::write(&path, "{ not json").unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
+        let result = Store::load_or_set_aside(&path);
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(result.is_err(), "started over an unreadable store");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "{ not json");
     }
 
     #[test]

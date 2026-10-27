@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 mod cmd;
 pub mod view;
-pub use cmd::{PluginCommand, CMD_SCHEMA};
+pub use cmd::{prompt_reply, PluginCommand, CMD_SCHEMA, PROMPT_ACK, PROMPT_NACK};
 
 /// Pipe name and `schema` tag of a full state snapshot.
 pub const STATE_SCHEMA: &str = "zj_herdr.state.v1";
@@ -86,7 +86,9 @@ impl FromStr for AgentState {
         AgentState::ALL
             .into_iter()
             .find(|st| st.as_str() == s)
-            .ok_or_else(|| format!("unknown state {s:?} (expected working, blocked, idle, done or unknown)"))
+            .ok_or_else(|| {
+                format!("unknown state {s:?} (expected working, blocked, idle, done or unknown)")
+            })
     }
 }
 
@@ -131,7 +133,9 @@ impl Agent {
             return true;
         }
         match (&self.pane, selector.rsplit_once(':')) {
-            (Some(pane), Some((session, id))) => pane.session == session && id.parse() == Ok(pane.pane_id),
+            (Some(pane), Some((session, id))) => {
+                pane.session == session && id.parse() == Ok(pane.pane_id)
+            }
             _ => false,
         }
     }
@@ -171,7 +175,10 @@ pub struct StateV1 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WireError {
     Json(String),
-    Schema { expected: &'static str, found: String },
+    Schema {
+        expected: &'static str,
+        found: String,
+    },
 }
 
 impl fmt::Display for WireError {
@@ -202,7 +209,8 @@ impl StateV1 {
 
     /// Parse a snapshot, rejecting other schema versions.
     pub fn from_json(text: &str) -> Result<Self, WireError> {
-        let state: StateV1 = serde_json::from_str(text).map_err(|e| WireError::Json(e.to_string()))?;
+        let state: StateV1 =
+            serde_json::from_str(text).map_err(|e| WireError::Json(e.to_string()))?;
         if state.schema != STATE_SCHEMA {
             return Err(WireError::Schema {
                 expected: STATE_SCHEMA,
@@ -288,7 +296,10 @@ mod tests {
     #[test]
     fn rejects_other_schema() {
         let json = sample().to_json().replace("state.v1", "state.v9");
-        assert!(matches!(StateV1::from_json(&json), Err(WireError::Schema { .. })));
+        assert!(matches!(
+            StateV1::from_json(&json),
+            Err(WireError::Schema { .. })
+        ));
     }
 
     #[test]

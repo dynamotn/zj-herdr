@@ -65,27 +65,74 @@ fn stem(path: &Path) -> String {
         .unwrap_or_default()
 }
 
-/// Newest file in `dir` (non-recursive) with the given extension.
-pub fn newest_file(dir: &Path, ext: &str) -> Option<PathBuf> {
-    fs::read_dir(dir)
-        .ok()?
+/// A transcript file and when it was created and last written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileTimes {
+    pub path: PathBuf,
+    /// Unix seconds of creation; the mtime where the filesystem has no
+    /// birth time.
+    pub created: u64,
+    pub modified: u64,
+}
+
+/// Files in `dir` (non-recursive) with the given extension.
+pub fn files_with_times(dir: &Path, ext: &str) -> Vec<FileTimes> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return vec![];
+    };
+    entries
         .filter_map(Result::ok)
         .map(|e| e.path())
         .filter(|p| p.extension().is_some_and(|e| e == ext))
-        .filter_map(|p| Some((modified_secs(&p)?, p)))
-        .max()
-        .map(|(_, p)| p)
+        .filter_map(|path| {
+            let meta = fs::metadata(&path).ok()?;
+            let secs = |t: std::io::Result<std::time::SystemTime>| {
+                t.ok()?.duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs())
+            };
+            let modified = secs(meta.modified())?;
+            let created = secs(meta.created()).unwrap_or(modified).min(modified);
+            Some(FileTimes {
+                path,
+                created,
+                modified,
+            })
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------- Claude Code
 
-/// Claude names a project directory after its cwd with every character that
-/// is not ASCII alphanumeric (`/`, `.`, `_`, ...) replaced by `-`.
+/// The plan's project directory name: the cwd with `/` and `.` replaced by
+/// `-`.
 pub fn claude_slug(cwd: &Path) -> String {
+    cwd.to_string_lossy()
+        .chars()
+        .map(|c| if c == '/' || c == '.' { '-' } else { c })
+        .collect()
+}
+
+/// Claude Code itself also replaces every other character that is not ASCII
+/// alphanumeric (`_`, spaces, ...); [`claude_project_dir`] falls back to it.
+pub fn claude_slug_alnum(cwd: &Path) -> String {
     cwd.to_string_lossy()
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect()
+}
+
+/// `<projects>/<slug>`, trying [`claude_slug`] first and then
+/// [`claude_slug_alnum`] for cwds where the two differ.
+pub fn claude_project_dir(projects: &Path, cwd: &Path) -> PathBuf {
+    let plain = projects.join(claude_slug(cwd));
+    if plain.is_dir() {
+        return plain;
+    }
+    let alnum = projects.join(claude_slug_alnum(cwd));
+    if alnum.is_dir() {
+        alnum
+    } else {
+        plain
+    }
 }
 
 pub fn read_claude(path: &Path) -> Option<Transcript> {
@@ -99,7 +146,9 @@ pub fn read_claude(path: &Path) -> Option<Transcript> {
 }
 
 fn content_items(entry: &Value) -> &[Value] {
-    entry["message"]["content"].as_array().map_or(&[], Vec::as_slice)
+    entry["message"]["content"]
+        .as_array()
+        .map_or(&[], Vec::as_slice)
 }
 
 pub fn claude_last_turn(entries: impl Iterator<Item = Value>) -> LastTurn {
@@ -164,10 +213,14 @@ pub fn codex_rollouts(root: &Path) -> Vec<(u64, PathBuf)> {
     let mut found = Vec::new();
     let mut dirs = vec![(root.to_path_buf(), 0)];
     while let Some((dir, depth)) = dirs.pop() {
-        let Ok(entries) = fs::read_dir(&dir) else { continue };
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
         for entry in entries.filter_map(Result::ok) {
             let path = entry.path();
-            let Ok(kind) = entry.file_type() else { continue };
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
             if kind.is_dir() && depth < 4 {
                 dirs.push((path, depth + 1));
             } else if kind.is_file()
@@ -189,9 +242,15 @@ pub fn codex_rollouts(root: &Path) -> Vec<(u64, PathBuf)> {
 /// Session id and cwd from a rollout's first line (`session_meta`).
 pub fn codex_meta(path: &Path) -> Option<(String, Option<String>)> {
     let mut first = String::new();
-    BufReader::new(File::open(path).ok()?).read_line(&mut first).ok()?;
+    BufReader::new(File::open(path).ok()?)
+        .read_line(&mut first)
+        .ok()?;
     let v: Value = serde_json::from_str(&first).ok()?;
-    let meta = if v["type"] == "session_meta" { &v["payload"] } else { &v };
+    let meta = if v["type"] == "session_meta" {
+        &v["payload"]
+    } else {
+        &v
+    };
     let id = meta["id"]
         .as_str()
         .map(str::to_owned)
@@ -275,10 +334,34 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn slug_matches_claude_layout() {
+    fn slug_replaces_slashes_and_dots() {
         assert_eq!(
             claude_slug(Path::new("/Users/me/.config/my_app")),
+            "-Users-me--config-my_app"
+        );
+        assert_eq!(
+            claude_slug_alnum(Path::new("/Users/me/.config/my_app")),
             "-Users-me--config-my-app"
+        );
+    }
+
+    #[test]
+    fn project_dir_falls_back_to_claude_own_slug() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = Path::new("/w/my_app");
+        assert_eq!(
+            claude_project_dir(tmp.path(), cwd),
+            tmp.path().join("-w-my_app")
+        );
+        fs::create_dir(tmp.path().join("-w-my-app")).unwrap();
+        assert_eq!(
+            claude_project_dir(tmp.path(), cwd),
+            tmp.path().join("-w-my-app")
+        );
+        fs::create_dir(tmp.path().join("-w-my_app")).unwrap();
+        assert_eq!(
+            claude_project_dir(tmp.path(), cwd),
+            tmp.path().join("-w-my_app")
         );
     }
 
@@ -288,9 +371,14 @@ mod tests {
             json!({"type":"assistant","message":{"content":[{"type":"tool_use","id":"a"},{"type":"tool_use","id":"b"}]}}),
             json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"a"}]}}),
         ];
-        assert_eq!(claude_last_turn(entries.clone().into_iter()), LastTurn::PendingTool);
+        assert_eq!(
+            claude_last_turn(entries.clone().into_iter()),
+            LastTurn::PendingTool
+        );
         let mut done = entries;
-        done.push(json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"b"}]}}));
+        done.push(
+            json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"b"}]}}),
+        );
         assert_eq!(claude_last_turn(done.into_iter()), LastTurn::AwaitingReply);
     }
 
@@ -300,7 +388,10 @@ mod tests {
             json!({"type":"assistant","message":{"content":[{"type":"tool_use","id":"a"}]}}),
             json!({"type":"user","message":{"content":"never mind"}}),
         ];
-        assert_eq!(claude_last_turn(entries.into_iter()), LastTurn::AwaitingReply);
+        assert_eq!(
+            claude_last_turn(entries.into_iter()),
+            LastTurn::AwaitingReply
+        );
     }
 
     #[test]
@@ -315,8 +406,12 @@ mod tests {
 
     #[test]
     fn codex_id_falls_back_to_file_name() {
-        let p = Path::new("/x/rollout-2025-05-01T10-00-00-0196a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b.jsonl");
-        assert_eq!(codex_id_from_name(p), "0196a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b");
+        let p =
+            Path::new("/x/rollout-2025-05-01T10-00-00-0196a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b.jsonl");
+        assert_eq!(
+            codex_id_from_name(p),
+            "0196a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b"
+        );
     }
 
     #[test]
@@ -325,8 +420,14 @@ mod tests {
             json!({"type":"response_item","payload":{"type":"function_call","call_id":"c1"}}),
             json!({"type":"event_msg","payload":{"type":"exec_approval_request"}}),
         ];
-        assert_eq!(codex_last_turn(entries.clone().into_iter()), LastTurn::PendingTool);
+        assert_eq!(
+            codex_last_turn(entries.clone().into_iter()),
+            LastTurn::PendingTool
+        );
         entries.push(json!({"type":"response_item","payload":{"type":"function_call_output","call_id":"c1"}}));
-        assert_eq!(codex_last_turn(entries.into_iter()), LastTurn::AwaitingReply);
+        assert_eq!(
+            codex_last_turn(entries.into_iter()),
+            LastTurn::AwaitingReply
+        );
     }
 }

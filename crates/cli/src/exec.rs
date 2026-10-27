@@ -39,8 +39,18 @@ pub fn run(mut cmd: Command, timeout: Duration) -> Result<Output, String> {
             String::from_utf8_lossy(&buf).into_owned()
         })
     };
-    let out = drain(child.stdout.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
-    let err = drain(child.stderr.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
+    let out = drain(
+        child
+            .stdout
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let err = drain(
+        child
+            .stderr
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
 
     let deadline = Instant::now() + timeout;
     let status = loop {
@@ -49,7 +59,10 @@ pub fn run(mut cmd: Command, timeout: Duration) -> Result<Output, String> {
             Ok(None) if Instant::now() >= deadline => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(format!("{program} timed out after {}s", timeout.as_secs_f32()));
+                return Err(format!(
+                    "{program} timed out after {}s",
+                    timeout.as_secs_f32()
+                ));
             }
             Ok(None) => thread::sleep(POLL),
             Err(e) => return Err(format!("{program}: {e}")),

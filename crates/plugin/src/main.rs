@@ -8,7 +8,9 @@ use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use zellij_tile::prelude::*;
-use zj_herdr_core::{view, Agent, PluginCommand, StateV1, CMD_SCHEMA, STATE_SCHEMA};
+use zj_herdr_core::{
+    view, Agent, PluginCommand, StateV1, CMD_SCHEMA, PROMPT_ACK, PROMPT_NACK, STATE_SCHEMA,
+};
 
 mod ui;
 
@@ -36,19 +38,34 @@ struct Plugin {
     bin: String,
     /// Attention jump requested before any state arrived.
     pending: Option<PluginCommand>,
+    /// Hide once `pending` has run: it came down a pipe, not from the user.
+    hide_after_pending: bool,
+    /// Zellij has granted the permissions asked for in `load`.
+    permitted: bool,
+    /// Prompts that arrived before the permissions did, with the CLI pipe
+    /// each one keeps blocked until it is answered.
+    queued_prompts: Vec<(Option<String>, u32, String)>,
+    /// A key was pressed since the picker was last shown: the user is
+    /// using it, so commands from pipes leave it open.
+    in_use: bool,
 }
 
 register_plugin!(Plugin);
 
 fn now_secs() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 impl ZellijPlugin for Plugin {
     fn load(&mut self, config: BTreeMap<String, String>) {
         self.pinned = config.get("pinned").is_some_and(|v| v == "true");
         self.deliver_prompts = config.get("deliver_prompts").is_none_or(|v| v != "false");
-        self.bin = config.get("zj_herdr_bin").cloned().unwrap_or_else(|| "zj-herdr".into());
+        self.bin = config
+            .get("zj_herdr_bin")
+            .cloned()
+            .unwrap_or_else(|| "zj-herdr".into());
         request_permission(&[
             PermissionType::ReadApplicationState,
             PermissionType::ChangeApplicationState,
@@ -75,6 +92,9 @@ impl ZellijPlugin for Plugin {
             }
             Event::Visible(visible) => {
                 self.visible = visible;
+                if !visible {
+                    self.in_use = false;
+                }
                 visible
             }
             Event::Timer(_) => {
@@ -82,12 +102,30 @@ impl ZellijPlugin for Plugin {
                 self.visible
             }
             Event::PermissionRequestResult(PermissionStatus::Granted) => {
+                self.permitted = true;
                 // Do not wait up to a heartbeat for the first push.
                 let context = BTreeMap::from([(FETCH_CONTEXT.to_string(), String::new())]);
                 run_command(&[self.bin.as_str(), "list", "--json"], context);
+                for (pipe, pane_id, text) in std::mem::take(&mut self.queued_prompts) {
+                    self.prompt(pipe, pane_id, text);
+                }
                 true
             }
-            Event::RunCommandResult(_, stdout, _, context) if context.contains_key(FETCH_CONTEXT) => {
+            Event::PermissionRequestResult(PermissionStatus::Denied) => {
+                for (pipe, _, _) in std::mem::take(&mut self.queued_prompts) {
+                    if let Some(id) = pipe {
+                        cli_pipe_output(
+                            &id,
+                            &format!("{PROMPT_NACK} the plugin was denied its permissions\n"),
+                        );
+                        unblock_cli_pipe_input(&id);
+                    }
+                }
+                true
+            }
+            Event::RunCommandResult(_, stdout, _, context)
+                if context.contains_key(FETCH_CONTEXT) =>
+            {
                 // A failed fetch is fine: the daemon's next push fills in.
                 if let Ok(state) = StateV1::from_json(&String::from_utf8_lossy(&stdout)) {
                     if self.state.is_none() {
@@ -102,11 +140,12 @@ impl ZellijPlugin for Plugin {
     }
 
     fn pipe(&mut self, msg: PipeMessage) -> bool {
-        if let PipeSource::Cli(id) = &msg.source {
-            unblock_cli_pipe_input(id);
-        }
+        let cli = match &msg.source {
+            PipeSource::Cli(id) => Some(id.clone()),
+            _ => None,
+        };
         let payload = msg.payload.as_deref().unwrap_or_default();
-        match msg.name.as_str() {
+        let redraw = match msg.name.as_str() {
             STATE_SCHEMA => match StateV1::from_json(payload) {
                 Ok(state) => {
                     self.set_state(state);
@@ -118,14 +157,34 @@ impl ZellijPlugin for Plugin {
                 }
             },
             CMD_SCHEMA => match PluginCommand::parse(payload) {
-                Ok(cmd) => self.on_command(cmd),
+                // Answers (and unblocks) its CLI pipe itself, maybe later.
+                Ok(PluginCommand::Prompt { pane_id, text }) => {
+                    self.prompt(cli, pane_id, text);
+                    return false;
+                }
+                Ok(cmd) => {
+                    let redraw = self.on_command(cmd.clone());
+                    if self.pending.is_some() {
+                        self.hide_after_pending = true;
+                    } else if cmd != PluginCommand::Toggle {
+                        self.hide_unless_in_use();
+                    }
+                    redraw
+                }
                 Err(e) => {
+                    if let Some(id) = &cli {
+                        cli_pipe_output(id, &format!("{PROMPT_NACK} {e}\n"));
+                    }
                     self.error = Some(e);
                     true
                 }
             },
             _ => false,
+        };
+        if let Some(id) = &cli {
+            unblock_cli_pipe_input(id);
         }
+        redraw
     }
 
     fn render(&mut self, rows: usize, cols: usize) {
@@ -151,7 +210,39 @@ impl Plugin {
         self.error = None;
         if let Some(cmd) = self.pending.take() {
             self.on_command(cmd);
+            if std::mem::take(&mut self.hide_after_pending) {
+                self.hide_unless_in_use();
+            }
         }
+    }
+
+    /// Zellij launches the plugin, floating, to deliver a pipe message when
+    /// it is not loaded. Put it away again afterwards unless it is pinned or
+    /// the user is using it. While permissions are pending it stays up:
+    /// that is where Zellij asks for them.
+    fn hide_unless_in_use(&self) {
+        if !self.pinned && !self.in_use && self.permitted {
+            hide_self();
+        }
+    }
+
+    /// Type a prompt from the daemon and answer on its CLI pipe, if any.
+    fn prompt(&mut self, pipe: Option<String>, pane_id: u32, text: String) {
+        if !self.permitted {
+            self.queued_prompts.push((pipe, pane_id, text));
+            return;
+        }
+        let reply = if self.deliver_prompts {
+            write_chars_to_pane_id(&text, PaneId::Terminal(pane_id));
+            format!("{PROMPT_ACK}\n")
+        } else {
+            format!("{PROMPT_NACK} this instance has deliver_prompts \"false\"\n")
+        };
+        if let Some(id) = pipe {
+            cli_pipe_output(&id, &reply);
+            unblock_cli_pipe_input(&id);
+        }
+        self.hide_unless_in_use();
     }
 
     fn find(&self, id: &str) -> Option<Agent> {
@@ -159,7 +250,9 @@ impl Plugin {
     }
 
     fn move_cursor(&mut self, delta: isize) -> bool {
-        let Some(state) = &self.state else { return false };
+        let Some(state) = &self.state else {
+            return false;
+        };
         let ids = ui::selectable(state);
         if ids.is_empty() {
             return false;
@@ -175,6 +268,7 @@ impl Plugin {
     }
 
     fn on_key(&mut self, key: KeyWithModifier) -> bool {
+        self.in_use = true;
         match key.bare_key {
             BareKey::Down | BareKey::Char('j') => self.move_cursor(1),
             BareKey::Up | BareKey::Char('k') => self.move_cursor(-1),
@@ -203,7 +297,9 @@ impl Plugin {
                 };
                 let forward = cmd == PluginCommand::AttentionNext;
                 let order = view::attention_order(state);
-                if let Some(agent) = view::cycle(&order, self.last_jump.as_deref(), forward).cloned() {
+                if let Some(agent) =
+                    view::cycle(&order, self.last_jump.as_deref(), forward).cloned()
+                {
                     self.selected = Some(agent.id.clone());
                     self.jump(&agent);
                 }
@@ -218,9 +314,7 @@ impl Plugin {
                 false
             }
             PluginCommand::Prompt { pane_id, text } => {
-                if self.deliver_prompts {
-                    write_chars_to_pane_id(&text, PaneId::Terminal(pane_id));
-                }
+                self.prompt(None, pane_id, text);
                 false
             }
         }

@@ -5,14 +5,16 @@ use zj_herdr_core::{fmt_elapsed, Agent, AgentState, Machine, MachineStatus};
 /// Replace control characters so names from processes or remote hosts
 /// cannot drive the terminal with escape sequences.
 pub fn clean(text: &str) -> String {
-    text.chars().map(|c| if c.is_control() { '?' } else { c }).collect()
+    text.chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect()
 }
 
 fn pane_label(agent: &Agent) -> String {
-    agent
-        .pane
-        .as_ref()
-        .map_or_else(|| "-".to_string(), |p| format!("{}:{}", p.session, p.pane_id))
+    agent.pane.as_ref().map_or_else(
+        || "-".to_string(),
+        |p| format!("{}:{}", p.session, p.pane_id),
+    )
 }
 
 /// `box/123 claude blocked dev:3 /w/proj`
@@ -70,7 +72,11 @@ pub fn table(machines: &[Machine], now: u64) -> String {
         .collect();
     let mut out = String::new();
     for row in &rows {
-        let line: Vec<String> = row.iter().zip(&widths).map(|(cell, w)| format!("{cell:<w$}")).collect();
+        let line: Vec<String> = row
+            .iter()
+            .zip(&widths)
+            .map(|(cell, w)| format!("{cell:<w$}"))
+            .collect();
         out.push_str(&clean(line.join("  ").trim_end()));
         out.push('\n');
     }

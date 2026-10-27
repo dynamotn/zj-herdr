@@ -27,7 +27,10 @@ fn truncate(text: &str, cols: usize) -> String {
 }
 
 fn basename(path: &str) -> &str {
-    path.trim_end_matches('/').rsplit('/').next().unwrap_or(path)
+    path.trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or(path)
 }
 
 /// Ids of the agent rows, in display order: what the cursor moves over.
@@ -96,11 +99,16 @@ pub fn render(
                     Row::Machine(m) => {
                         let mut text = m.name.clone();
                         if m.status == MachineStatus::Unreachable {
-                            text.push_str(&format!(" (unreachable: {})", m.error.as_deref().unwrap_or("?")));
+                            text.push_str(&format!(
+                                " (unreachable: {})",
+                                m.error.as_deref().unwrap_or("?")
+                            ));
                         }
                         body.push((format!("{BOLD}{}{RESET}", truncate(&text, cols)), false));
                     }
-                    Row::Session { name, .. } => body.push((truncate(&format!("  {name}"), cols), false)),
+                    Row::Session { name, .. } => {
+                        body.push((truncate(&format!("  {name}"), cols), false))
+                    }
                     Row::Agent { agent, local } => {
                         let ssh = ssh_of(&agent.machine);
                         let text = truncate(&agent_text(agent, local, ssh.as_deref(), now), cols);
@@ -221,7 +229,14 @@ mod tests {
     #[test]
     fn truncates_to_width() {
         let st = state(1);
-        for line in plain(&render(Some(&st), None, Some("a very long error message"), 0, 10, 12)) {
+        for line in plain(&render(
+            Some(&st),
+            None,
+            Some("a very long error message"),
+            0,
+            10,
+            12,
+        )) {
             assert!(line.chars().count() <= 12, "{line:?}");
         }
     }

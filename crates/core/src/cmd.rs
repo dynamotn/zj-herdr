@@ -8,6 +8,26 @@ use serde::{Deserialize, Serialize};
 /// Pipe name for plugin commands.
 pub const CMD_SCHEMA: &str = "zj_herdr.cmd.v1";
 
+/// What the plugin writes back down a CLI pipe once a prompt is typed. The
+/// daemon reports success only when it reads this line.
+pub const PROMPT_ACK: &str = "zj_herdr.prompt.delivered";
+/// Prefix of the line the plugin writes back when it could not type a
+/// prompt; the reason follows.
+pub const PROMPT_NACK: &str = "zj_herdr.prompt.failed:";
+
+/// Read a plugin's reply to a prompt from the pipe's output.
+pub fn prompt_reply(output: &str) -> Result<(), String> {
+    for line in output.lines().map(str::trim) {
+        if line == PROMPT_ACK {
+            return Ok(());
+        }
+        if let Some(reason) = line.strip_prefix(PROMPT_NACK) {
+            return Err(reason.trim().to_string());
+        }
+    }
+    Err("no zj-herdr plugin acknowledged the prompt".to_string())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "kebab-case")]
 pub enum PluginCommand {
@@ -29,7 +49,8 @@ impl PluginCommand {
     pub fn parse(payload: &str) -> Result<Self, String> {
         let payload = payload.trim();
         if payload.starts_with('{') {
-            return serde_json::from_str(payload).map_err(|e| format!("invalid {CMD_SCHEMA} payload: {e}"));
+            return serde_json::from_str(payload)
+                .map_err(|e| format!("invalid {CMD_SCHEMA} payload: {e}"));
         }
         match payload {
             "attention-next" => Ok(PluginCommand::AttentionNext),
@@ -68,5 +89,15 @@ mod tests {
         let json = cmd.to_json();
         assert!(json.starts_with(r#"{"cmd":"prompt""#));
         assert_eq!(PluginCommand::parse(&json), Ok(cmd));
+    }
+
+    #[test]
+    fn prompt_replies_parse() {
+        assert_eq!(prompt_reply(&format!("{PROMPT_ACK}\n")), Ok(()));
+        assert_eq!(
+            prompt_reply(&format!("{PROMPT_NACK} permission denied\n")),
+            Err("permission denied".into())
+        );
+        assert!(prompt_reply("").is_err(), "silence is not delivery");
     }
 }

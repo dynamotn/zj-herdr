@@ -66,12 +66,17 @@ pub enum Request {
 }
 
 pub fn parse_request(line: &str) -> Result<Request, String> {
-    let req: Request = serde_json::from_str(line.trim()).map_err(|e| format!("bad request: {e}"))?;
+    let req: Request =
+        serde_json::from_str(line.trim()).map_err(|e| format!("bad request: {e}"))?;
     match &req {
-        Request::Wait { timeout: Some(t), .. } if !t.is_finite() || *t < 0.0 => {
+        Request::Wait {
+            timeout: Some(t), ..
+        } if !t.is_finite() || *t < 0.0 => {
             Err("bad request: timeout must be a non-negative number of seconds".into())
         }
-        Request::Spawn { command, .. } if command.argv().is_empty() => Err("bad request: empty command".into()),
+        Request::Spawn { command, .. } if command.argv().is_empty() => {
+            Err("bad request: empty command".into())
+        }
         _ => Ok(req),
     }
 }
@@ -138,7 +143,10 @@ mod tests {
     #[test]
     fn parses_every_op() {
         assert_eq!(parse_request(r#"{"op":"list"}"#), Ok(Request::List));
-        assert_eq!(parse_request("{\"op\":\"subscribe\"}\n"), Ok(Request::Subscribe));
+        assert_eq!(
+            parse_request("{\"op\":\"subscribe\"}\n"),
+            Ok(Request::Subscribe)
+        );
         assert_eq!(
             parse_request(r#"{"op":"wait","agent":"box/1","state":"blocked","timeout":2.5}"#),
             Ok(Request::Wait {
@@ -155,14 +163,24 @@ mod tests {
                 submit: true
             })
         );
-        let spawn = parse_request(r#"{"op":"spawn","session":"dev","command":"claude --continue"}"#).unwrap();
-        let Request::Spawn { session, cwd, command } = spawn else {
+        let spawn =
+            parse_request(r#"{"op":"spawn","session":"dev","command":"claude --continue"}"#)
+                .unwrap();
+        let Request::Spawn {
+            session,
+            cwd,
+            command,
+        } = spawn
+        else {
             panic!("not spawn")
         };
         assert_eq!((session.as_str(), cwd), ("dev", None));
         assert_eq!(command.argv(), vec!["sh", "-c", "claude --continue"]);
-        let spawn = parse_request(r#"{"op":"spawn","session":"s","cwd":"/w","command":["codex"]}"#).unwrap();
-        assert!(matches!(spawn, Request::Spawn { command: CommandLine::Argv(ref a), .. } if a == &["codex"]));
+        let spawn = parse_request(r#"{"op":"spawn","session":"s","cwd":"/w","command":["codex"]}"#)
+            .unwrap();
+        assert!(
+            matches!(spawn, Request::Spawn { command: CommandLine::Argv(ref a), .. } if a == &["codex"])
+        );
     }
 
     #[test]

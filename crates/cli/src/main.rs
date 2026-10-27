@@ -98,7 +98,12 @@ fn live_local_agents(socket: &std::path::Path) -> Vec<Agent> {
     match client::request(socket, &Request::List) {
         Ok(resp) => resp
             .state
-            .map(|s| s.agents().filter(|a| a.machine == machine).cloned().collect())
+            .map(|s| {
+                s.agents()
+                    .filter(|a| a.machine == machine)
+                    .cloned()
+                    .collect()
+            })
             .unwrap_or_default(),
         Err(_) => Scanner::scan_once(machine, &Roots::from_env()).agents,
     }
@@ -163,24 +168,45 @@ fn run(cli: Cli) -> Result<(), String> {
                 machine: local_machine_name(),
                 roots: Roots::from_env(),
                 remotes: config.remote,
+                plugin: config.plugin,
                 sessions: paths::state_dir().join("sessions.json"),
             })?;
         }
         Command::List { json } => match client::request(&socket, &Request::List) {
-            Ok(resp) => print_state(&resp.state.unwrap_or_else(|| StateV1::new(now_secs(), vec![])), json),
+            Ok(resp) => print_state(
+                &resp
+                    .state
+                    .unwrap_or_else(|| StateV1::new(now_secs(), vec![])),
+                json,
+            ),
             Err(e) => {
                 eprintln!("zj-herdr: {e}\nzj-herdr: falling back to a local scan");
                 let machine = Scanner::scan_once(local_machine_name(), &Roots::from_env());
                 print_state(&StateV1::new(now_secs(), vec![machine]), json);
             }
         },
-        Command::Wait { agent, state, timeout } => {
-            let resp = client::request(&socket, &Request::Wait { agent, state, timeout })?;
+        Command::Wait {
+            agent,
+            state,
+            timeout,
+        } => {
+            let resp = client::request(
+                &socket,
+                &Request::Wait {
+                    agent,
+                    state,
+                    timeout,
+                },
+            )?;
             if let Some(agent) = resp.agent {
                 println!("{}", output::agent_line(&agent));
             }
         }
-        Command::Prompt { agent, text, no_enter } => {
+        Command::Prompt {
+            agent,
+            text,
+            no_enter,
+        } => {
             client::request(
                 &socket,
                 &Request::Prompt {
@@ -190,8 +216,17 @@ fn run(cli: Cli) -> Result<(), String> {
                 },
             )?;
         }
-        Command::Spawn { session, cwd, command } => {
-            let cwd = cwd.map(|c| std::path::absolute(&c).unwrap_or(c).to_string_lossy().into_owned());
+        Command::Spawn {
+            session,
+            cwd,
+            command,
+        } => {
+            let cwd = cwd.map(|c| {
+                std::path::absolute(&c)
+                    .unwrap_or(c)
+                    .to_string_lossy()
+                    .into_owned()
+            });
             client::request(
                 &socket,
                 &Request::Spawn {
@@ -206,8 +241,12 @@ fn run(cli: Cli) -> Result<(), String> {
                 print!("{}", zj_herdr::api::to_line(&event));
             } else {
                 match &event {
-                    Event::Snapshot { state } => print!("{}", output::table(&state.machines, now_secs())),
-                    Event::Change { agent, from } => println!("{}", output::change_line(agent, *from)),
+                    Event::Snapshot { state } => {
+                        print!("{}", output::table(&state.machines, now_secs()))
+                    }
+                    Event::Change { agent, from } => {
+                        println!("{}", output::change_line(agent, *from))
+                    }
                 }
             }
             true

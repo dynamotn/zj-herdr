@@ -65,9 +65,37 @@ fn basename(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
-fn by_name(name: &str) -> Option<&'static AgentSpec> {
-    let name = basename(name);
+fn by_basename(name: &str) -> Option<&'static AgentSpec> {
     KNOWN_AGENTS.iter().find(|s| s.names.contains(&name))
+}
+
+/// `2.1.3`, `0.45.0-beta.1`: a file named after a release, not a program.
+fn is_version(name: &str) -> bool {
+    name.starts_with(|c: char| c.is_ascii_digit())
+        && name.contains('.')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+' | '_'))
+}
+
+/// Directory names that sit between an agent's own directory and a
+/// versioned binary (`~/.local/share/claude/versions/2.1.3`).
+const VERSION_DIRS: &[&str] = &["versions", "version", "bin"];
+
+/// Match a basename, or for a versioned binary the agent directory above it.
+fn by_name(path: &str) -> Option<&'static AgentSpec> {
+    let name = basename(path);
+    if let Some(spec) = by_basename(name) {
+        return Some(spec);
+    }
+    if !is_version(name) {
+        return None;
+    }
+    path.rsplit('/')
+        .skip(1)
+        .filter(|c| !c.is_empty())
+        .find(|c| !VERSION_DIRS.contains(c))
+        .and_then(by_basename)
 }
 
 fn is_interpreter(name: &str) -> bool {
@@ -104,7 +132,9 @@ pub fn is_valid_session_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 128
         && !id.starts_with('-')
-        && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 /// The resume command for `kind` and `session_id`, if the agent supports one
@@ -114,7 +144,12 @@ pub fn resume_command(kind: &str, session_id: &str) -> Option<Vec<String>> {
         return None;
     }
     let template = spec(kind)?.resume?;
-    Some(template.iter().map(|part| part.replace("{id}", session_id)).collect())
+    Some(
+        template
+            .iter()
+            .map(|part| part.replace("{id}", session_id))
+            .collect(),
+    )
 }
 
 #[cfg(test)]
@@ -127,7 +162,10 @@ mod tests {
 
     #[test]
     fn identifies_native_binaries() {
-        assert_eq!(identify("claude", None, &argv(&["claude"])).unwrap().kind, "claude");
+        assert_eq!(
+            identify("claude", None, &argv(&["claude"])).unwrap().kind,
+            "claude"
+        );
         assert_eq!(
             identify(
                 "2.1.3",
@@ -138,7 +176,27 @@ mod tests {
             .kind,
             "claude"
         );
-        assert_eq!(identify("codex", Some("/usr/bin/codex"), &[]).unwrap().kind, "codex");
+        assert_eq!(
+            identify("codex", Some("/usr/bin/codex"), &[]).unwrap().kind,
+            "codex"
+        );
+    }
+
+    #[test]
+    fn identifies_versioned_binaries_by_their_directory() {
+        let exe = "/home/u/.local/share/claude/versions/2.1.3";
+        assert_eq!(
+            identify("2.1.3", Some(exe), &argv(&["2.1.3"]))
+                .unwrap()
+                .kind,
+            "claude"
+        );
+        assert_eq!(
+            identify("2.1.3", None, &argv(&[exe, "-c"])).unwrap().kind,
+            "claude"
+        );
+        assert!(identify("2.1.3", Some("/opt/tool/versions/2.1.3"), &argv(&["2.1.3"])).is_none());
+        assert!(identify("app", Some("/home/u/claude/bin/app"), &argv(&["app"])).is_none());
     }
 
     #[test]
@@ -170,13 +228,23 @@ mod tests {
             resume_command("claude", "abc").unwrap(),
             argv(&["claude", "--resume", "abc"])
         );
-        assert_eq!(resume_command("codex", "r1").unwrap(), argv(&["codex", "resume", "r1"]));
+        assert_eq!(
+            resume_command("codex", "r1").unwrap(),
+            argv(&["codex", "resume", "r1"])
+        );
         assert!(resume_command("aider", "x").is_none());
     }
 
     #[test]
     fn refuses_session_ids_that_could_be_flags() {
-        for bad in ["--dangerously-skip-permissions", "-r", "", "a b", "a;b", "../x"] {
+        for bad in [
+            "--dangerously-skip-permissions",
+            "-r",
+            "",
+            "a b",
+            "a;b",
+            "../x",
+        ] {
             assert!(resume_command("claude", bad).is_none(), "accepted {bad:?}");
         }
         assert!(resume_command("codex", "0196a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b").is_some());

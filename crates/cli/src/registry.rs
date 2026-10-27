@@ -154,7 +154,10 @@ impl Registry {
     pub fn subscribe(&self, tx: Sender<String>) {
         let mut inner = self.lock();
         let snapshot = StateV1::new(inner.generated_at, inner.machines.clone());
-        if tx.send(api::to_line(&Event::Snapshot { state: snapshot })).is_ok() {
+        if tx
+            .send(api::to_line(&Event::Snapshot { state: snapshot }))
+            .is_ok()
+        {
             inner.subscribers.push(tx);
         }
     }
@@ -190,8 +193,11 @@ impl Registry {
                 Some(d) => {
                     let left = d.saturating_duration_since(Instant::now());
                     if left.is_zero() {
-                        let now = found.map_or("not found".to_string(), |a| format!("is {}", a.state));
-                        return Err(format!("timed out waiting for {selector} to be {state} (it {now})"));
+                        let now =
+                            found.map_or("not found".to_string(), |a| format!("is {}", a.state));
+                        return Err(format!(
+                            "timed out waiting for {selector} to be {state} (it {now})"
+                        ));
                     }
                     self.changed
                         .wait_timeout(inner, left)
@@ -250,7 +256,9 @@ mod tests {
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].from, None);
 
-        assert!(t.update(vec![agent(1, AgentState::Working, 105)], 105).is_empty());
+        assert!(t
+            .update(vec![agent(1, AgentState::Working, 105)], 105)
+            .is_empty());
         assert_eq!(t.agents()[0].since, 100);
 
         let changes = t.update(vec![agent(1, AgentState::Blocked, 90)], 110);
@@ -291,7 +299,9 @@ mod tests {
         reg.publish(machine(vec![agent(1, AgentState::Working, 0)]), 0);
         let waiter = {
             let reg = Arc::clone(&reg);
-            std::thread::spawn(move || reg.wait_for("1", AgentState::Blocked, Some(Duration::from_secs(5)), "m"))
+            std::thread::spawn(move || {
+                reg.wait_for("1", AgentState::Blocked, Some(Duration::from_secs(5)), "m")
+            })
         };
         std::thread::sleep(Duration::from_millis(50));
         reg.publish(machine(vec![agent(1, AgentState::Blocked, 1)]), 1);
@@ -303,7 +313,12 @@ mod tests {
         let reg = Registry::default();
         reg.publish(machine(vec![agent(1, AgentState::Working, 0)]), 0);
         let err = reg
-            .wait_for("m/1", AgentState::Idle, Some(Duration::from_millis(30)), "m")
+            .wait_for(
+                "m/1",
+                AgentState::Idle,
+                Some(Duration::from_millis(30)),
+                "m",
+            )
             .unwrap_err();
         assert!(err.contains("is working"), "{err}");
     }

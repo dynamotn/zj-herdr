@@ -71,7 +71,8 @@ pub fn poll_loop(remote: Remote, registry: Arc<Registry>) {
     let timeout = Duration::from_secs(remote.timeout_secs);
     loop {
         let started = Instant::now();
-        let result = exec::run(ssh_command(&remote), timeout).and_then(|out| merge_remote(&remote, &out.stdout));
+        let result = exec::run(ssh_command(&remote), timeout)
+            .and_then(|out| merge_remote(&remote, &out.stdout));
         match result {
             Ok(machine) => {
                 registry.publish(machine, now_secs());
@@ -97,7 +98,10 @@ mod tests {
     #[test]
     fn ssh_command_is_batch_mode_and_option_safe() {
         let cmd = ssh_command(&remote());
-        let args: Vec<String> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
         assert_eq!(cmd.get_program(), "ssh");
         assert_eq!(
             args,

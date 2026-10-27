@@ -9,8 +9,10 @@ plugins {
         // Stay open after Enter or an attention jump (for a pinned pane).
         // pinned "false"
 
-        // Prompts from `zj-herdr prompt` reach every loaded instance in the
-        // session. Keep this "true" on exactly one of them.
+        // `zj-herdr prompt` pipes to this alias (the daemon's `plugin`
+        // setting, "zj_herdr" by default). Zellij loads the plugin, floating,
+        // in a session that has not opened it yet; it hides itself again
+        // once the prompt is typed.
         // deliver_prompts "true"
 
         // Used once at load to fetch the first snapshot without waiting for
@@ -31,24 +33,29 @@ keybinds {
             }
         }
         // Jump to the next / previous agent that needs you
-        // (blocked first, then idle), across sessions.
+        // (blocked first, then idle), across sessions. If the plugin is not
+        // loaded yet, it is launched floating, never as a tiled pane, and
+        // hides itself after the jump (or at once when nobody needs you).
         bind "Alt ]" {
             MessagePlugin "zj_herdr" {
                 name "zj_herdr.cmd.v1"
                 payload "attention-next"
+                floating true
             }
         }
         bind "Alt [" {
             MessagePlugin "zj_herdr" {
                 name "zj_herdr.cmd.v1"
                 payload "attention-prev"
+                floating true
             }
         }
     }
 }
 
-// Optional: a pinned, narrow agent list in a layout. Because the floating
-// picker above already delivers prompts, this one does not.
+// Optional: a pinned, narrow agent list in a layout. Its configuration
+// differs from the alias above, so Zellij treats it as a separate instance;
+// prompts and attention keys keep going to the alias.
 //
 // layout {
 //     pane split_direction="vertical" {

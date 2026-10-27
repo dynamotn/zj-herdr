@@ -19,9 +19,8 @@ pub fn uid() -> u32 {
 }
 
 /// `$ZJ_HERDR_SOCKET`, else `$XDG_RUNTIME_DIR/zj-herdr.sock`, else
-/// `$TMPDIR/zj-herdr-$UID/zj-herdr.sock`. The last one lives in its own
-/// directory because `$TMPDIR` may be the shared `/tmp`, where a bare
-/// socket name could be claimed first by another user.
+/// `$TMPDIR/zj-herdr-$UID.sock`. `$TMPDIR` may be the shared `/tmp`; see
+/// [`check_socket_dir`] for why that is still safe.
 pub fn socket_path_from(get: impl Fn(&str) -> Option<String>, uid: u32) -> PathBuf {
     if let Some(path) = get("ZJ_HERDR_SOCKET") {
         return PathBuf::from(path);
@@ -30,7 +29,7 @@ pub fn socket_path_from(get: impl Fn(&str) -> Option<String>, uid: u32) -> PathB
         return PathBuf::from(dir).join("zj-herdr.sock");
     }
     let tmp = get("TMPDIR").unwrap_or_else(|| "/tmp".to_string());
-    PathBuf::from(tmp).join(format!("zj-herdr-{uid}")).join("zj-herdr.sock")
+    PathBuf::from(tmp).join(format!("zj-herdr-{uid}.sock"))
 }
 
 /// Refuse a socket directory another user could tamper with: it must be a
@@ -56,14 +55,57 @@ pub fn check_private_dir(dir: &Path, uid: u32) -> io::Result<()> {
     }
 }
 
-/// Create `dir` with mode 0700 if missing, then [`check_private_dir`] it.
-pub fn ensure_private_dir(dir: &Path, uid: u32) -> io::Result<()> {
+/// A directory the socket may live in: a private one, or a shared one with
+/// the sticky bit (`/tmp`), where other users cannot remove or replace a
+/// file we own. A socket another user planted there first is refused by
+/// [`check_socket_owner`] on both ends.
+pub fn check_socket_dir(dir: &Path, uid: u32) -> io::Result<()> {
+    let private = check_private_dir(dir, uid);
+    if private.is_ok() {
+        return private;
+    }
+    let trusted = |m: &fs::Metadata| m.uid() == 0 || m.uid() == uid;
+    let mut meta = fs::symlink_metadata(dir)?;
+    // macOS's `/tmp` is a root-owned link to `/private/tmp`; follow a link
+    // only when root or we own it.
+    if meta.file_type().is_symlink() && trusted(&meta) {
+        meta = fs::metadata(dir)?;
+    }
+    if meta.file_type().is_dir() && trusted(&meta) && meta.mode() & 0o1000 != 0 {
+        Ok(())
+    } else {
+        private
+    }
+}
+
+/// An existing socket path must be a socket we own.
+pub fn check_socket_owner(path: &Path, uid: u32) -> io::Result<()> {
+    use std::os::unix::fs::FileTypeExt;
+    let meta = fs::symlink_metadata(path)?;
+    let reason = if !meta.file_type().is_socket() {
+        Some("is not a socket".to_string())
+    } else if meta.uid() != uid {
+        Some(format!("is owned by uid {}", meta.uid()))
+    } else {
+        None
+    };
+    match reason {
+        Some(r) => Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{} {r}; refusing it", path.display()),
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Create `dir` with mode 0700 if missing, then [`check_socket_dir`] it.
+pub fn ensure_socket_dir(dir: &Path, uid: u32) -> io::Result<()> {
     match fs::DirBuilder::new().mode(0o700).create(dir) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
         Err(e) => return Err(e),
     }
-    check_private_dir(dir, uid)
+    check_socket_dir(dir, uid)
 }
 
 pub fn socket_path() -> PathBuf {
@@ -91,10 +133,18 @@ mod tests {
     #[test]
     fn socket_path_precedence() {
         let vars = |pairs: &'static [(&'static str, &'static str)]| {
-            move |k: &str| pairs.iter().find(|(key, _)| *key == k).map(|(_, v)| v.to_string())
+            move |k: &str| {
+                pairs
+                    .iter()
+                    .find(|(key, _)| *key == k)
+                    .map(|(_, v)| v.to_string())
+            }
         };
         assert_eq!(
-            socket_path_from(vars(&[("ZJ_HERDR_SOCKET", "/s"), ("XDG_RUNTIME_DIR", "/run/u")]), 1),
+            socket_path_from(
+                vars(&[("ZJ_HERDR_SOCKET", "/s"), ("XDG_RUNTIME_DIR", "/run/u")]),
+                1
+            ),
             PathBuf::from("/s")
         );
         assert_eq!(
@@ -103,11 +153,11 @@ mod tests {
         );
         assert_eq!(
             socket_path_from(vars(&[("TMPDIR", "/t/")]), 501),
-            PathBuf::from("/t/zj-herdr-501/zj-herdr.sock")
+            PathBuf::from("/t/zj-herdr-501.sock")
         );
         assert_eq!(
             socket_path_from(vars(&[]), 7),
-            PathBuf::from("/tmp/zj-herdr-7/zj-herdr.sock")
+            PathBuf::from("/tmp/zj-herdr-7.sock")
         );
     }
 
@@ -116,9 +166,9 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("zj-herdr-1");
-        ensure_private_dir(&dir, uid()).unwrap();
+        ensure_socket_dir(&dir, uid()).unwrap();
         assert_eq!(fs::metadata(&dir).unwrap().mode() & 0o777, 0o700);
-        ensure_private_dir(&dir, uid()).unwrap();
+        ensure_socket_dir(&dir, uid()).unwrap();
 
         assert!(
             check_private_dir(&dir, uid().wrapping_add(1)).is_err(),
@@ -128,10 +178,43 @@ mod tests {
         let open = tmp.path().join("open");
         fs::create_dir(&open).unwrap();
         fs::set_permissions(&open, fs::Permissions::from_mode(0o777)).unwrap();
-        assert!(check_private_dir(&open, uid()).is_err(), "world-writable dir accepted");
+        assert!(
+            check_private_dir(&open, uid()).is_err(),
+            "world-writable dir accepted"
+        );
 
         let link = tmp.path().join("link");
         std::os::unix::fs::symlink(&dir, &link).unwrap();
         assert!(check_private_dir(&link, uid()).is_err(), "symlink accepted");
+        assert!(
+            check_socket_dir(&open, uid()).is_err(),
+            "non-sticky shared dir accepted"
+        );
+
+        let sticky = tmp.path().join("sticky");
+        fs::create_dir(&sticky).unwrap();
+        fs::set_permissions(&sticky, fs::Permissions::from_mode(0o1777)).unwrap();
+        check_socket_dir(&sticky, uid()).unwrap();
+    }
+
+    #[test]
+    fn socket_owner_must_be_us() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("s.sock");
+        let plain = tmp.path().join("plain");
+        fs::write(&plain, "").unwrap();
+        assert!(
+            check_socket_owner(&plain, uid()).is_err(),
+            "regular file accepted"
+        );
+        let _listener = match std::os::unix::net::UnixListener::bind(&sock) {
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+                eprintln!("skipped: this environment forbids binding Unix sockets ({e})");
+                return;
+            }
+            other => other.unwrap(),
+        };
+        check_socket_owner(&sock, uid()).unwrap();
+        assert!(check_socket_owner(&sock, uid().wrapping_add(1)).is_err());
     }
 }

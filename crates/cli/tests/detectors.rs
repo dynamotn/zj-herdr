@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, UNIX_EPOCH};
 
 use zj_herdr::agents;
-use zj_herdr::detect::{self, ClaudeDetector, CodexDetector, Detector, ProcessDetector};
+use zj_herdr::detect::{self, AiderDetector, ClaudeDetector, CodexDetector, Detector};
 use zj_herdr::procs::{ProcInfo, RawProc};
 use zj_herdr::scan::Scanner;
 use zj_herdr::transcript::claude_slug;
@@ -19,7 +19,9 @@ const CODEX_OLD: &str = "rollout-2025-05-01T09-00-00-0196a1b2-0000-7e5f-8a9b-0c1
 const CODEX_OTHER: &str = "rollout-2025-04-30T08-00-00-0196a1b2-ffff-7e5f-8a9b-0c1d2e3f4a5b.jsonl";
 
 fn fixture(rel: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(rel)
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(rel)
 }
 
 fn set_mtime(path: &Path, secs: u64) {
@@ -66,9 +68,7 @@ fn proc(kind: &str, cwd: &str, sampled_at: u64, cpu: f32) -> ProcInfo {
 fn claude_state(name: &str, age: u64, cpu: f32) -> AgentState {
     let tmp = tempfile::tempdir().unwrap();
     install_claude(tmp.path(), "/work/proj", name, "s1", T0);
-    let detector = ClaudeDetector {
-        projects: tmp.path().to_path_buf(),
-    };
+    let detector = ClaudeDetector::new(tmp.path().to_path_buf());
     detector
         .detect(&proc("claude", "/work/proj", T0 + age, cpu))
         .unwrap()
@@ -95,9 +95,7 @@ fn claude_pending_tool_just_written_is_working() {
 fn claude_pending_tool_recently_busy_is_working() {
     let tmp = tempfile::tempdir().unwrap();
     install_claude(tmp.path(), "/work/proj", "pending-tool", "s1", T0);
-    let detector = ClaudeDetector {
-        projects: tmp.path().to_path_buf(),
-    };
+    let detector = ClaudeDetector::new(tmp.path().to_path_buf());
     let mut p = proc("claude", "/work/proj", T0 + 30, 0.0);
     p.cpu_quiet_for = Some(2);
     assert_eq!(detector.detect(&p).unwrap().state, AgentState::Working);
@@ -115,7 +113,10 @@ fn claude_ended_turn_is_idle_once_quiet() {
 #[test]
 fn claude_awaiting_reply_is_working_while_active() {
     assert_eq!(claude_state("awaiting-reply", 2, 0.0), AgentState::Working);
-    assert_eq!(claude_state("awaiting-reply", 120, 5.0), AgentState::Working);
+    assert_eq!(
+        claude_state("awaiting-reply", 120, 5.0),
+        AgentState::Working
+    );
     assert_eq!(claude_state("awaiting-reply", 120, 0.0), AgentState::Idle);
 }
 
@@ -130,10 +131,10 @@ fn claude_reports_newest_transcript_as_session() {
     install_claude(tmp.path(), "/work/proj", "turn-ended", "older", T0 - 100);
     install_claude(tmp.path(), "/work/proj", "pending-tool", "newer", T0);
     install_claude(tmp.path(), "/work/other", "turn-ended", "other", T0 + 5);
-    let detector = ClaudeDetector {
-        projects: tmp.path().to_path_buf(),
-    };
-    let status = detector.detect(&proc("claude", "/work/proj", T0 + 30, 0.0)).unwrap();
+    let detector = ClaudeDetector::new(tmp.path().to_path_buf());
+    let status = detector
+        .detect(&proc("claude", "/work/proj", T0 + 30, 0.0))
+        .unwrap();
     assert_eq!(status.session_id.as_deref(), Some("newer"));
     assert_eq!(status.state, AgentState::Blocked);
     assert_eq!(status.last_activity, Some(T0));
@@ -144,9 +145,7 @@ fn claude_resume_flag_selects_its_transcript() {
     let tmp = tempfile::tempdir().unwrap();
     install_claude(tmp.path(), "/work/proj", "turn-ended", "resumed", T0 - 100);
     install_claude(tmp.path(), "/work/proj", "pending-tool", "newer", T0);
-    let detector = ClaudeDetector {
-        projects: tmp.path().to_path_buf(),
-    };
+    let detector = ClaudeDetector::new(tmp.path().to_path_buf());
     let mut p = proc("claude", "/work/proj", T0 + 30, 0.0);
     p.argv = vec!["claude".into(), "--resume".into(), "resumed".into()];
     let status = detector.detect(&p).unwrap();
@@ -157,9 +156,8 @@ fn claude_resume_flag_selects_its_transcript() {
 #[test]
 fn claude_without_transcript_defers_to_process_signals() {
     let tmp = tempfile::tempdir().unwrap();
-    let detectors: Vec<Box<dyn Detector>> = vec![Box::new(ClaudeDetector {
-        projects: tmp.path().to_path_buf(),
-    })];
+    let detectors: Vec<Box<dyn Detector>> =
+        vec![Box::new(ClaudeDetector::new(tmp.path().to_path_buf()))];
     let status = detect::detect(&detectors, &proc("claude", "/nowhere", T0, 0.0));
     assert_eq!(status.state, AgentState::Idle);
     assert_eq!(status.session_id, None);
@@ -225,17 +223,25 @@ fn codex_resume_argument_selects_rollout() {
 #[test]
 fn codex_unknown_cwd_has_no_opinion() {
     let (_tmp, detector) = codex_tree();
-    assert!(detector.detect(&proc("codex", "/work/unknown", T0, 0.0)).is_none());
+    assert!(detector
+        .detect(&proc("codex", "/work/unknown", T0, 0.0))
+        .is_none());
 }
 
 #[test]
 fn other_agents_use_cpu_only() {
     assert_eq!(
-        ProcessDetector.detect(&proc("aider", "/w", T0, 30.0)).unwrap().state,
+        AiderDetector
+            .detect(&proc("aider", "/w", T0, 30.0))
+            .unwrap()
+            .state,
         AgentState::Working
     );
     assert_eq!(
-        ProcessDetector.detect(&proc("aider", "/w", T0, 0.1)).unwrap().state,
+        AiderDetector
+            .detect(&proc("aider", "/w", T0, 0.1))
+            .unwrap()
+            .state,
         AgentState::Idle
     );
 }
@@ -259,9 +265,7 @@ fn scanner_tracks_cpu_history_between_scans() {
     install_claude(tmp.path(), "/work/proj", "pending-tool", "s1", T0 - 1);
     let mut scanner = Scanner::with_detectors(
         "box".into(),
-        vec![Box::new(ClaudeDetector {
-            projects: tmp.path().to_path_buf(),
-        })],
+        vec![Box::new(ClaudeDetector::new(tmp.path().to_path_buf()))],
     );
 
     let mut shell = raw(100, 1, &["zsh"], 0.0);
@@ -292,4 +296,29 @@ fn scanner_tracks_cpu_history_between_scans() {
     let blocked = scanner.scan_from(&[shell, agent], T0 + 30);
     assert_eq!(blocked.agents[0].state, AgentState::Blocked);
     assert_eq!(blocked.agents[0].since, T0 - 1);
+}
+
+#[test]
+fn scanner_never_gives_two_claudes_the_same_transcript() {
+    let tmp = tempfile::tempdir().unwrap();
+    install_claude(tmp.path(), "/work/proj", "pending-tool", "s1", T0 - 1);
+    install_claude(tmp.path(), "/work/proj", "turn-ended", "s2", T0 - 2);
+    let mut scanner = Scanner::with_detectors(
+        "box".into(),
+        vec![Box::new(ClaudeDetector::new(tmp.path().to_path_buf()))],
+    );
+    let claude = |pid| {
+        let mut p = raw(pid, 1, &["claude"], 0.0);
+        p.cwd = Some("/work/proj".into());
+        p
+    };
+
+    let scan = scanner.scan_from(&[claude(101), claude(102), claude(103)], T0 + 30);
+    let mut ids: Vec<Option<&str>> = scan
+        .agents
+        .iter()
+        .map(|x| x.session_id.as_deref())
+        .collect();
+    ids.sort();
+    assert_eq!(ids, vec![None, Some("s1"), Some("s2")]);
 }

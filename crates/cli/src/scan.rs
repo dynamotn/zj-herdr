@@ -9,7 +9,9 @@ use crate::detect::{self, Detector, Roots, CPU_ACTIVE_PERCENT};
 use crate::procs::{self, ProcInfo, ProcessTable, RawProc};
 
 pub fn now_secs() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 /// Short host name, used as the local machine name.
@@ -68,7 +70,9 @@ impl Scanner {
     pub fn scan_once(machine: String, roots: &Roots) -> Machine {
         let mut scanner = Scanner::new(machine, roots);
         scanner.table = Some(ProcessTable::new());
-        std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL.max(std::time::Duration::from_millis(250)));
+        std::thread::sleep(
+            sysinfo::MINIMUM_CPU_UPDATE_INTERVAL.max(std::time::Duration::from_millis(250)),
+        );
         scanner.scan()
     }
 
@@ -80,13 +84,15 @@ impl Scanner {
     /// Scan a given process table (the testable half of [`Scanner::scan`]).
     pub fn scan_from(&mut self, raw: &[RawProc], now: u64) -> Machine {
         let mut found = procs::find_agents(raw, std::process::id(), now);
-        self.busy_at.retain(|pid, _| found.iter().any(|p| p.pid == *pid));
+        self.busy_at
+            .retain(|pid, _| found.iter().any(|p| p.pid == *pid));
         for p in &mut found {
             if p.cpu >= CPU_ACTIVE_PERCENT {
                 self.busy_at.insert(p.pid, now);
             }
             p.cpu_quiet_for = self.busy_at.get(&p.pid).map(|t| now.saturating_sub(*t));
         }
+        detect::prepare(&self.detectors, &found);
         Machine {
             name: self.machine.clone(),
             ssh: None,

@@ -15,11 +15,16 @@ use zj_herdr::client;
 use zj_herdr::registry::Registry;
 use zj_herdr::server::{self, Context};
 use zj_herdr::zellij::Zellij;
-use zj_herdr_core::{Agent, AgentState, Machine, MachineStatus, Pane, PluginCommand, CMD_SCHEMA};
+use zj_herdr_core::{
+    Agent, AgentState, Machine, MachineStatus, Pane, PluginCommand, CMD_SCHEMA, PROMPT_ACK,
+    PROMPT_NACK,
+};
 
 #[derive(Default)]
 struct FakeZellij {
     calls: Mutex<Vec<String>>,
+    /// What the plugin writes back to `deliver`; `None` means an ack.
+    reply: Mutex<Option<String>>,
 }
 
 impl Zellij for FakeZellij {
@@ -30,6 +35,18 @@ impl Zellij for FakeZellij {
         let call = format!("pipe {session} {name} {payload}");
         self.calls.lock().unwrap().push(call);
         Ok(())
+    }
+    fn deliver(
+        &self,
+        session: &str,
+        plugin: &str,
+        name: &str,
+        payload: &str,
+    ) -> Result<String, String> {
+        let call = format!("deliver {session} {plugin} {name} {payload}");
+        self.calls.lock().unwrap().push(call);
+        let reply = self.reply.lock().unwrap().clone();
+        Ok(reply.unwrap_or_else(|| format!("{PROMPT_ACK}\n")))
     }
     fn run(&self, session: &str, cwd: Option<&str>, command: &[String]) -> Result<(), String> {
         let call = format!("run {session} {cwd:?} {}", command.join(" "));
@@ -83,8 +100,13 @@ impl Daemon {
             registry: Arc::clone(&registry),
             zellij: fake.clone(),
             machine: "box".into(),
+            plugin: "zj_herdr".into(),
         });
-        Daemon { registry, fake, ctx }
+        Daemon {
+            registry,
+            fake,
+            ctx,
+        }
     }
 
     /// A client stream whose other end is served by the daemon.
@@ -100,7 +122,13 @@ impl Daemon {
     }
 
     fn last_call(&self) -> String {
-        self.fake.calls.lock().unwrap().last().cloned().unwrap_or_default()
+        self.fake
+            .calls
+            .lock()
+            .unwrap()
+            .last()
+            .cloned()
+            .unwrap_or_default()
     }
 }
 
@@ -123,14 +151,67 @@ fn only_the_owning_user_is_served() {
 }
 
 #[test]
-fn bind_refuses_a_shared_directory() {
+fn client_refuses_a_listener_running_as_someone_else() {
+    let (a, _b) = UnixStream::pair().unwrap();
+    let me = zj_herdr::paths::uid();
+    client::check_peer(&a, me).unwrap();
+    let err = client::check_peer(&a, me.wrapping_add(1)).unwrap_err();
+    assert!(err.contains("refusing"), "{err}");
+}
+
+#[test]
+fn sticky_dir_behind_a_link_of_ours_is_accepted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let real = tmp.path().join("private-tmp");
+    std::fs::create_dir(&real).unwrap();
+    std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o1777)).unwrap();
+    let link = tmp.path().join("tmp");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let me = zj_herdr::paths::uid();
+    zj_herdr::paths::check_socket_dir(&link, me).unwrap();
+    assert!(zj_herdr::paths::check_socket_dir(&link, me.wrapping_add(1)).is_err());
+}
+
+#[test]
+fn bind_refuses_a_shared_directory_without_sticky_bit() {
     let tmp = tempfile::tempdir().unwrap();
     let shared = tmp.path().join("shared");
     std::fs::create_dir(&shared).unwrap();
-    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o1777)).unwrap();
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
     let err = server::bind(&shared.join("s.sock")).unwrap_err();
     assert_eq!(err.kind(), ErrorKind::PermissionDenied);
     assert!(err.to_string().contains("writable by other users"), "{err}");
+}
+
+#[test]
+fn bind_refuses_to_replace_something_that_is_not_its_socket() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("zj-herdr-1.sock");
+    std::fs::write(&path, "planted").unwrap();
+    let err = server::bind(&path).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::PermissionDenied);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "planted");
+}
+
+#[test]
+fn bind_accepts_a_sticky_shared_directory_like_tmp() {
+    let tmp = tempfile::tempdir().unwrap();
+    let shared = tmp.path().join("tmp");
+    std::fs::create_dir(&shared).unwrap();
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o1777)).unwrap();
+    let path = shared.join("zj-herdr-1.sock");
+    match server::bind(&path) {
+        Err(e)
+            if e.kind() == ErrorKind::PermissionDenied && !e.to_string().contains("refusing") =>
+        {
+            eprintln!("skipped: this environment forbids binding Unix sockets ({e})");
+        }
+        other => {
+            other.unwrap();
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+    }
 }
 
 #[test]
@@ -158,22 +239,30 @@ fn bound_socket_is_private_and_not_stolen() {
 #[test]
 fn list_returns_every_machine() {
     let d = Daemon::new();
-    d.registry
-        .publish(machine("box", vec![agent("box", 10, AgentState::Idle, dev_pane())]), 1);
-    d.registry
-        .publish(machine("far", vec![agent("far", 20, AgentState::Idle, dev_pane())]), 1);
+    d.registry.publish(
+        machine("box", vec![agent("box", 10, AgentState::Idle, dev_pane())]),
+        1,
+    );
+    d.registry.publish(
+        machine("far", vec![agent("far", 20, AgentState::Idle, dev_pane())]),
+        1,
+    );
     let state = d.request(Request::List).unwrap().state.unwrap();
     assert_eq!(state.agents().count(), 2);
     assert_eq!(state.machines.len(), 2);
 }
 
 #[test]
-fn prompt_goes_through_the_plugin_pipe() {
+fn prompt_goes_to_the_plugin_by_name() {
     let d = Daemon::new();
-    d.registry
-        .publish(machine("box", vec![agent("box", 10, AgentState::Idle, dev_pane())]), 1);
-    d.registry
-        .publish(machine("far", vec![agent("far", 20, AgentState::Idle, dev_pane())]), 1);
+    d.registry.publish(
+        machine("box", vec![agent("box", 10, AgentState::Idle, dev_pane())]),
+        1,
+    );
+    d.registry.publish(
+        machine("far", vec![agent("far", 20, AgentState::Idle, dev_pane())]),
+        1,
+    );
 
     d.request(prompt("box/10", "go on", true)).unwrap();
     let expected = PluginCommand::Prompt {
@@ -181,7 +270,10 @@ fn prompt_goes_through_the_plugin_pipe() {
         text: "go on\r".into(),
     }
     .to_json();
-    assert_eq!(d.last_call(), format!("pipe dev {CMD_SCHEMA} {expected}"));
+    assert_eq!(
+        d.last_call(),
+        format!("deliver dev zj_herdr {CMD_SCHEMA} {expected}")
+    );
 
     // `dev:3` exists on both machines; a pane selector means the local one.
     d.request(prompt("dev:3", "again", false)).unwrap();
@@ -190,7 +282,10 @@ fn prompt_goes_through_the_plugin_pipe() {
         text: "again".into(),
     }
     .to_json();
-    assert_eq!(d.last_call(), format!("pipe dev {CMD_SCHEMA} {expected}"));
+    assert_eq!(
+        d.last_call(),
+        format!("deliver dev zj_herdr {CMD_SCHEMA} {expected}")
+    );
 
     let err = d.request(prompt("far/20", "x", false)).unwrap_err();
     assert!(err.contains("remote"), "{err}");
@@ -199,10 +294,32 @@ fn prompt_goes_through_the_plugin_pipe() {
 }
 
 #[test]
+fn prompt_fails_unless_the_plugin_acknowledges_it() {
+    let d = Daemon::new();
+    d.registry.publish(
+        machine("box", vec![agent("box", 10, AgentState::Idle, dev_pane())]),
+        1,
+    );
+
+    *d.fake.reply.lock().unwrap() = Some(String::new());
+    let err = d.request(prompt("10", "x", true)).unwrap_err();
+    assert!(
+        err.contains("not delivered") && err.contains("acknowledged"),
+        "{err}"
+    );
+
+    *d.fake.reply.lock().unwrap() = Some(format!("{PROMPT_NACK} permissions not granted\n"));
+    let err = d.request(prompt("10", "x", true)).unwrap_err();
+    assert!(err.contains("permissions not granted"), "{err}");
+}
+
+#[test]
 fn prompt_needs_a_pane() {
     let d = Daemon::new();
-    d.registry
-        .publish(machine("box", vec![agent("box", 10, AgentState::Idle, None)]), 1);
+    d.registry.publish(
+        machine("box", vec![agent("box", 10, AgentState::Idle, None)]),
+        1,
+    );
     let err = d.request(prompt("10", "x", true)).unwrap_err();
     assert!(err.contains("not running inside Zellij"), "{err}");
 }
@@ -223,7 +340,10 @@ fn spawn_runs_in_the_session() {
 fn wait_and_subscribe_see_changes() {
     let d = Daemon::new();
     d.registry.publish(
-        machine("box", vec![agent("box", 10, AgentState::Working, dev_pane())]),
+        machine(
+            "box",
+            vec![agent("box", 10, AgentState::Working, dev_pane())],
+        ),
         1,
     );
 
@@ -246,7 +366,10 @@ fn wait_and_subscribe_see_changes() {
     });
     thread::sleep(Duration::from_millis(100));
     d.registry.publish(
-        machine("box", vec![agent("box", 10, AgentState::Blocked, dev_pane())]),
+        machine(
+            "box",
+            vec![agent("box", 10, AgentState::Blocked, dev_pane())],
+        ),
         2,
     );
 

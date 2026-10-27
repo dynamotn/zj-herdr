@@ -29,6 +29,8 @@ pub struct Options {
     pub machine: String,
     pub roots: Roots,
     pub remotes: Vec<Remote>,
+    /// Zellij plugin URL or alias that types prompts.
+    pub plugin: String,
     /// Where pane sessions are recorded for `zj-herdr restore`.
     pub sessions: PathBuf,
 }
@@ -40,13 +42,23 @@ pub fn run(opts: Options) -> Result<(), String> {
             r.name
         ));
     }
-    let listener = server::bind(&opts.socket).map_err(|e| format!("{}: {e}", opts.socket.display()))?;
+    let (mut store, aside) = Store::load_or_set_aside(&opts.sessions)?;
+    if let Some(aside) = aside {
+        eprintln!(
+            "zj-herdr: {} was unreadable; moved it to {} and started afresh",
+            opts.sessions.display(),
+            aside.display()
+        );
+    }
+    let listener =
+        server::bind(&opts.socket).map_err(|e| format!("{}: {e}", opts.socket.display()))?;
     let registry = Arc::new(Registry::default());
     let zellij: Arc<dyn Zellij> = Arc::new(ZellijCli);
     let ctx = Arc::new(Context {
         registry: Arc::clone(&registry),
         zellij: Arc::clone(&zellij),
         machine: opts.machine.clone(),
+        plugin: opts.plugin.clone(),
     });
     eprintln!("zj-herdr: listening on {}", opts.socket.display());
 
@@ -60,13 +72,6 @@ pub fn run(opts: Options) -> Result<(), String> {
         thread::spawn(move || remote::poll_loop(r, registry));
     }
 
-    let mut store = Store::load(&opts.sessions).unwrap_or_else(|e| {
-        // Keep the unreadable file for the user rather than overwrite it.
-        let aside = opts.sessions.with_extension("json.unreadable");
-        let _ = std::fs::rename(&opts.sessions, &aside);
-        eprintln!("zj-herdr: {e}; moved it to {} and started afresh", aside.display());
-        Store::default()
-    });
     let mut scanner = Scanner::new(opts.machine, &opts.roots);
     loop {
         let started = Instant::now();

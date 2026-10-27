@@ -92,7 +92,9 @@ pub fn find_agents(procs: &[RawProc], self_pid: u32, sampled_at: u64) -> Vec<Pro
 
     let mut found: Vec<ProcInfo> = kinds
         .iter()
-        .filter(|(pid, spec)| !ancestors(**pid).any(|a| kinds.get(&a).is_some_and(|k| k.kind == spec.kind)))
+        .filter(|(pid, spec)| {
+            !ancestors(**pid).any(|a| kinds.get(&a).is_some_and(|k| k.kind == spec.kind))
+        })
         .map(|(&pid, &spec)| {
             let p = by_pid[&pid];
             let pane = p
@@ -116,7 +118,11 @@ pub fn find_agents(procs: &[RawProc], self_pid: u32, sampled_at: u64) -> Vec<Pro
     found
 }
 
-fn subtree_cpu(root: u32, by_pid: &HashMap<u32, &RawProc>, children: &HashMap<u32, Vec<u32>>) -> f32 {
+fn subtree_cpu(
+    root: u32,
+    by_pid: &HashMap<u32, &RawProc>,
+    children: &HashMap<u32, Vec<u32>>,
+) -> f32 {
     let mut total = 0.0;
     let mut stack = vec![root];
     let mut seen = 0usize;
@@ -157,7 +163,8 @@ impl ProcessTable {
             .with_exe(UpdateKind::OnlyIfNotSet)
             .with_environ(UpdateKind::OnlyIfNotSet)
             .with_cwd(UpdateKind::Always);
-        self.sys.refresh_processes_specifics(ProcessesToUpdate::All, true, kind);
+        self.sys
+            .refresh_processes_specifics(ProcessesToUpdate::All, true, kind);
     }
 
     /// Refresh and return the table. Call at least
@@ -173,9 +180,17 @@ impl ProcessTable {
                 ppid: p.parent().map(|pp| pp.as_u32()),
                 name: p.name().to_string_lossy().into_owned(),
                 exe: p.exe().map(|e| e.to_string_lossy().into_owned()),
-                argv: p.cmd().iter().map(|a| a.to_string_lossy().into_owned()).collect(),
+                argv: p
+                    .cmd()
+                    .iter()
+                    .map(|a| a.to_string_lossy().into_owned())
+                    .collect(),
                 cwd: p.cwd().map(PathBuf::from),
-                pane: pane_from_env(p.environ().iter().filter_map(|kv| kv.to_str()?.split_once('='))),
+                pane: pane_from_env(
+                    p.environ()
+                        .iter()
+                        .filter_map(|kv| kv.to_str()?.split_once('=')),
+                ),
                 cpu: p.cpu_usage(),
                 start_time: p.start_time(),
             })
@@ -206,7 +221,11 @@ mod tests {
 
     #[test]
     fn parses_zellij_env() {
-        let vars = [("HOME", "/h"), ("ZELLIJ_SESSION_NAME", "work"), ("ZELLIJ_PANE_ID", "7")];
+        let vars = [
+            ("HOME", "/h"),
+            ("ZELLIJ_SESSION_NAME", "work"),
+            ("ZELLIJ_PANE_ID", "7"),
+        ];
         assert_eq!(pane_from_env(vars), pane("work", 7));
         assert_eq!(pane_from_env([("ZELLIJ_PANE_ID", "7")]), None);
         assert_eq!(
@@ -238,8 +257,16 @@ mod tests {
 
     #[test]
     fn folds_same_kind_helpers_into_their_parent() {
-        let launcher = proc(10, 1, &["node", "/usr/lib/node_modules/@openai/codex/bin/codex"]);
-        let native = proc(11, 10, &["/usr/lib/node_modules/@openai/codex/vendor/codex", "--yolo"]);
+        let launcher = proc(
+            10,
+            1,
+            &["node", "/usr/lib/node_modules/@openai/codex/bin/codex"],
+        );
+        let native = proc(
+            11,
+            10,
+            &["/usr/lib/node_modules/@openai/codex/vendor/codex", "--yolo"],
+        );
         let found = find_agents(&[launcher, native], 999, 0);
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].pid, 10);

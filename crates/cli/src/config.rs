@@ -1,12 +1,14 @@
 //! `~/.config/zj-herdr/config.toml`.
 //!
 //! ```toml
+//! plugin = "zj_herdr"       # Zellij plugin alias or URL that types prompts
+//!
 //! [[remote]]
 //! name = "l30n4rd0d4v1nc1"
 //! ssh = "l30n4rd0d4v1nc1"   # a Host alias from ~/.ssh/config
 //! ```
 //!
-//! Only SSH targets live here. Authentication is the user's own SSH config
+//! Besides the plugin, only SSH targets live here. Authentication is the user's own SSH config
 //! and agent; zj-herdr never reads keys and the config holds no credentials.
 
 use std::path::Path;
@@ -44,27 +46,61 @@ fn default_timeout() -> u64 {
     DEFAULT_REMOTE_TIMEOUT_SECS
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+/// The alias `docs/zellij.kdl` declares for the plugin.
+pub const DEFAULT_PLUGIN: &str = "zj_herdr";
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    /// Zellij plugin URL or alias that `prompt` is piped to; Zellij loads
+    /// it in the agent's session if it is not running there yet.
+    #[serde(default = "default_plugin")]
+    pub plugin: String,
     #[serde(default)]
     pub remote: Vec<Remote>,
+}
+
+fn default_plugin() -> String {
+    DEFAULT_PLUGIN.into()
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Config {
+            plugin: default_plugin(),
+            remote: Vec::new(),
+        }
+    }
 }
 
 impl Config {
     pub fn parse(text: &str) -> Result<Self, String> {
         let config: Config = toml::from_str(text).map_err(|e| e.to_string())?;
+        // Handed to `zellij --plugin`; a leading '-' would read as an option.
+        if config.plugin.is_empty() || config.plugin.starts_with('-') {
+            return Err(format!(
+                "plugin {:?} is not a plugin URL or alias",
+                config.plugin
+            ));
+        }
         let mut seen = std::collections::HashSet::new();
         for r in &config.remote {
             if r.name.is_empty() || r.name.contains('/') {
-                return Err(format!("remote name {:?} must be non-empty and contain no '/'", r.name));
+                return Err(format!(
+                    "remote name {:?} must be non-empty and contain no '/'",
+                    r.name
+                ));
             }
             if !seen.insert(r.name.as_str()) {
                 return Err(format!("remote name {:?} is used twice", r.name));
             }
             // A leading '-' would be read by ssh as an option.
-            if r.ssh.is_empty() || r.ssh.starts_with('-') || r.ssh.chars().any(char::is_whitespace) {
-                return Err(format!("remote {:?}: ssh target {:?} is not a host", r.name, r.ssh));
+            if r.ssh.is_empty() || r.ssh.starts_with('-') || r.ssh.chars().any(char::is_whitespace)
+            {
+                return Err(format!(
+                    "remote {:?}: ssh target {:?} is not a host",
+                    r.name, r.ssh
+                ));
             }
             if r.interval_secs == 0 || r.timeout_secs == 0 {
                 return Err(format!(
@@ -112,6 +148,10 @@ mod tests {
         assert_eq!(config.remote[1].command, "/opt/bin/zj-herdr");
         assert_eq!(config.remote[1].interval_secs, 30);
         assert_eq!(Config::parse("").unwrap(), Config::default());
+        assert_eq!(config.plugin, DEFAULT_PLUGIN);
+        let custom = Config::parse("plugin = \"file:/opt/zj_herdr.wasm\"").unwrap();
+        assert_eq!(custom.plugin, "file:/opt/zj_herdr.wasm");
+        assert!(Config::parse("plugin = \"--evil\"").is_err());
     }
 
     #[test]
@@ -131,6 +171,9 @@ mod tests {
     #[test]
     fn missing_file_is_empty() {
         let tmp = tempfile::tempdir().unwrap();
-        assert_eq!(Config::load(&tmp.path().join("none.toml")).unwrap(), Config::default());
+        assert_eq!(
+            Config::load(&tmp.path().join("none.toml")).unwrap(),
+            Config::default()
+        );
     }
 }

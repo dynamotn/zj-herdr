@@ -10,7 +10,7 @@ use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::Duration;
 
-use zj_herdr_core::{PluginCommand, CMD_SCHEMA};
+use zj_herdr_core::{prompt_reply, PluginCommand, CMD_SCHEMA};
 
 use crate::api::{self, Request, Response};
 use crate::paths;
@@ -22,17 +22,26 @@ pub struct Context {
     pub zellij: Arc<dyn Zellij>,
     /// Name of this machine; only its agents can be prompted.
     pub machine: String,
+    /// Zellij plugin URL or alias that types prompts.
+    pub plugin: String,
 }
 
-/// Bind the socket with mode 0600 inside a directory only we control,
-/// replacing a stale socket but refusing to steal it from a running daemon.
+/// Bind the socket with mode 0600 in a directory others cannot tamper
+/// with, replacing a stale socket of ours but refusing to steal one from a
+/// running daemon or to touch anything another user put there.
 pub fn bind(path: &Path) -> io::Result<UnixListener> {
     let dir = match path.parent() {
         Some(d) if !d.as_os_str().is_empty() => d,
         _ => Path::new("."),
     };
-    paths::ensure_private_dir(dir, paths::uid())?;
+    paths::ensure_socket_dir(dir, paths::uid())?;
     if fs::symlink_metadata(path).is_ok() {
+        paths::check_socket_owner(path, paths::uid()).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("{e}; set ZJ_HERDR_SOCKET or XDG_RUNTIME_DIR to use another path"),
+            )
+        })?;
         if UnixStream::connect(path).is_ok() {
             return Err(io::Error::new(
                 io::ErrorKind::AddrInUse,
@@ -148,11 +157,17 @@ pub fn respond(ctx: &Context, req: Request) -> Response {
             state: Some(ctx.registry.snapshot()),
             ..Response::ok()
         },
-        Request::Wait { agent, state, timeout } => {
-            match ctx
-                .registry
-                .wait_for(&agent, state, timeout.map(Duration::from_secs_f64), &ctx.machine)
-            {
+        Request::Wait {
+            agent,
+            state,
+            timeout,
+        } => {
+            match ctx.registry.wait_for(
+                &agent,
+                state,
+                timeout.map(Duration::from_secs_f64),
+                &ctx.machine,
+            ) {
                 Ok(agent) => Response {
                     agent: Some(agent),
                     ..Response::ok()
@@ -160,15 +175,25 @@ pub fn respond(ctx: &Context, req: Request) -> Response {
                 Err(e) => Response::error(e),
             }
         }
-        Request::Prompt { agent, text, submit } => match prompt(ctx, &agent, text, submit) {
+        Request::Prompt {
+            agent,
+            text,
+            submit,
+        } => match prompt(ctx, &agent, text, submit) {
             Ok(()) => Response::ok(),
             Err(e) => Response::error(e),
         },
-        Request::Spawn { session, cwd, command } => match ctx.zellij.run(&session, cwd.as_deref(), &command.argv()) {
+        Request::Spawn {
+            session,
+            cwd,
+            command,
+        } => match ctx.zellij.run(&session, cwd.as_deref(), &command.argv()) {
             Ok(()) => Response::ok(),
             Err(e) => Response::error(e),
         },
-        Request::Subscribe => Response::error("subscribe streams events; send it on its own connection"),
+        Request::Subscribe => {
+            Response::error("subscribe streams events; send it on its own connection")
+        }
     }
 }
 
@@ -197,5 +222,15 @@ fn prompt(ctx: &Context, selector: &str, mut text: String, submit: bool) -> Resu
         pane_id: pane.pane_id,
         text,
     };
-    ctx.zellij.pipe(&pane.session, CMD_SCHEMA, &cmd.to_json())
+    // Addressed to the plugin itself so Zellij loads it in a session that
+    // has not opened the picker yet; only its acknowledgement counts.
+    let reply = ctx
+        .zellij
+        .deliver(&pane.session, &ctx.plugin, CMD_SCHEMA, &cmd.to_json())?;
+    prompt_reply(&reply).map_err(|e| {
+        format!(
+            "prompt to {} in session {} not delivered: {e}",
+            agent.id, pane.session
+        )
+    })
 }

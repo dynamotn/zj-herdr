@@ -1,0 +1,63 @@
+// zj-herdr: example Zellij configuration.
+//
+// Merge these blocks into ~/.config/zellij/config.kdl. Build the plugin with
+//   cargo build -p zj-herdr-plugin --target wasm32-wasip1 --release
+// and copy target/wasm32-wasip1/release/zj_herdr.wasm to the location below.
+
+plugins {
+    zj_herdr location="file:~/.config/zellij/plugins/zj_herdr.wasm" {
+        // Stay open after Enter or an attention jump (for a pinned pane).
+        // pinned "false"
+
+        // Prompts from `zj-herdr prompt` reach every loaded instance in the
+        // session. Keep this "true" on exactly one of them.
+        // deliver_prompts "true"
+
+        // Used once at load to fetch the first snapshot without waiting for
+        // the daemon's next push. Use an absolute path if Zellij's PATH
+        // does not include it.
+        // zj_herdr_bin "zj-herdr"
+    }
+}
+
+keybinds {
+    shared_except "locked" {
+        // Open the floating picker: j/k or arrows move, Enter jumps,
+        // n/p cycle attention, Esc or q hides it.
+        bind "Alt a" {
+            LaunchOrFocusPlugin "zj_herdr" {
+                floating true
+                move_to_focused_tab true
+            }
+        }
+        // Jump to the next / previous agent that needs you
+        // (blocked first, then idle), across sessions.
+        bind "Alt ]" {
+            MessagePlugin "zj_herdr" {
+                name "zj_herdr.cmd.v1"
+                payload "attention-next"
+            }
+        }
+        bind "Alt [" {
+            MessagePlugin "zj_herdr" {
+                name "zj_herdr.cmd.v1"
+                payload "attention-prev"
+            }
+        }
+    }
+}
+
+// Optional: a pinned, narrow agent list in a layout. Because the floating
+// picker above already delivers prompts, this one does not.
+//
+// layout {
+//     pane split_direction="vertical" {
+//         pane
+//         pane size=44 {
+//             plugin location="zj_herdr" {
+//                 pinned "true"
+//                 deliver_prompts "false"
+//             }
+//         }
+//     }
+// }

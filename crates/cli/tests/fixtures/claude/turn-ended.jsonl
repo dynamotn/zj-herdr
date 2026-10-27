@@ -1,0 +1,5 @@
+{"type":"user","uuid":"u1","sessionId":"turn-ended","cwd":"/work/proj","message":{"role":"user","content":"list the files"}}
+{"type":"assistant","uuid":"u2","parentUuid":"u1","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_01","name":"Bash","input":{"command":"ls"}}]}}
+{"type":"user","uuid":"u3","parentUuid":"u2","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_01","content":"a\nb"}]}}
+{"type":"assistant","uuid":"u4","parentUuid":"u3","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"Two files: a and b."}]}}
+{"type":"file-history-snapshot","messageId":"u4","snapshot":{}}

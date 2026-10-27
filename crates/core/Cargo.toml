@@ -1,0 +1,9 @@
+[package]
+name = "zj-herdr-core"
+description = "Shared types and wire format for zj-herdr"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true

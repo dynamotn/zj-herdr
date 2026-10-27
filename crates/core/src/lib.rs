@@ -1,0 +1,323 @@
+//! Shared types for zj-herdr: the agent model and the versioned JSON wire
+//! format exchanged between the daemon, the CLI, remote machines and the
+//! Zellij plugin. This crate builds for native targets and `wasm32-wasip1`.
+
+use std::fmt;
+use std::str::FromStr;
+
+use serde::{Deserialize, Serialize};
+
+mod cmd;
+pub mod view;
+pub use cmd::{PluginCommand, CMD_SCHEMA};
+
+/// Pipe name and `schema` tag of a full state snapshot.
+pub const STATE_SCHEMA: &str = "zj_herdr.state.v1";
+
+/// What an agent is doing, as far as zj-herdr can tell without hooks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentState {
+    /// Generating output or running a tool.
+    Working,
+    /// Waiting on the user, typically a tool permission prompt.
+    Blocked,
+    /// Finished its turn and waiting for the next prompt.
+    Idle,
+    /// The process has exited.
+    Done,
+    /// Not enough signal to decide.
+    #[default]
+    Unknown,
+}
+
+impl AgentState {
+    pub const ALL: [AgentState; 5] = [
+        AgentState::Working,
+        AgentState::Blocked,
+        AgentState::Idle,
+        AgentState::Done,
+        AgentState::Unknown,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AgentState::Working => "working",
+            AgentState::Blocked => "blocked",
+            AgentState::Idle => "idle",
+            AgentState::Done => "done",
+            AgentState::Unknown => "unknown",
+        }
+    }
+
+    /// One-cell glyph for list views.
+    pub fn glyph(self) -> &'static str {
+        match self {
+            AgentState::Working => "●",
+            AgentState::Blocked => "!",
+            AgentState::Idle => "○",
+            AgentState::Done => "✓",
+            AgentState::Unknown => "?",
+        }
+    }
+
+    /// Sort key: lower needs the user's attention sooner.
+    pub fn attention_rank(self) -> u8 {
+        match self {
+            AgentState::Blocked => 0,
+            AgentState::Idle => 1,
+            AgentState::Working => 2,
+            AgentState::Unknown => 3,
+            AgentState::Done => 4,
+        }
+    }
+}
+
+impl fmt::Display for AgentState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for AgentState {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        AgentState::ALL
+            .into_iter()
+            .find(|st| st.as_str() == s)
+            .ok_or_else(|| format!("unknown state {s:?} (expected working, blocked, idle, done or unknown)"))
+    }
+}
+
+/// The Zellij pane an agent runs in.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Pane {
+    pub session: String,
+    pub pane_id: u32,
+}
+
+/// One agent process.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Agent {
+    /// Stable identifier, `<machine>/<pid>`.
+    pub id: String,
+    pub machine: String,
+    /// Agent family from the known-agents table, e.g. `claude` or `codex`.
+    pub kind: String,
+    pub pid: u32,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    pub state: AgentState,
+    /// Unix seconds at which `state` was entered (best effort).
+    pub since: u64,
+    /// `None` when the agent runs outside Zellij.
+    #[serde(default)]
+    pub pane: Option<Pane>,
+    /// The agent's own session id (Claude transcript stem, Codex rollout id).
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+impl Agent {
+    pub fn make_id(machine: &str, pid: u32) -> String {
+        format!("{machine}/{pid}")
+    }
+
+    /// Whether `selector` names this agent: its id, its pid, or
+    /// `<session>:<pane_id>`.
+    pub fn matches(&self, selector: &str) -> bool {
+        if selector == self.id || selector == self.pid.to_string() {
+            return true;
+        }
+        match (&self.pane, selector.rsplit_once(':')) {
+            (Some(pane), Some((session, id))) => pane.session == session && id.parse() == Ok(pane.pane_id),
+            _ => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum MachineStatus {
+    #[default]
+    Ok,
+    Unreachable,
+}
+
+/// A machine and the agents found on it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Machine {
+    pub name: String,
+    /// SSH target for remote machines, `None` for the local one.
+    #[serde(default)]
+    pub ssh: Option<String>,
+    #[serde(default)]
+    pub status: MachineStatus,
+    #[serde(default)]
+    pub error: Option<String>,
+    pub agents: Vec<Agent>,
+}
+
+/// Full snapshot, `zj_herdr.state.v1`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StateV1 {
+    pub schema: String,
+    /// Unix seconds.
+    pub generated_at: u64,
+    pub machines: Vec<Machine>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WireError {
+    Json(String),
+    Schema { expected: &'static str, found: String },
+}
+
+impl fmt::Display for WireError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            WireError::Json(e) => write!(f, "invalid JSON: {e}"),
+            WireError::Schema { expected, found } => {
+                write!(f, "unsupported schema {found:?}, expected {expected:?}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for WireError {}
+
+impl StateV1 {
+    pub fn new(generated_at: u64, machines: Vec<Machine>) -> Self {
+        StateV1 {
+            schema: STATE_SCHEMA.to_string(),
+            generated_at,
+            machines,
+        }
+    }
+
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(self).expect("state serializes")
+    }
+
+    /// Parse a snapshot, rejecting other schema versions.
+    pub fn from_json(text: &str) -> Result<Self, WireError> {
+        let state: StateV1 = serde_json::from_str(text).map_err(|e| WireError::Json(e.to_string()))?;
+        if state.schema != STATE_SCHEMA {
+            return Err(WireError::Schema {
+                expected: STATE_SCHEMA,
+                found: state.schema,
+            });
+        }
+        Ok(state)
+    }
+
+    pub fn agents(&self) -> impl Iterator<Item = &Agent> {
+        self.machines.iter().flat_map(|m| m.agents.iter())
+    }
+}
+
+/// Compact elapsed time: `42s`, `5m`, `3h`, `2d`.
+pub fn fmt_elapsed(secs: u64) -> String {
+    match secs {
+        0..60 => format!("{secs}s"),
+        60..3600 => format!("{}m", secs / 60),
+        3600..86400 => format!("{}h", secs / 3600),
+        _ => format!("{}d", secs / 86400),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn elapsed_is_compact() {
+        assert_eq!(fmt_elapsed(0), "0s");
+        assert_eq!(fmt_elapsed(59), "59s");
+        assert_eq!(fmt_elapsed(60), "1m");
+        assert_eq!(fmt_elapsed(7200), "2h");
+        assert_eq!(fmt_elapsed(200_000), "2d");
+    }
+
+    fn sample() -> StateV1 {
+        StateV1::new(
+            1_700_000_000,
+            vec![
+                Machine {
+                    name: "box".into(),
+                    ssh: None,
+                    status: MachineStatus::Ok,
+                    error: None,
+                    agents: vec![Agent {
+                        id: Agent::make_id("box", 42),
+                        machine: "box".into(),
+                        kind: "claude".into(),
+                        pid: 42,
+                        cwd: Some("/w/p".into()),
+                        state: AgentState::Blocked,
+                        since: 1_699_999_990,
+                        pane: Some(Pane {
+                            session: "main".into(),
+                            pane_id: 3,
+                        }),
+                        session_id: Some("abc".into()),
+                    }],
+                },
+                Machine {
+                    name: "far".into(),
+                    ssh: Some("far-alias".into()),
+                    status: MachineStatus::Unreachable,
+                    error: Some("timeout".into()),
+                    agents: vec![],
+                },
+            ],
+        )
+    }
+
+    #[test]
+    fn state_round_trips() {
+        let state = sample();
+        let json = state.to_json();
+        assert!(json.contains("\"schema\":\"zj_herdr.state.v1\""));
+        assert!(json.contains("\"state\":\"blocked\""));
+        assert!(json.contains("\"status\":\"unreachable\""));
+        assert_eq!(StateV1::from_json(&json).unwrap(), state);
+    }
+
+    #[test]
+    fn rejects_other_schema() {
+        let json = sample().to_json().replace("state.v1", "state.v9");
+        assert!(matches!(StateV1::from_json(&json), Err(WireError::Schema { .. })));
+    }
+
+    #[test]
+    fn optional_fields_default() {
+        let json = r#"{"schema":"zj_herdr.state.v1","generated_at":1,"machines":[
+            {"name":"m","agents":[{"id":"m/1","machine":"m","kind":"pi","pid":1,"state":"idle","since":0}]}]}"#;
+        let state = StateV1::from_json(json).unwrap();
+        let agent = state.agents().next().unwrap();
+        assert_eq!(agent.pane, None);
+        assert_eq!(state.machines[0].status, MachineStatus::Ok);
+    }
+
+    #[test]
+    fn state_parses_from_str() {
+        for st in AgentState::ALL {
+            assert_eq!(st.as_str().parse::<AgentState>(), Ok(st));
+        }
+        assert!("asleep".parse::<AgentState>().is_err());
+    }
+
+    #[test]
+    fn selector_matching() {
+        let state = sample();
+        let agent = state.agents().next().unwrap();
+        assert!(agent.matches("box/42"));
+        assert!(agent.matches("42"));
+        assert!(agent.matches("main:3"));
+        assert!(!agent.matches("main:4"));
+        assert!(!agent.matches("other:3"));
+        assert!(!agent.matches("43"));
+    }
+}

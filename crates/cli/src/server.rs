@@ -2,10 +2,10 @@
 
 use std::fs;
 use std::io::{self, BufRead, BufReader, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::Duration;
@@ -50,15 +50,53 @@ pub fn bind(path: &Path) -> io::Result<UnixListener> {
         }
         fs::remove_file(path)?;
     }
-    // Create the socket 0600 from the start: no window with umask perms.
-    // SAFETY: umask only swaps the process file-creation mask.
-    let old = unsafe { libc::umask(0o177) };
-    let bound = UnixListener::bind(path);
-    // SAFETY: as above, restoring the previous mask.
-    unsafe { libc::umask(old) };
-    let listener = bound?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-    Ok(listener)
+    // Bind inside a fresh 0700 directory, make the socket 0600, then link it
+    // into place: it is never reachable with looser permissions, and the
+    // process umask (shared by every thread) is left alone. The link fails
+    // if another daemon bound `path` meanwhile, as a bind would.
+    let staging = make_staging_dir(dir)?;
+    let staged = staging.join("s");
+    let linked = UnixListener::bind(&staged).and_then(|listener| {
+        fs::set_permissions(&staged, fs::Permissions::from_mode(0o600))?;
+        fs::hard_link(&staged, path).map_err(|e| {
+            if e.kind() == io::ErrorKind::AlreadyExists {
+                io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    format!("a daemon is already listening on {}", path.display()),
+                )
+            } else {
+                e
+            }
+        })?;
+        Ok(listener)
+    });
+    let _ = fs::remove_dir_all(&staging);
+    linked
+}
+
+/// A new 0700 directory in `dir` with an unpredictable, short name (the
+/// socket path inside it must stay under the ~104-byte limit). In a shared
+/// `/tmp` another user may squat names, so a taken one is skipped.
+fn make_staging_dir(dir: &Path) -> io::Result<PathBuf> {
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64)
+        ^ (u64::from(std::process::id()) << 32);
+    for n in 0..16u64 {
+        let candidate = dir.join(format!(
+            ".zjh{:x}",
+            seed.wrapping_mul(n + 1) & 0xff_ffff_ffff
+        ));
+        match fs::DirBuilder::new().mode(0o700).create(&candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!("no free staging directory in {}", dir.display()),
+    ))
 }
 
 /// The uid of the process at the other end of `stream`.

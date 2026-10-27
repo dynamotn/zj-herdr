@@ -227,6 +227,13 @@ fn bound_socket_is_private_and_not_stolen() {
     };
     let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o600);
+    // Reachable through the linked name, with the staging dir cleaned up.
+    UnixStream::connect(&path).unwrap();
+    let left: Vec<_> = std::fs::read_dir(tmp.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(left, vec![std::ffi::OsString::from("s.sock")]);
     assert!(
         server::bind(&path).is_err(),
         "a second daemon must not take over the socket"

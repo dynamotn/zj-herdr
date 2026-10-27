@@ -74,7 +74,9 @@ pub fn deliver_args(session: &str, plugin: &str, name: &str, payload: &str) -> V
     .to_vec()
 }
 
-/// Session names from `zellij list-sessions --short`, without exited ones.
+/// Session names from `zellij list-sessions --no-formatting`, without exited
+/// ones. Not `--short`: it drops the `EXITED` marker, and piping to an exited
+/// session makes Zellij resurrect it.
 pub fn parse_sessions(stdout: &str) -> Vec<String> {
     stdout
         .lines()
@@ -87,7 +89,7 @@ pub fn parse_sessions(stdout: &str) -> Vec<String> {
 impl Zellij for ZellijCli {
     fn sessions(&self) -> Result<Vec<String>, String> {
         let mut cmd = Command::new("zellij");
-        cmd.args(["list-sessions", "--short", "--no-formatting"]);
+        cmd.args(["list-sessions", "--no-formatting"]);
         match exec::run(cmd, ZELLIJ_TIMEOUT) {
             Ok(out) => Ok(parse_sessions(&out.stdout)),
             // Zellij exits non-zero when there are no sessions at all.

@@ -159,6 +159,14 @@ impl ZellijPlugin for Plugin {
             _ => None,
         };
         let payload = msg.payload.as_deref().unwrap_or_default();
+        // `zellij pipe -- PAYLOAD` with stdin closed also delivers an empty
+        // message once its input ends: nothing to parse, nothing wrong.
+        if payload.trim().is_empty() {
+            if let Some(id) = &cli {
+                unblock_cli_pipe_input(id);
+            }
+            return false;
+        }
         let redraw = match msg.name.as_str() {
             STATE_SCHEMA => match StateV1::from_json(payload) {
                 Ok(state) => {

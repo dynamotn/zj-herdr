@@ -118,7 +118,9 @@ pub struct Claimant {
 /// written yet, the new file goes to the silent one. Timestamps alone cannot
 /// tell that from two agents prompted a second apart; upgrade by reading a
 /// link between the files (if the agent writes one) or the process's open
-/// file descriptors.
+/// file descriptors. Likewise a `--resume`d process stays on its resumed
+/// file after a `/clear`: a newer file in its cwd may as well belong to an
+/// agent that has since exited.
 /// A process keeps the most recently written of the files it was given.
 /// Processes left without one (`--continue` reopens an older file) take the
 /// newest unclaimed file written since they started.

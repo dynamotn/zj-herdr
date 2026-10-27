@@ -132,7 +132,18 @@ impl Store {
     pub fn record(&mut self, agents: &[Agent], now: u64) -> bool {
         let mut changed = false;
         for a in agents.iter().filter(|a| a.state != AgentState::Done) {
-            let (Some(pane), Some(session_id)) = (&a.pane, &a.session_id) else {
+            let Some(pane) = &a.pane else {
+                continue;
+            };
+            let Some(session_id) = &a.session_id else {
+                // Another kind of agent now owns the pane: the old record is
+                // superseded. A same-kind agent not yet prompted leaves it,
+                // since that conversation is still the last work there.
+                let key = format!("{}:{}", pane.session, pane.pane_id);
+                if self.panes.get(&key).is_some_and(|old| old.kind != a.kind) {
+                    self.panes.remove(&key);
+                    changed = true;
+                }
                 continue;
             };
             if !agents::is_valid_session_id(session_id) {
@@ -243,6 +254,23 @@ mod tests {
         let replaced = vec![agent(4, "codex", "dev", 1, Some("r2"), AgentState::Working)];
         assert!(store.record(&replaced, 30));
         assert_eq!(store.panes["dev:1"].kind, "codex");
+    }
+
+    #[test]
+    fn another_kind_of_agent_in_the_pane_supersedes_the_record() {
+        let mut store = Store::default();
+        store.record(
+            &[agent(1, "claude", "dev", 1, Some("c1"), AgentState::Idle)],
+            10,
+        );
+        // A fresh claude, not prompted yet: the old conversation stays.
+        let fresh = [agent(2, "claude", "dev", 1, None, AgentState::Idle)];
+        assert!(!store.record(&fresh, 20));
+        assert!(store.panes.contains_key("dev:1"));
+        // aider took the pane over: nothing there to resume any more.
+        let other = [agent(3, "aider", "dev", 1, None, AgentState::Idle)];
+        assert!(store.record(&other, 30));
+        assert!(store.panes.is_empty());
     }
 
     #[test]

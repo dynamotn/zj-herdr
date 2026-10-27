@@ -18,6 +18,9 @@ mod ui;
 const TICK_SECS: f64 = 1.0;
 /// Marks the `run_command` that fetches the first snapshot.
 const FETCH_CONTEXT: &str = "zj_herdr_fetch";
+/// `sh -c` script for `start_daemon`; `$1` is the zj-herdr binary.
+const START_DAEMON: &str = r#"d="${XDG_STATE_HOME:-$HOME/.local/state}/zj-herdr"
+mkdir -p "$d" && nohup "$1" daemon >>"$d/daemon.log" 2>&1 </dev/null &"#;
 
 #[derive(Default)]
 struct Plugin {
@@ -40,6 +43,8 @@ struct Plugin {
     deliver_prompts: bool,
     /// Binary used to fetch the first snapshot.
     bin: String,
+    /// Start `zj-herdr daemon` once permitted, unless one already runs.
+    start_daemon: bool,
     /// Attention jump requested before any state arrived.
     pending: Option<PluginCommand>,
     /// Hide once `pending` has run: it came down a pipe, not from the user.
@@ -73,6 +78,7 @@ impl ZellijPlugin for Plugin {
             .get("zj_herdr_bin")
             .cloned()
             .unwrap_or_else(|| "zj-herdr".into());
+        self.start_daemon = config.get("start_daemon").is_some_and(|v| v == "true");
         request_permission(&[
             PermissionType::ReadApplicationState,
             PermissionType::ChangeApplicationState,
@@ -120,6 +126,14 @@ impl ZellijPlugin for Plugin {
             }
             Event::PermissionRequestResult(PermissionStatus::Granted) => {
                 self.permitted = true;
+                if self.start_daemon {
+                    // Detached, so it outlives Zellij and is never a zombie of
+                    // its server; a second daemon exits at once (socket in use).
+                    run_command(
+                        &["sh", "-c", START_DAEMON, "sh", self.bin.as_str()],
+                        BTreeMap::new(),
+                    );
+                }
                 // Do not wait up to a heartbeat for the first push.
                 let context = BTreeMap::from([(FETCH_CONTEXT.to_string(), String::new())]);
                 run_command(&[self.bin.as_str(), "list", "--json"], context);

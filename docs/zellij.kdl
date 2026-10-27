@@ -18,6 +18,9 @@ plugins {
         // the daemon's next push. Use an absolute path if Zellij's PATH
         // does not include it.
         // zj_herdr_bin "zj-herdr"
+
+        // Start the daemon from Zellij instead of a service manager.
+        // start_daemon "true"
     }
 }
 

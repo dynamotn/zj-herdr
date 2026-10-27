@@ -91,7 +91,8 @@ first snapshot with `zj-herdr list --json`). Plugin options:
 |---|---|---|
 | `pinned` | `false` | stay open after a jump (for a pane in a layout) |
 | `deliver_prompts` | `false` | type prompts sent to this instance; `zj-herdr prompt` sets it on its own instance, so leave it unset in layouts |
-| `zj_herdr_bin` | `zj-herdr` | binary used for the first snapshot |
+| `zj_herdr_bin` | `zj-herdr` | binary used for the first snapshot (and by `start_daemon`) |
+| `start_daemon` | `false` | start `zj-herdr daemon` in the background once permitted, unless one runs already; it logs to `$XDG_STATE_HOME/zj-herdr/daemon.log` and outlives Zellij |
 
 Pipe commands (`zellij pipe --name zj_herdr.cmd.v1 -- <payload>`):
 `attention-next`, `attention-prev`, `toggle`, and

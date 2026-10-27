@@ -42,6 +42,8 @@ struct Plugin {
     hide_after_pending: bool,
     /// Zellij has granted the permissions asked for in `load`.
     permitted: bool,
+    /// Zellij refused them; no later answer will come.
+    denied: bool,
     /// Prompts that arrived before the permissions did, with the CLI pipe
     /// each one keeps blocked until it is answered.
     queued_prompts: Vec<(Option<String>, u32, String)>,
@@ -112,13 +114,10 @@ impl ZellijPlugin for Plugin {
                 true
             }
             Event::PermissionRequestResult(PermissionStatus::Denied) => {
+                self.denied = true;
                 for (pipe, _, _) in std::mem::take(&mut self.queued_prompts) {
                     if let Some(id) = pipe {
-                        cli_pipe_output(
-                            &id,
-                            &format!("{PROMPT_NACK} the plugin was denied its permissions\n"),
-                        );
-                        unblock_cli_pipe_input(&id);
+                        nack_denied(&id);
                     }
                 }
                 true
@@ -200,6 +199,14 @@ impl ZellijPlugin for Plugin {
     }
 }
 
+fn nack_denied(pipe: &str) {
+    cli_pipe_output(
+        pipe,
+        &format!("{PROMPT_NACK} the plugin was denied its permissions\n"),
+    );
+    unblock_cli_pipe_input(pipe);
+}
+
 impl Plugin {
     fn set_state(&mut self, state: StateV1) {
         let ids = ui::selectable(&state);
@@ -228,6 +235,12 @@ impl Plugin {
 
     /// Type a prompt from the daemon and answer on its CLI pipe, if any.
     fn prompt(&mut self, pipe: Option<String>, pane_id: u32, text: String) {
+        if self.denied {
+            if let Some(id) = &pipe {
+                nack_denied(id);
+            }
+            return;
+        }
         if !self.permitted {
             // Keep the CLI waiting until the permissions are answered.
             if let Some(id) = &pipe {

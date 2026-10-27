@@ -74,6 +74,16 @@ pub fn parse_request(line: &str) -> Result<Request, String> {
         } if std::time::Duration::try_from_secs_f64(*t).is_err() => {
             Err("bad request: timeout must be a non-negative number of seconds".into())
         }
+        // `wait_for` would otherwise treat it as no deadline at all.
+        Request::Wait {
+            timeout: Some(t), ..
+        } if std::time::Duration::try_from_secs_f64(*t)
+            .ok()
+            .and_then(|d| std::time::Instant::now().checked_add(d))
+            .is_none() =>
+        {
+            Err("bad request: timeout is too large".into())
+        }
         Request::Spawn { command, .. } if command.argv().is_empty() => {
             Err("bad request: empty command".into())
         }
@@ -198,6 +208,8 @@ mod tests {
             r#"{"op":"wait","agent":"a","state":"sleeping"}"#,
             r#"{"op":"wait","agent":"a","state":"idle","timeout":-1}"#,
             r#"{"op":"wait","agent":"a","state":"idle","timeout":1e300}"#,
+            // Fits a Duration, but no Instant that far ahead exists.
+            r#"{"op":"wait","agent":"a","state":"idle","timeout":1e19}"#,
             r#"{"op":"wait","state":"idle"}"#,
             r#"{"op":"spawn","session":"s","command":[]}"#,
         ] {

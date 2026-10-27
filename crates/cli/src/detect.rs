@@ -113,6 +113,12 @@ pub struct Claimant {
 /// already running when it was created, preferring one with no transcript
 /// yet, then one whose current transcript went quiet before this file
 /// appeared (`/clear` moves on to a new file), then the latest started.
+///
+/// shortcut: when an agent clears while another in the same cwd has not
+/// written yet, the new file goes to the silent one. Timestamps alone cannot
+/// tell that from two agents prompted a second apart; upgrade by reading a
+/// link between the files (if the agent writes one) or the process's open
+/// file descriptors.
 /// A process keeps the most recently written of the files it was given.
 /// Processes left without one (`--continue` reopens an older file) take the
 /// newest unclaimed file written since they started.
@@ -255,7 +261,7 @@ type RolloutMeta = (String, Option<String>);
 pub struct CodexDetector {
     pub sessions: PathBuf,
     /// First-line metadata never changes, so read it once per file.
-    meta: Mutex<HashMap<PathBuf, Option<RolloutMeta>>>,
+    meta: Mutex<HashMap<PathBuf, RolloutMeta>>,
     /// Rollout per pid from the last [`Detector::prepare`]; `None` means the
     /// process was considered and given none.
     assigned: Mutex<HashMap<u32, Option<PathBuf>>>,
@@ -272,10 +278,14 @@ impl CodexDetector {
 
     fn meta(&self, path: &Path) -> Option<RolloutMeta> {
         let mut cache = self.meta.lock().unwrap_or_else(|e| e.into_inner());
-        cache
-            .entry(path.to_path_buf())
-            .or_insert_with(|| transcript::codex_meta(path))
-            .clone()
+        if let Some(meta) = cache.get(path) {
+            return Some(meta.clone());
+        }
+        // Only successes are cached: a rollout caught before its first line
+        // is complete is read again on the next scan.
+        let meta = transcript::codex_meta(path)?;
+        cache.insert(path.to_path_buf(), meta.clone());
+        Some(meta)
     }
 
     /// The session id after `resume` in argv.
@@ -532,6 +542,30 @@ mod tests {
         let map = assign_transcripts(&[claimant(1, 100), claimant(2, 200)], &files);
         assert_eq!(owner(&map, 1), Some("a2"));
         assert_eq!(owner(&map, 2), Some("b"));
+    }
+
+    #[test]
+    fn codex_meta_is_read_again_until_the_first_line_is_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout-x.jsonl");
+        std::fs::write(&path, r#"{"type":"session_meta","payload":{"id":"s1","#).unwrap();
+        let codex = CodexDetector::new(dir.path().into());
+        assert_eq!(codex.meta(&path), None);
+        std::fs::write(
+            &path,
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"s1\",\"cwd\":\"/w\"}}\n",
+        )
+        .unwrap();
+        assert_eq!(codex.meta(&path), Some(("s1".into(), Some("/w".into()))));
+    }
+
+    #[test]
+    fn a_newcomer_just_started_takes_the_new_file() {
+        // B started at 298, after A last wrote at 290: a2 is B's first file.
+        let files = [file("a1", 110, 290), file("a2", 300, 450)];
+        let map = assign_transcripts(&[claimant(1, 100), claimant(2, 298)], &files);
+        assert_eq!(owner(&map, 1), Some("a1"));
+        assert_eq!(owner(&map, 2), Some("a2"));
     }
 
     #[test]

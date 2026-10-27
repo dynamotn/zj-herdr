@@ -9,6 +9,8 @@ use crate::exec;
 const ZELLIJ_TIMEOUT: Duration = Duration::from_secs(3);
 /// A pipe to one plugin may first have to load and compile it.
 const DELIVER_TIMEOUT: Duration = Duration::from_secs(20);
+/// The plugin types prompts only in an instance configured with this.
+const DELIVER_CONFIG: &str = "deliver_prompts=true";
 
 pub trait Zellij: Send + Sync {
     /// Names of the running sessions.
@@ -48,6 +50,9 @@ pub fn run_args(session: &str, cwd: Option<&str>, command: &[String]) -> Vec<Str
 
 /// Arguments for `zellij action pipe` to `plugin` (a URL or an alias from
 /// the user's Zellij config), launching it floating when it is not loaded.
+/// Zellij matches instances by URL and configuration, so the extra
+/// configuration reaches one dedicated instance per session, never the
+/// picker panes of a layout (which would each type the prompt again).
 pub fn deliver_args(session: &str, plugin: &str, name: &str, payload: &str) -> Vec<String> {
     [
         "--session",
@@ -56,6 +61,8 @@ pub fn deliver_args(session: &str, plugin: &str, name: &str, payload: &str) -> V
         "pipe",
         "--plugin",
         plugin,
+        "--plugin-configuration",
+        DELIVER_CONFIG,
         "--floating-plugin",
         "true",
         "--name",
@@ -149,7 +156,7 @@ mod tests {
     fn builds_deliver_args() {
         assert_eq!(
             deliver_args("dev", "zj_herdr", "zj_herdr.cmd.v1", "-x").join(" "),
-            "--session dev action pipe --plugin zj_herdr --floating-plugin true --name zj_herdr.cmd.v1 -- -x"
+            "--session dev action pipe --plugin zj_herdr --plugin-configuration deliver_prompts=true --floating-plugin true --name zj_herdr.cmd.v1 -- -x"
         );
     }
 }

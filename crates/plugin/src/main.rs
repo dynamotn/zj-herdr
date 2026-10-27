@@ -28,6 +28,10 @@ struct Plugin {
     last_jump: Option<String>,
     /// The Zellij session this instance runs in.
     session: Option<String>,
+    /// Panes of this session, by tab position, from the last `PaneUpdate`.
+    panes: Option<PaneManifest>,
+    /// Tabs of this session, from the last `TabUpdate`.
+    tabs: Vec<TabInfo>,
     error: Option<String>,
     visible: bool,
     /// Pinned instances stay open after a jump.
@@ -63,7 +67,8 @@ fn now_secs() -> u64 {
 impl ZellijPlugin for Plugin {
     fn load(&mut self, config: BTreeMap<String, String>) {
         self.pinned = config.get("pinned").is_some_and(|v| v == "true");
-        self.deliver_prompts = config.get("deliver_prompts").is_none_or(|v| v != "false");
+        // Off by default: every picker pane would otherwise type each prompt.
+        self.deliver_prompts = config.get("deliver_prompts").is_some_and(|v| v == "true");
         self.bin = config
             .get("zj_herdr_bin")
             .cloned()
@@ -82,6 +87,8 @@ impl ZellijPlugin for Plugin {
             EventType::Visible,
             EventType::PermissionRequestResult,
             EventType::RunCommandResult,
+            EventType::PaneUpdate,
+            EventType::TabUpdate,
         ]);
         set_timeout(TICK_SECS);
     }
@@ -90,6 +97,14 @@ impl ZellijPlugin for Plugin {
         match event {
             Event::ModeUpdate(info) => {
                 self.session = info.session_name;
+                false
+            }
+            Event::PaneUpdate(manifest) => {
+                self.panes = Some(manifest);
+                false
+            }
+            Event::TabUpdate(tabs) => {
+                self.tabs = tabs;
                 false
             }
             Event::Visible(visible) => {
@@ -249,17 +264,61 @@ impl Plugin {
             self.queued_prompts.push((pipe, pane_id, text));
             return;
         }
-        let reply = if self.deliver_prompts {
+        let reply = if !self.deliver_prompts {
+            format!("{PROMPT_NACK} this instance has deliver_prompts \"false\"\n")
+        } else if self.panes.is_some() && !self.has_terminal(pane_id) {
+            // Typing into a pane that closed (say, while permissions were
+            // pending) would report a delivery that never happened.
+            format!("{PROMPT_NACK} pane {pane_id} is gone\n")
+        } else {
             write_chars_to_pane_id(&text, PaneId::Terminal(pane_id));
             format!("{PROMPT_ACK}\n")
-        } else {
-            format!("{PROMPT_NACK} this instance has deliver_prompts \"false\"\n")
         };
         if let Some(id) = pipe {
             cli_pipe_output(&id, &reply);
             unblock_cli_pipe_input(&id);
         }
         self.hide_unless_in_use();
+    }
+
+    fn has_terminal(&self, pane_id: u32) -> bool {
+        self.panes.as_ref().is_some_and(|m| {
+            m.panes
+                .values()
+                .flatten()
+                .any(|p| !p.is_plugin && !p.exited && p.id == pane_id)
+        })
+    }
+
+    /// The focused terminal pane of the active tab.
+    fn focused_terminal(&self) -> Option<u32> {
+        let tab = self.tabs.iter().find(|t| t.active)?.position;
+        self.panes
+            .as_ref()?
+            .panes
+            .get(&tab)?
+            .iter()
+            .find(|p| p.is_focused && !p.is_plugin)
+            .map(|p| p.id)
+    }
+
+    /// Where attention cycling continues from: the agent in the focused
+    /// pane, which survives a session switch (each session has its own
+    /// plugin instance), else this instance's last jump.
+    fn cycle_from(&self) -> Option<String> {
+        let focused = self.focused_terminal();
+        let session = self.session.as_deref();
+        self.state
+            .as_ref()
+            .and_then(|s| {
+                s.agents().find(|a| {
+                    a.pane.as_ref().is_some_and(|p| {
+                        Some(p.session.as_str()) == session && Some(p.pane_id) == focused
+                    })
+                })
+            })
+            .map(|a| a.id.clone())
+            .or_else(|| self.last_jump.clone())
     }
 
     fn find(&self, id: &str) -> Option<Agent> {
@@ -308,15 +367,14 @@ impl Plugin {
     fn on_command(&mut self, cmd: PluginCommand) -> bool {
         match cmd {
             PluginCommand::AttentionNext | PluginCommand::AttentionPrev => {
+                let from = self.cycle_from();
                 let Some(state) = &self.state else {
                     self.pending = Some(cmd);
                     return false;
                 };
                 let forward = cmd == PluginCommand::AttentionNext;
                 let order = view::attention_order(state);
-                if let Some(agent) =
-                    view::cycle(&order, self.last_jump.as_deref(), forward).cloned()
-                {
+                if let Some(agent) = view::cycle(&order, from.as_deref(), forward).cloned() {
                     self.selected = Some(agent.id.clone());
                     self.jump(&agent);
                 }

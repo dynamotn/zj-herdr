@@ -2,6 +2,7 @@
 
 use std::io::Read;
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -29,15 +30,20 @@ pub fn run(mut cmd: Command, timeout: Duration) -> Result<Output, String> {
 
     // Drain pipes on threads so a chatty child cannot fill them and stall;
     // keep at most MAX_OUTPUT bytes of each, discarding the rest.
+    // Results come back on channels, not joins: a descendant that inherited
+    // the pipe keeps it open after the child exits, and must not hold the
+    // caller past its deadline.
     let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
             let mut buf = Vec::new();
             if let Some(mut p) = pipe {
                 let _ = p.by_ref().take(MAX_OUTPUT).read_to_end(&mut buf);
                 let _ = std::io::copy(&mut p, &mut std::io::sink());
             }
-            String::from_utf8_lossy(&buf).into_owned()
-        })
+            let _ = tx.send(String::from_utf8_lossy(&buf).into_owned());
+        });
+        rx
     };
     let out = drain(
         child
@@ -68,9 +74,13 @@ pub fn run(mut cmd: Command, timeout: Duration) -> Result<Output, String> {
             Err(e) => return Err(format!("{program}: {e}")),
         }
     };
+    let collect = |rx: mpsc::Receiver<String>| {
+        rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .map_err(|_| format!("{program} exited but left its output open"))
+    };
     let output = Output {
-        stdout: out.join().unwrap_or_default(),
-        stderr: err.join().unwrap_or_default(),
+        stdout: collect(out)?,
+        stderr: collect(err)?,
     };
     if status.success() {
         Ok(output)
@@ -113,5 +123,13 @@ mod tests {
         assert!(err.contains("bad"), "{err}");
         let err = run(sh("sleep 5"), Duration::from_millis(100)).unwrap_err();
         assert!(err.contains("timed out"), "{err}");
+    }
+
+    #[test]
+    fn a_descendant_holding_the_pipe_cannot_outlast_the_deadline() {
+        let start = Instant::now();
+        let err = run(sh("sleep 5 & echo hi"), Duration::from_millis(300)).unwrap_err();
+        assert!(err.contains("left its output open"), "{err}");
+        assert!(start.elapsed() < Duration::from_secs(2));
     }
 }

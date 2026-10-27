@@ -138,6 +138,10 @@ pub enum Event {
         /// `None` when the agent just appeared.
         from: Option<AgentState>,
     },
+    /// A `done` agent was dropped after its retention period.
+    Gone {
+        id: String,
+    },
     /// A machine became unreachable or came back.
     Machine {
         name: String,

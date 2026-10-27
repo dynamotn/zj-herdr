@@ -90,7 +90,7 @@ first snapshot with `zj-herdr list --json`). Plugin options:
 | Option | Default | Meaning |
 |---|---|---|
 | `pinned` | `false` | stay open after a jump (for a pane in a layout) |
-| `deliver_prompts` | `true` | type prompts from `zj-herdr prompt` sent to this instance |
+| `deliver_prompts` | `false` | type prompts sent to this instance; `zj-herdr prompt` sets it on its own instance, so leave it unset in layouts |
 | `zj_herdr_bin` | `zj-herdr` | binary used for the first snapshot |
 
 Pipe commands (`zellij pipe --name zj_herdr.cmd.v1 -- <payload>`):
@@ -98,9 +98,12 @@ Pipe commands (`zellij pipe --name zj_herdr.cmd.v1 -- <payload>`):
 `{"cmd":"prompt","pane_id":N,"text":"..."}`.
 
 `zj-herdr prompt` runs `zellij --session S action pipe --plugin zj_herdr
---floating-plugin true` in the agent's session, so Zellij loads the plugin
-there if the picker was never opened (it hides itself again afterwards). The
-plugin answers `zj_herdr.prompt.delivered` once the text is typed; without
+--plugin-configuration deliver_prompts=true --floating-plugin true` in the
+agent's session. Zellij matches plugin instances by URL and configuration,
+so this reaches one dedicated instance (loaded floating the first time, and
+hidden again afterwards) and never the picker panes, which would each type
+the prompt again. The plugin answers `zj_herdr.prompt.delivered` once the
+text is typed, or fails if the pane is gone; without
 that answer the command fails rather than report success. The first time
 the plugin loads in a session, Zellij asks for its permissions in the
 floating pane, and the prompt waits for them. Set `plugin = "..."` at the

@@ -10,10 +10,9 @@ plugins {
         // pinned "false"
 
         // `zj-herdr prompt` pipes to this alias (the daemon's `plugin`
-        // setting, "zj_herdr" by default). Zellij loads the plugin, floating,
-        // in a session that has not opened it yet; it hides itself again
-        // once the prompt is typed.
-        // deliver_prompts "true"
+        // setting, "zj_herdr" by default) with deliver_prompts "true" added,
+        // which Zellij loads as its own floating instance. Do not set
+        // deliver_prompts here: every picker pane would type each prompt.
 
         // Used once at load to fetch the first snapshot without waiting for
         // the daemon's next push. Use an absolute path if Zellij's PATH

@@ -247,6 +247,7 @@ fn run(cli: Cli) -> Result<(), String> {
                     Event::Change { agent, from } => {
                         println!("{}", output::change_line(agent, *from))
                     }
+                    Event::Gone { id } => println!("{} gone", output::clean(id)),
                     Event::Machine {
                         name,
                         status,

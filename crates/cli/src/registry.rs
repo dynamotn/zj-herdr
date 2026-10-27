@@ -24,6 +24,8 @@ pub struct Change {
 #[derive(Debug, Default)]
 pub struct Tracker {
     agents: BTreeMap<String, Agent>,
+    /// Ids of `done` agents dropped by the last update.
+    expired: Vec<String>,
 }
 
 impl Tracker {
@@ -59,10 +61,17 @@ impl Tracker {
             }
             if now.saturating_sub(gone.since) < DONE_RETAIN_SECS {
                 next.insert(id, gone);
+            } else {
+                self.expired.push(id);
             }
         }
         self.agents = next;
         changes
+    }
+
+    /// Ids dropped since the last call, for subscribers to forget them.
+    pub fn take_expired(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.expired)
     }
 
     pub fn agents(&self) -> Vec<Agent> {
@@ -114,6 +123,7 @@ impl Registry {
         let mut inner = self.lock();
         let tracker = inner.trackers.entry(machine.name.clone()).or_default();
         let changes = tracker.update(std::mem::take(&mut machine.agents), now);
+        let expired = tracker.take_expired();
         machine.agents = tracker.agents();
         let mut recovered = false;
         let mut lines = Vec::new();
@@ -128,7 +138,7 @@ impl Registry {
             None => inner.machines.push(machine),
         }
         inner.generated_at = now;
-        if !changes.is_empty() || recovered {
+        if !changes.is_empty() || recovered || !expired.is_empty() {
             inner.changes += 1;
         }
         lines.extend(changes.iter().map(|c| {
@@ -137,6 +147,11 @@ impl Registry {
                 from: c.from,
             })
         }));
+        lines.extend(
+            expired
+                .into_iter()
+                .map(|id| api::to_line(&Event::Gone { id })),
+        );
         broadcast(&mut inner, &lines);
         self.changed.notify_all();
         changes
@@ -301,6 +316,22 @@ mod tests {
     }
 
     #[test]
+    fn subscribers_hear_when_a_done_agent_is_dropped() {
+        let reg = Registry::default();
+        reg.publish(machine(vec![agent(1, AgentState::Idle, 0)]), 0);
+        reg.publish(machine(vec![]), 1);
+        let (tx, rx) = mpsc::channel();
+        reg.subscribe(tx);
+        rx.recv().unwrap();
+        reg.publish(machine(vec![]), 1 + DONE_RETAIN_SECS);
+        let line = rx.recv().unwrap();
+        assert!(
+            line.contains("\"event\":\"gone\"") && line.contains("m/1"),
+            "{line}"
+        );
+    }
+
+    #[test]
     fn subscribers_hear_machines_go_and_come_back() {
         let reg = Registry::default();
         reg.publish(machine(vec![]), 0);
@@ -330,8 +361,10 @@ mod tests {
         assert_eq!(changes[0].from, Some(AgentState::Idle));
         assert!(t.update(vec![], 20).is_empty());
         assert_eq!(t.agents().len(), 1);
+        assert!(t.take_expired().is_empty());
         t.update(vec![], 10 + DONE_RETAIN_SECS);
         assert!(t.agents().is_empty());
+        assert_eq!(t.take_expired(), vec![Agent::make_id("m", 1)]);
     }
 
     #[test]

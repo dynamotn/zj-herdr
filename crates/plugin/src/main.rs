@@ -7,7 +7,9 @@
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use ui::Target;
 use zellij_tile::prelude::*;
+use zj_herdr_core::view::{SessionLayout, TabLayout};
 use zj_herdr_core::{
     view, Agent, PluginCommand, StateV1, CMD_SCHEMA, PROMPT_ACK, PROMPT_NACK, STATE_SCHEMA,
 };
@@ -35,6 +37,12 @@ struct Plugin {
     panes: Option<PaneManifest>,
     /// Tabs of this session, from the last `TabUpdate`.
     tabs: Vec<TabInfo>,
+    /// Every session's tabs and panes, from the last `SessionUpdate`.
+    sessions: Vec<SessionInfo>,
+    /// What a click on each rendered line does.
+    targets: Vec<Option<Target>>,
+    /// The last value sent with `set_selectable`.
+    selectable: Option<bool>,
     error: Option<String>,
     visible: bool,
     /// Pinned instances stay open after a jump.
@@ -95,6 +103,8 @@ impl ZellijPlugin for Plugin {
             EventType::RunCommandResult,
             EventType::PaneUpdate,
             EventType::TabUpdate,
+            EventType::SessionUpdate,
+            EventType::Mouse,
         ]);
         set_timeout(TICK_SECS);
     }
@@ -107,11 +117,22 @@ impl ZellijPlugin for Plugin {
             }
             Event::PaneUpdate(manifest) => {
                 self.panes = Some(manifest);
-                false
+                self.sync_selectable();
+                self.visible
             }
             Event::TabUpdate(tabs) => {
                 self.tabs = tabs;
-                false
+                self.visible
+            }
+            Event::SessionUpdate(sessions, _) => {
+                self.sessions = sessions;
+                self.visible
+            }
+            Event::Mouse(Mouse::LeftClick(line, _)) => {
+                let target = usize::try_from(line)
+                    .ok()
+                    .and_then(|l| self.targets.get(l).cloned().flatten());
+                target.is_some_and(|t| self.on_click(t))
             }
             Event::Visible(visible) => {
                 self.visible = visible;
@@ -126,6 +147,7 @@ impl ZellijPlugin for Plugin {
             }
             Event::PermissionRequestResult(PermissionStatus::Granted) => {
                 self.permitted = true;
+                self.sync_selectable();
                 if self.start_daemon {
                     // Detached, so it outlives Zellij and is never a zombie of
                     // its server; a second daemon exits at once (socket in use).
@@ -144,6 +166,7 @@ impl ZellijPlugin for Plugin {
             }
             Event::PermissionRequestResult(PermissionStatus::Denied) => {
                 self.denied = true;
+                self.sync_selectable();
                 for (pipe, _, _) in std::mem::take(&mut self.queued_prompts) {
                     if let Some(id) = pipe {
                         nack_denied(&id);
@@ -224,14 +247,18 @@ impl ZellijPlugin for Plugin {
     }
 
     fn render(&mut self, rows: usize, cols: usize) {
-        let lines = ui::render(
+        let layouts = self.layouts();
+        let tree = self.tree(&layouts);
+        let (lines, targets) = ui::render(
             self.state.as_ref(),
+            &tree,
+            self.session.as_deref(),
             self.selected.as_deref(),
             self.error.as_deref(),
             now_secs(),
-            rows,
-            cols,
+            (rows, cols),
         );
+        self.targets = targets;
         print!("{}", lines.join("\n"));
     }
 }
@@ -246,12 +273,12 @@ fn nack_denied(pipe: &str) {
 
 impl Plugin {
     fn set_state(&mut self, state: StateV1) {
-        let ids = ui::selectable(&state);
+        self.state = Some(state);
+        self.error = None;
+        let ids = self.selectable_ids();
         if self.selected.as_ref().is_none_or(|s| !ids.contains(s)) {
             self.selected = ids.first().cloned();
         }
-        self.state = Some(state);
-        self.error = None;
         if let Some(cmd) = self.pending.take() {
             self.on_command(cmd);
             if std::mem::take(&mut self.hide_after_pending) {
@@ -347,11 +374,84 @@ impl Plugin {
         self.state.as_ref()?.agents().find(|a| a.id == id).cloned()
     }
 
+    /// Tabs and terminal panes of every local session this instance knows:
+    /// its own from `TabUpdate`/`PaneUpdate`, the rest from `SessionUpdate`.
+    fn layouts(&self) -> Vec<SessionLayout> {
+        let mut out: Vec<SessionLayout> = self
+            .sessions
+            .iter()
+            .filter(|s| !s.is_current_session && Some(&s.name) != self.session.as_ref())
+            .map(|s| layout(&s.name, &s.tabs, Some(&s.panes)))
+            .collect();
+        if let Some(name) = &self.session {
+            out.push(layout(name, &self.tabs, self.panes.as_ref()));
+        }
+        out
+    }
+
+    fn tree<'a>(&'a self, layouts: &'a [SessionLayout]) -> Vec<view::Row<'a>> {
+        self.state
+            .as_ref()
+            .map(|s| view::tree(s, self.session.as_deref(), layouts))
+            .unwrap_or_default()
+    }
+
+    fn selectable_ids(&self) -> Vec<String> {
+        ui::selectable(&self.tree(&self.layouts()))
+    }
+
+    /// A pinned rail must not be selectable once its permissions are
+    /// answered: Zellij closes a tab (and the session with its last tab)
+    /// only when no selectable pane is left, so a selectable rail would
+    /// keep it open after its last terminal pane exits. It stays
+    /// selectable until its tab has a terminal, so the tab is never
+    /// closed while the layout is still opening.
+    fn sync_selectable(&mut self) {
+        if !self.pinned {
+            return;
+        }
+        let own = get_plugin_ids().plugin_id;
+        let tab_has_terminal = self.panes.as_ref().is_some_and(|m| {
+            m.panes
+                .values()
+                .find(|ps| ps.iter().any(|p| p.is_plugin && p.id == own))
+                .is_some_and(|ps| ps.iter().any(|p| !p.is_plugin))
+        });
+        let want = !((self.permitted || self.denied) && tab_has_terminal);
+        if self.selectable != Some(want) {
+            self.selectable = Some(want);
+            set_selectable(want);
+        }
+    }
+
+    fn on_click(&mut self, target: Target) -> bool {
+        match target {
+            Target::Agent(id) => {
+                if let Some(agent) = self.find(&id) {
+                    self.selected = Some(id);
+                    self.jump(&agent);
+                }
+            }
+            Target::Tab { session, position } => {
+                if !self.pinned {
+                    hide_self();
+                }
+                if self.session.as_deref() == Some(session.as_str()) {
+                    switch_tab_to(position as u32 + 1);
+                } else {
+                    switch_session_with_focus(&session, Some(position), None);
+                }
+            }
+            Target::Session(name) => switch_session(Some(&name)),
+        }
+        true
+    }
+
     fn move_cursor(&mut self, delta: isize) -> bool {
-        let Some(state) = &self.state else {
+        if self.state.is_none() {
             return false;
-        };
-        let ids = ui::selectable(state);
+        }
+        let ids = self.selectable_ids();
         if ids.is_empty() {
             return false;
         }
@@ -437,5 +537,25 @@ impl Plugin {
         } else {
             switch_session_with_focus(&pane.session, None, Some((pane.pane_id, false)));
         }
+    }
+}
+
+/// A [`SessionLayout`] from Zellij's tabs and panes, keyed by tab position.
+fn layout(name: &str, tabs: &[TabInfo], panes: Option<&PaneManifest>) -> SessionLayout {
+    let tabs = tabs
+        .iter()
+        .map(|t| TabLayout {
+            position: t.position,
+            name: t.name.clone(),
+            active: t.active,
+            panes: panes
+                .and_then(|m| m.panes.get(&t.position))
+                .map(|ps| ps.iter().filter(|p| !p.is_plugin).map(|p| p.id).collect())
+                .unwrap_or_default(),
+        })
+        .collect();
+    SessionLayout {
+        name: name.to_string(),
+        tabs,
     }
 }

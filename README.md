@@ -80,6 +80,14 @@ CLI, and the daemon serves only connections from its own uid.
   glyph and the time in that state. `j`/`k` or arrows move, `Enter` jumps to
   the pane (switching session if needed), `n`/`p` cycle attention, `Esc`
   hides it. Remote rows show their SSH target and do not jump.
+  On this machine, the agents of each Zellij session sit under the tab that
+  holds their pane, as in zj-radar: the current session first with all its
+  tabs (`▌` marks the active one), other sessions with the tabs that have
+  agents. Agents outside Zellij and remote machines stay grouped by host
+  and session. Click an agent, tab or session row to jump to it.
+- A pinned rail (`pinned "true"` in a layout) makes itself unselectable
+  once its permissions are answered, like Zellij's status bar, so closing
+  the last terminal pane still closes the tab and the session.
 - `Alt ]` / `Alt [` jump to the next / previous agent that needs you:
   blocked ones first, then idle ones.
 

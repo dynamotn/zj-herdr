@@ -9,8 +9,37 @@ pub const NO_SESSION: &str = "(outside zellij)";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Row<'a> {
     Machine(&'a Machine),
-    Session { name: &'a str, local: bool },
-    Agent { agent: &'a Agent, local: bool },
+    Session {
+        name: &'a str,
+        local: bool,
+    },
+    /// A tab of a local session; `state` is its most urgent agent's.
+    Tab {
+        session: &'a str,
+        tab: &'a TabLayout,
+        state: Option<AgentState>,
+    },
+    Agent {
+        agent: &'a Agent,
+        local: bool,
+    },
+}
+
+/// A tab of a local Zellij session, as the plugin sees it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TabLayout {
+    pub position: usize,
+    pub name: String,
+    pub active: bool,
+    /// Terminal pane ids in this tab.
+    pub panes: Vec<u32>,
+}
+
+/// The tabs of one local Zellij session.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SessionLayout {
+    pub name: String,
+    pub tabs: Vec<TabLayout>,
 }
 
 fn session_of(agent: &Agent) -> &str {
@@ -53,6 +82,86 @@ pub fn rows(state: &StateV1) -> Vec<Row<'_>> {
                 agents
                     .iter()
                     .filter(|a| session_of(a) == s)
+                    .map(|a| Row::Agent { agent: a, local }),
+            );
+        }
+    }
+    out
+}
+
+/// Like [`rows`], but local sessions found in `layouts` list their agents
+/// under the tab that holds each pane, in tab and pane order, as zj-radar
+/// does. The `current` session comes first on the local machine and shows
+/// every tab; other sessions show only tabs with agents. Remote machines
+/// and agents outside Zellij keep the flat session grouping.
+pub fn tree<'a>(
+    state: &'a StateV1,
+    current: Option<&str>,
+    layouts: &'a [SessionLayout],
+) -> Vec<Row<'a>> {
+    let mut machines: Vec<&Machine> = state.machines.iter().collect();
+    machines.sort_by_key(|m| (!is_local(m), m.name.as_str()));
+    let mut out = Vec::new();
+    for m in machines {
+        let local = is_local(m);
+        out.push(Row::Machine(m));
+        let mut agents: Vec<&Agent> = m.agents.iter().collect();
+        agents.sort_by_key(|a| agent_key(a));
+        let mut sessions: Vec<&str> = Vec::new();
+        if local {
+            if let Some(cur) = layouts.iter().find(|l| Some(l.name.as_str()) == current) {
+                sessions.push(&cur.name);
+            }
+        }
+        for a in &agents {
+            if !sessions.contains(&session_of(a)) {
+                sessions.push(session_of(a));
+            }
+        }
+        for s in sessions {
+            out.push(Row::Session { name: s, local });
+            let mut in_session: Vec<&Agent> = agents
+                .iter()
+                .copied()
+                .filter(|a| session_of(a) == s)
+                .collect();
+            let layout = layouts
+                .iter()
+                .find(|l| local && s != NO_SESSION && l.name == s);
+            if let Some(layout) = layout {
+                let mut tabs: Vec<&TabLayout> = layout.tabs.iter().collect();
+                tabs.sort_by_key(|t| t.position);
+                for tab in tabs {
+                    let mut here: Vec<&Agent> = in_session
+                        .iter()
+                        .copied()
+                        .filter(|a| {
+                            a.pane
+                                .as_ref()
+                                .is_some_and(|p| tab.panes.contains(&p.pane_id))
+                        })
+                        .collect();
+                    if here.is_empty() && Some(s) != current {
+                        continue;
+                    }
+                    in_session.retain(|a| !here.contains(a));
+                    here.sort_by_key(|a| a.pane.as_ref().map(|p| p.pane_id));
+                    let state = here
+                        .iter()
+                        .map(|a| a.state)
+                        .min_by_key(|st| st.attention_rank());
+                    out.push(Row::Tab {
+                        session: s,
+                        tab,
+                        state,
+                    });
+                    out.extend(here.into_iter().map(|a| Row::Agent { agent: a, local }));
+                }
+            }
+            // No layout yet, outside Zellij, remote, or a pane no tab lists.
+            out.extend(
+                in_session
+                    .into_iter()
                     .map(|a| Row::Agent { agent: a, local }),
             );
         }
@@ -151,6 +260,9 @@ mod tests {
             .map(|r| match r {
                 Row::Machine(m) => format!("M {}", m.name),
                 Row::Session { name, .. } => format!("S {name}"),
+                Row::Tab { tab, state, .. } => {
+                    format!("T {} {}", tab.name, state.map_or("-", |s| s.as_str()))
+                }
                 Row::Agent { agent, .. } => format!("A {}", agent.pid),
             })
             .collect()
@@ -176,6 +288,63 @@ mod tests {
                 "A 9"
             ]
         );
+    }
+
+    fn tab(position: usize, name: &str, panes: &[u32]) -> TabLayout {
+        TabLayout {
+            position,
+            name: name.into(),
+            active: position == 0,
+            panes: panes.to_vec(),
+        }
+    }
+
+    #[test]
+    fn tree_groups_local_agents_by_tab() {
+        let st = state();
+        let layouts = vec![
+            SessionLayout {
+                name: "a".into(),
+                tabs: vec![
+                    tab(1, "two", &[1]),
+                    tab(0, "one", &[3, 7]),
+                    tab(2, "empty", &[8]),
+                ],
+            },
+            SessionLayout {
+                name: "b".into(),
+                // Pane 2 sits in no tab, say the layout is a beat behind.
+                tabs: vec![tab(0, "x", &[5]), tab(1, "quiet", &[9])],
+            },
+        ];
+        assert_eq!(
+            describe(&tree(&st, Some("a"), &layouts)),
+            [
+                "M box",
+                // The current session first, every tab shown.
+                "S a",
+                "T one blocked",
+                "A 3",
+                "T two working",
+                "A 1",
+                "T empty -",
+                "S b",
+                "T x blocked",
+                "A 5",
+                "A 2",
+                &format!("S {NO_SESSION}"),
+                "A 4",
+                "M far",
+                "S x",
+                "A 9"
+            ]
+        );
+    }
+
+    #[test]
+    fn tree_without_layouts_matches_rows() {
+        let st = state();
+        assert_eq!(describe(&tree(&st, Some("a"), &[])), describe(&rows(&st)));
     }
 
     #[test]

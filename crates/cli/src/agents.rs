@@ -141,12 +141,21 @@ const CLAUDE_MACHINERY: &[&str] = &["daemon", "bg-pty-host"];
 /// daemon's `spare` directory until claimed, and is a background session after.
 const CLAUDE_SPARE: &str = "bg-spare";
 
-/// The word after the program name. The daemon's workers retitle
-/// themselves, so it may share `argv[0]` with it (`"claude bg-spare"`).
+/// The word after the program name, as a subcommand: the daemon's
+/// workers retitle themselves, so it may share `argv[0]` with it
+/// (`"claude bg-spare"`), and newer releases pass it as a flag
+/// (`claude --bg-pty-host <socket>`).
 fn claude_subcommand<'a>(spec: &AgentSpec, argv: &'a [String]) -> Option<&'a str> {
     (spec.kind == "claude")
         .then(|| argv.iter().flat_map(|a| a.split_whitespace()).nth(1))
         .flatten()
+        .map(|w| w.trim_start_matches("--"))
+}
+
+/// Whether the process hosts the pty of a Claude Code background session:
+/// what runs under it is in no pane, whatever Zellij variables it has.
+pub fn is_session_host(spec: &AgentSpec, argv: &[String]) -> bool {
+    claude_subcommand(spec, argv) == Some("bg-pty-host")
 }
 
 /// Whether an agent-looking process is machinery rather than a session: the
@@ -173,6 +182,16 @@ pub fn is_one_shot(spec: &AgentSpec, argv: &[String]) -> bool {
         .skip(1)
         .chain(argv.iter().skip(1).map(String::as_str));
     spec.kind == "claude" && words.any(|w| w == "-p" || w == "--print")
+}
+
+/// Whether the process is a Claude run allowed no tools at all
+/// (`--tools=` or `--tools ""`): a helper some plugin drives over the SDK,
+/// such as a memory observer, never a coding agent.
+pub fn is_toolless(spec: &AgentSpec, argv: &[String]) -> bool {
+    spec.kind == "claude"
+        && argv.iter().enumerate().any(|(i, a)| {
+            a == "--tools=" || (a == "--tools" && argv.get(i + 1).is_some_and(|v| v.is_empty()))
+        })
 }
 
 /// Whether the agent is a background session of the Claude Code daemon. It
@@ -303,6 +322,46 @@ mod tests {
         assert!(!is_one_shot(
             spec("aider").unwrap(),
             &argv(&["aider", "-p"])
+        ));
+    }
+
+    #[test]
+    fn knows_claude_machinery_in_flag_form_and_toolless_helpers() {
+        let claude = spec("claude").unwrap();
+        let bin = "/opt/claude/2.1.312/claude";
+        // Claude Code 2.1.312 passes the pty host as a flag.
+        let host = argv(&[
+            bin,
+            "--bg-pty-host",
+            "/t/pty/a.sock",
+            "181",
+            "49",
+            "--",
+            bin,
+        ]);
+        assert!(is_machinery(claude, &host, None));
+        assert!(is_session_host(claude, &host));
+        assert!(is_session_host(
+            claude,
+            &argv(&["claude bg-pty-host", "--bg-pty-host", "x"])
+        ));
+        assert!(!is_session_host(claude, &argv(&[bin, "--session-id", "s"])));
+        let observer = argv(&[
+            bin,
+            "--output-format",
+            "stream-json",
+            "--input-format",
+            "stream-json",
+            "--tools=",
+            "--setting-sources=",
+        ]);
+        assert!(is_toolless(claude, &observer));
+        assert!(is_toolless(claude, &argv(&[bin, "--tools", ""])));
+        assert!(!is_toolless(claude, &argv(&[bin, "--tools", "Bash,Read"])));
+        assert!(!is_toolless(claude, &argv(&[bin, "--tools=Bash"])));
+        assert!(!is_toolless(
+            spec("codex").unwrap(),
+            &argv(&["codex", "--tools="])
         ));
     }
 

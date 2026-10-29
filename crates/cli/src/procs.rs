@@ -83,6 +83,7 @@ pub fn find_agents(procs: &[RawProc], self_pid: u32, sampled_at: u64) -> Vec<Pro
             let p = by_pid[pid];
             !agents::is_machinery(spec, &p.argv, p.cwd.as_deref())
                 && !agents::is_one_shot(spec, &p.argv)
+                && !agents::is_toolless(spec, &p.argv)
         })
         .collect();
 
@@ -108,7 +109,15 @@ pub fn find_agents(procs: &[RawProc], self_pid: u32, sampled_at: u64) -> Vec<Pro
         })
         .map(|(&pid, &spec)| {
             let p = by_pid[&pid];
-            let pane = if agents::is_detached(spec, &p.argv) {
+            // A session the Claude Code daemon runs under a pty host is in
+            // no pane, whatever Zellij variables it inherited.
+            let hosted = ancestors(pid).any(|a| {
+                by_pid.get(&a).is_some_and(|h| {
+                    agents::identify(&h.name, h.exe.as_deref(), &h.argv)
+                        .is_some_and(|s| agents::is_session_host(s, &h.argv))
+                })
+            });
+            let pane = if hosted || agents::is_detached(spec, &p.argv) {
                 None
             } else {
                 p.pane
@@ -320,6 +329,30 @@ mod tests {
         let pids: Vec<(u32, Option<Pane>)> =
             found.iter().map(|p| (p.pid, p.pane.clone())).collect();
         assert_eq!(pids, [(14, None), (15, pane("work", 0))]);
+    }
+
+    #[test]
+    fn background_sessions_under_a_flag_form_pty_host_are_in_no_pane() {
+        // Claude Code 2.1.312: the pty host is `--bg-pty-host`, the session
+        // under it a plain `claude --session-id`, both with the Zellij
+        // variables of the pane that started the daemon.
+        let bin = "/opt/claude/2.1.312/claude";
+        let mut host = proc(20, 1, &[bin, "--bg-pty-host", "/t/pty/a.sock", "--", bin]);
+        host.pane = pane("work", 0);
+        let mut session = proc(21, 20, &[bin, "--session-id", "s1", "--agent", "claude"]);
+        session.pane = pane("work", 0);
+        let mut observer = proc(22, 1, &[bin, "--input-format", "stream-json", "--tools="]);
+        observer.pane = pane("work", 0);
+        let mut mine = proc(23, 1, &["claude"]);
+        mine.pane = pane("work", 1);
+        let mut procs = [host, session, observer, mine];
+        for p in &mut procs {
+            p.name = "claude".into();
+        }
+        let found = find_agents(&procs, 999, 100);
+        let pids: Vec<(u32, Option<Pane>)> =
+            found.iter().map(|p| (p.pid, p.pane.clone())).collect();
+        assert_eq!(pids, [(21, None), (23, pane("work", 1))]);
     }
 
     #[test]

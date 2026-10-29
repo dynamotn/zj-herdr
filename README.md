@@ -1,355 +1,198 @@
-# zj-herdr
+<h1 align="center">zj-herdr</h1>
 
-A [herdr](https://herdr.dev/docs/)-style agent runtime for Zellij: hook-free
-agent state detection for every agent on the machine, a socket API agents can
-drive, a combined agent list across sessions and SSH machines, and session
-restore.
+<p align="center">
+  <b>Herd every AI agent on your machine from inside Zellij.</b><br>
+  No hooks to install, no wrapper to launch through. It watches the processes
+  and transcripts your agents already have, and tells you who needs you.
+</p>
 
-## How it differs from zj-radar
+<p align="center">
+  <a href="https://github.com/dynamotn/zj-herdr/actions/workflows/ci.yml">
+    <img alt="CI" src="https://img.shields.io/github/actions/workflow/status/dynamotn/zj-herdr/ci.yml?branch=main&label=ci">
+  </a>
+  <a href="https://github.com/dynamotn/zj-herdr/releases/latest">
+    <img alt="Release" src="https://img.shields.io/github/v/release/dynamotn/zj-herdr?label=release">
+  </a>
+  <img alt="Coverage gate" src="https://img.shields.io/badge/coverage-%E2%89%A595%25-brightgreen">
+  <img alt="Zellij plugin" src="https://img.shields.io/badge/zellij-0.45%20plugin-8A2BE2">
+  <img alt="Hook-free" src="https://img.shields.io/badge/hooks-none-informational">
+  <br>
+  <img alt="Claude Code" src="https://img.shields.io/badge/Claude%20Code-full-orange">
+  <img alt="Codex" src="https://img.shields.io/badge/Codex-full-black">
+  <img alt="Opencode" src="https://img.shields.io/badge/Opencode-cpu%20only-4B8BBE">
+  <img alt="Gemini" src="https://img.shields.io/badge/Gemini-cpu%20only-1A73E8">
+  <img alt="pi" src="https://img.shields.io/badge/pi-cpu%20only-6E56CF">
+  <img alt="aider" src="https://img.shields.io/badge/aider-cpu%20only-14B014">
+</p>
 
-| | zj-radar | zj-herdr |
-|---|---|---|
-| State source | a hook installed in each agent CLI | process inspection plus the transcripts agents already write; nothing to install in any agent |
-| Coverage | agents in the current Zellij session | every agent process on the machine, inside Zellij or not |
-| Machines | local only | local plus remote hosts over SSH |
-| Control | display | socket API and CLI: `list`, `wait`, `prompt`, `spawn`, `watch` |
-| Restore | none | `zj-herdr restore` reopens agent sessions with their resume command |
+<p align="center">
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#what-you-get">What you get</a> ·
+  <a href="#how-it-works">How it works</a> ·
+  <a href="#drive-it-from-a-script">Scripting</a> ·
+  <a href="#how-is-this-different">Compared</a> ·
+  <a href="#documentation">Docs</a>
+</p>
 
-## How detection works
-
-`zj-herdr scan` looks for processes of known agents (`claude`, `codex`,
-`opencode`, `gemini`, `copilot`, `cursor-agent`, `pi`, `aider`; the table is
-`crates/cli/src/agents.rs`), reads `ZELLIJ_SESSION_NAME` and `ZELLIJ_PANE_ID`
-from the process environment (or its nearest ancestor's) to find the pane,
-and derives a state. Claude Code's own background machinery is skipped:
-`claude daemon`, its `bg-pty-host` processes, and `bg-spare` workers still
-waiting in the daemon's `spare` directory. A claimed `bg-spare` is a
-background session and is listed outside Zellij, whatever pane variables it
-inherited from the daemon. Headless one-shot runs (`claude -p`/`--print`, as
-hooks and plugins start them) are skipped too; long-lived headless sessions
-(`--input-format stream-json`) are listed.
-
-| State | Rule |
-|---|---|
-| `blocked` | the transcript ends with a tool call that has no result, and both the transcript and the agent's process tree have been quiet for 5 s |
-| `working` | the transcript was written in the last 5 s, or the process tree (agent plus the tools it runs) uses CPU |
-| `idle` | the turn ended (or was interrupted) and everything is quiet |
-| `done` | the process exited; kept in the list for 10 s. An agent that ran less than 30 s in all was a helper and is dropped as soon as it exits (`wait <agent> done` already waiting on it still returns) |
-
-Transcripts read:
-
-- Claude Code: the session Claude records for the process in
-  `~/.claude/sessions/<pid>.json` (only its `pid`, `sessionId`, `cwd` and
-  `startedAt` are read; a file left by an earlier process with the same pid
-  is ignored), whose transcript is
-  `~/.claude/projects/<cwd-slug>/<sessionId>.jsonl` or, for a session that
-  moved into a worktree, the same file in another project directory. Without
-  a session file: the newest `~/.claude/projects/<cwd-slug>/*.jsonl`, where
-  the slug is the cwd with `/` and `.` replaced by `-` (falling back to
-  Claude's own form, which also replaces `_` and other symbols), and
-  `--resume <id>` picks that file. `$CLAUDE_CONFIG_DIR` is honoured. When
-  several Claude agents share a cwd, each remaining transcript goes to the
-  process that was running when it was created, so two agents never report
-  the same session.
-- Codex: the newest `~/.codex/sessions/**/rollout-*.jsonl` recorded for the
-  process cwd (`$CODEX_HOME` is honoured; `codex resume <id>` picks that one).
-- Other agents: CPU only, so they show `working` or `idle`, never `blocked`.
-
-For Claude Code the session's token use is sent as `tokens` (`input`,
-`output`, `cache_read`, `cache_write`): the sums of `message.usage` over the
-transcript's `assistant` entries, each reply once. Claude Code writes a reply
-as one entry per content block, each carrying the reply's whole usage, so
-consecutive entries with the same `message.id` count as one, at the usage of
-the last. Each line is parsed once, as it is
-appended; a transcript that is replaced or shrinks is summed again from the
-start. Codex and the other agents report no tokens yet.
-
-Only the shape of each entry is read, never message text, with one
-exception: for a `blocked` agent, the name of the tool call it waits on and,
-for a shell tool (Claude `Bash`, Codex `shell`/`exec_command`), its command.
-That text is sent as `waiting` (one line, at most 60 characters, absent in
-other states) and shown by the plugin under the agent as `↳ Bash: cargo
-test`. Tool results, prompts and replies are never read. Known limits: a
-quiet tool (a long `sleep`, a stalled download) awaiting no permission looks
-`blocked`, and when two Claude agents in one directory both `/clear` at
-about the same time their new transcripts can be swapped.
-
-## Install
-
-```sh
-cargo install --path crates/cli          # the zj-herdr binary
-rustup target add wasm32-wasip1
-cargo build -p zj-herdr-plugin --target wasm32-wasip1 --release
-mkdir -p ~/.config/zellij/plugins
-cp target/wasm32-wasip1/release/zj_herdr.wasm ~/.config/zellij/plugins/
+```text
+ zj-herdr  ·4▲ 1!
+ ═════════◆══════════════════════
+ ▌ api
+   ◆ ✳ api                     2m
+     opus5.5 4.8M ■■■□□ 62% #12
+     ↳ Bash: cargo test --workspace
+   ⠋ ❉ api-worker             14s
+     gpt-5 1.2M ■□□□□ 18% #14
+     ┊ ⠹ npm test            0:42
+   ⚗ cargo test               ⠋ 31s
+   · $ nvim src/main.rs
+   web
+   ○ ✳ web                    9m ✓
+   +3 tabs
+ l30n4rd0d4v1nc1 · ssh
+   ⠋ ✳ infra                   1m
+ ─ earlier ─
+   ● ✳ docs                  done
+ ────────────────────────────────
+ 2 working · 1 need you
+ ↵ jump  n next  p prev
 ```
 
-Run the daemon (from a service manager, or a Zellij pane):
+<p align="center">
+  <code>◆ blocked</code> · <code>⠋ working</code> · <code>○ idle</code> ·
+  <code>✗ API error</code> · <code>✓ exited</code>
+</p>
+
+Agents work for minutes, then stop on a permission prompt or finish without a
+word. Spread over tabs, sessions and a server or two, you lose track of which
+one is waiting. zj-herdr finds them all, puts them on one rail in the Zellij you
+already run, and gives you a socket so agents can wait on and prompt each other.
+
+## Quick start
 
 ```sh
-zj-herdr daemon
+# 1. The CLI and daemon. Archives exist for x86_64/aarch64 Linux (musl) and
+#    macOS; swap the target to match.
+curl -fsSL https://github.com/dynamotn/zj-herdr/releases/latest/download/zj-herdr-x86_64-unknown-linux-musl.tar.gz \
+  | tar -xz -C ~/.local/bin zj-herdr
+
+# 2. Look before you commit: one scan of this machine, no daemon needed.
+zj-herdr scan
 ```
 
-It rescans every second, serves `$XDG_RUNTIME_DIR/zj-herdr.sock` (falling
-back to `$TMPDIR/zj-herdr-$UID.sock`; override with `--socket` or
-`$ZJ_HERDR_SOCKET`), and pushes state to every running Zellij session with
-`zellij pipe --name zj_herdr.state.v1`. The socket is mode 0600, in a
-directory that is either private or shared with the sticky bit (`/tmp`).
-A socket path owned by another user is refused by both the daemon and the
-CLI, and the daemon serves only connections from its own uid.
-
-## Zellij config
-
-[`docs/zellij.kdl`](docs/zellij.kdl) has the plugin alias and keybinds:
-
-- `Alt a` opens the floating picker. Its look borrows from zj-radar
-  (the tab tree, cards, the `earlier` list), herdr (seen marks, the
-  selected row lit) and abtop (context bars, short model names, task
-  trees):
-  - The header shows the agent count, `▲` when tabs are folded away, and
-    in red how many need you (`zj-herdr  ·3▲ 1!`), over a `═` rule along
-    which a `◆` sweeps while anything runs.
-  - Agents of each local Zellij session sit under the tab that holds their
-    pane: the current session first with its active tab (marked `▌`) and
-    every tab that has agents, tabs without agents folded into one dim
-    `+N tabs` line; other sessions with the tabs that have agents. Agents
-    outside Zellij and on remote machines are grouped by host and session.
-  - Each agent takes two lines. The first is its state glyph (`◆` blocked,
-    a spinning `⠋` working, `○` idle, dim `○` idle and seen, `✗` its last
-    turn hit an API error, `✓` exited), its kind as a mark (`✳` claude,
-    `❉` codex, `✺` opencode, `✦` gemini, `✴` pi; other kinds by name), the
-    project (its directory) in bold, and the time in that state flush
-    right. The second keeps what fits of the model (`opus5.5`), the
-    session's token total (`4.8M`), how full its context window is
-    (`■■■□□ 62%`, `!` past 75%, `⚠` past 90%) and the pane (`#12`, `pid N`
-    or `ssh:host`). A blocked agent adds `↳ <what it waits on>`.
-  - Work an agent runs in the background (Claude's background shells and
-    subagents) hangs under it on a `┊`: a spinner with its age while it
-    runs (a steady `▸` for a dev server), then `●` done, `✗` failed or `○`
-    killed for five minutes; at most three lines, a failure always shown.
-    An agent whose turn ended while such work runs (a server aside) counts
-    as working.
-  - Commands run in this session's panes (`cargo test`, `npm run dev`, …),
-    seen through Zellij's `CommandChanged` like zj-radar, get a row under
-    their tab once they have run two seconds: `⚙` build, `⚗` test, `⇡`
-    deploy, `❯` server (steady `▸`), `⇄` ssh, `$` anything else. Editors,
-    pagers and shells are left out. A command typed at a shell has no exit
-    status to read, so the pane returning to its prompt counts as done;
-    a `zellij run` pane's exit status marks it `✗` when it failed.
-  - Every other terminal pane, in every local session, gets a dim
-    `· $ <pane title>` row under its tab, so a pane just opened (a floating
-    one included) shows at once; clicking it focuses the pane. These rows
-    are not counted and never need you. Commands are only seen in sessions
-    with a zj-herdr rail (Zellij sends `CommandChanged` to its own
-    session's plugins); elsewhere the pane title, which shells set to the
-    running command, stands in.
-  - The row under the cursor is marked `►` and lit; a row that just
-    started needing you flashes for three seconds.
-  - When the tree does not fit, idle tabs (nothing running, nobody
-    waiting, not in view) fold into one `+N idle ▾` line, the last first.
-  - Room left over fills from the bottom: with three lines free a footer
-    (a rule, the tally `3 working · 2 need you`, and clickable `↵ jump  n
-    next  p prev` buttons), and above it `─ earlier ─`, up to ten things
-    that finished lately, newest first: agents that ended a turn and
-    commands that ended.
-  - `j`/`k` or arrows move, `Enter` jumps to the pane (switching session
-    if needed), `n`/`p` cycle attention, `Esc` hides it. Click an agent,
-    tab or session row to jump to it. Remote rows show their SSH target
-    and do not jump.
-- Rows end in buttons: `✓` on an idle agent marks it seen (`zj-herdr
-  ack`), so it stops counting as needing you until it changes state; `⇲`
-  on an agent that runs outside Zellij and has a session to resume runs
-  `zj-herdr adopt <id> --session <this session>`, which moves it into a
-  new pane here (stopping it where it ran) — only the button does this,
-  `Enter` or a click elsewhere on the row only selects it; `✕` on an
-  unreachable machine hides it until it is reachable again.
-  Zellij does not always describe other sessions to a plugin, so the
-  daemon also records each agent's tab: every 5 s at most, it runs
-  `zellij --session S action list-panes --json --tab` in each session
-  that has agents, and sends the result as `pane.tab`
-  (`{"position":0,"name":"api"}`, absent when unknown) in the snapshot.
-- A pinned rail (`pinned "true"` in a layout) makes itself unselectable
-  once its permissions are answered, like Zellij's status bar, so closing
-  the last terminal pane still closes the tab and the session.
-- `Alt ]` / `Alt [` jump to the next / previous agent that needs you:
-  blocked ones first, then idle ones.
-
-The plugin asks for permission to read and change application state, write
-to panes (for `prompt`), read CLI pipes, and run commands (to fetch the
-first snapshot with `zj-herdr list --json`, and for `zj-herdr adopt`,
-`zj-herdr ack` and `zj-herdr restore`).
-Plugin options:
-
-| Option | Default | Meaning |
-|---|---|---|
-| `pinned` | `false` | stay open after a jump (for a pane in a layout) |
-| `deliver_prompts` | `false` | type prompts sent to this instance; `zj-herdr prompt` sets it on its own instance, so leave it unset in layouts |
-| `zj_herdr_bin` | `zj-herdr` | binary used for the first snapshot (and by `start_daemon`) |
-| `start_daemon` | `false` | start `zj-herdr daemon` in the background once permitted, unless one runs already; it logs to `$XDG_STATE_HOME/zj-herdr/daemon.log` and outlives Zellij |
-| `density` | `cards` | `cards`: each tab a card tinted from the terminal's own colours (needs truecolor), a blank line between cards; `comfortable`: the blank lines, no tint; `compact`: tabs flush |
-| `rename_tabs` | `true` | name each tab of the current session after the directory of its first agent (in pane order), as long as the tab still has Zellij's default `Tab #<n>` name or the name this instance gave it; a tab you renamed is never touched. Only the instance in the active tab renames, so one rail per tab do not race |
-
-Pipe commands (`zellij pipe --name zj_herdr.cmd.v1 -- <payload>`):
-`attention-next`, `attention-prev`, `toggle`, `select-next`,
-`select-prev`, `jump`, `session-next`, `session-prev` (switch to the next
-or previous Zellij session by name), and `{"cmd":"prompt","pane_id":N,"text":"..."}`.
-
-A pinned rail is unselectable, so it never gets keys; `select-next`,
-`select-prev` (move the cursor) and `jump` (go to the agent under it) drive
-it from keybinds instead. Every rail of the session receives them, and only
-the one whose own tab is active acts. Zellij delivers a keybind's message
-to the instances whose URL and configuration match, so the bind must repeat
-the rail's options from the layout exactly (`name`, `payload` and
-`floating` are not part of the configuration):
+Then add the plugin to `~/.config/zellij/config.kdl` and let it start the
+daemon for you:
 
 ```kdl
-bind "Ctrl Alt j" {
-    MessagePlugin "zj_herdr" {
-        name "zj_herdr.cmd.v1"
-        payload "select-next"
-        floating true          // if nothing matches, launch floating, not tiled
-        pinned "true"          // the rail's own options, as in the layout
-        deliver_prompts "false"
+plugins {
+    zj_herdr location="https://github.com/dynamotn/zj-herdr/releases/latest/download/zj_herdr.wasm" {
+        start_daemon "true"
+    }
+}
+
+keybinds {
+    shared_except "locked" {
+        bind "Alt a" { LaunchOrFocusPlugin "zj_herdr" { floating true; move_to_focused_tab true; }; }
+        bind "Alt ]" { MessagePlugin "zj_herdr" { name "zj_herdr.cmd.v1"; payload "attention-next"; floating true; }; }
+        bind "Alt [" { MessagePlugin "zj_herdr" { name "zj_herdr.cmd.v1"; payload "attention-prev"; floating true; }; }
     }
 }
 ```
 
-[`docs/zellij.kdl`](docs/zellij.kdl) has all three binds next to the layout
-they match.
+Restart Zellij, grant the permissions once, and press `Alt a`. A pinned rail
+for your layout and more keybinds are in [`docs/zellij.kdl`](docs/zellij.kdl);
+building from source is in [`docs/development.md`](docs/development.md).
 
-`zj-herdr prompt` runs `zellij --session S action pipe --plugin zj_herdr
---plugin-configuration deliver_prompts=true --floating-plugin true` in the
-agent's session. Zellij matches plugin instances by URL and configuration,
-so this reaches one dedicated instance (loaded floating the first time, and
-hidden again afterwards) and never the picker panes, which would each type
-the prompt again. The plugin answers `zj_herdr.prompt.delivered` once the
-text is typed, or fails if the pane is gone; without
-that answer the command fails rather than report success. The first time
-the plugin loads in a session, Zellij asks for its permissions in the
-floating pane, and the prompt waits for them. Set `plugin = "..."` at the
-top of `config.toml` if your alias or plugin URL differs.
+## What you get
 
-## CLI
+- **Every agent, wherever it runs.** Claude Code, Codex, Opencode, Gemini,
+  Copilot, Cursor, pi and aider, inside Zellij or outside it, on this machine
+  or on hosts you reach over SSH.
+- **Nothing to install in the agents.** State comes from the process tree and
+  the transcripts agents already write, so a new agent version never needs a
+  new hook.
+- **Who needs you, and for what.** A blocked agent shows the tool it waits on
+  (`↳ Bash: cargo test`); `Alt ]` jumps to it, across sessions.
+- **The numbers at a glance.** Model, session token total, how full the
+  context window is, and the background shells and subagents it left running.
+- **Your panes too.** Builds, tests and dev servers in your panes get their own
+  rows; editors and pagers stay quiet.
+- **Pull agents in.** `⇲` moves an agent running outside Zellij into a new pane
+  here, resumed where it was.
+- **Survive a restart.** After Zellij resurrects a session, the rail offers
+  `↻ restore N agents` and reopens each one with its resume command.
 
-```sh
-zj-herdr scan [--json]                 # this machine, once, no daemon needed
-zj-herdr list [--json]                 # everything the daemon knows (falls back to scan)
-zj-herdr wait <agent> <state> [--timeout S]
-zj-herdr prompt <agent> <text...> [--no-enter]
-zj-herdr spawn --session S [--cwd DIR] -- <command...>
-zj-herdr watch [--json]                # stream state changes
-zj-herdr restore [--session S] [--dry-run [--json]]
-zj-herdr adopt <agent> --session S      # move an agent from outside Zellij into S
-zj-herdr ack <agent>                    # mark an idle agent seen
+## How it works
+
+```text
+ agents (claude, codex, …) ──┐
+ ~/.claude, ~/.codex ────────┼──▶ zj-herdr daemon ──zellij pipe──▶ rail in every session
+ ssh host: zj-herdr scan ────┘         │
+                                       └──▶ socket ◀── zj-herdr CLI · your scripts
 ```
 
-`adopt` works on a local agent running outside Zellij whose session id and
-cwd are known and whose kind has a resume command (`claude`, `codex`). The
-daemon checks that session S is running and that the pid still runs that
-agent (same kind and cwd, outside Zellij), sends it SIGTERM, waits up to
-5 s for it and any native helper of its own kind to exit (and fails
-without opening anything if they do not), then opens `claude --resume
-<id>` or `codex resume <id>` in a new pane of S, in the agent's cwd. A
-second `adopt` of the same agent while one is under way is refused.
+Once a second the daemon scans processes for known agents, finds each one's
+pane from `ZELLIJ_SESSION_NAME` and `ZELLIJ_PANE_ID` in its environment, and
+derives a state:
 
-`<agent>` is an id (`machine/pid`), a pid, or `session:pane_id`. `wait`
-exits 1 on timeout, so an agent can wait for another to need attention:
+| State | When |
+|---|---|
+| `blocked` | the transcript ends on a tool call with no result, and everything has been quiet for 5 s |
+| `working` | the transcript moved in the last 5 s, or the agent's process tree uses CPU |
+| `idle` | the turn ended and everything is quiet |
+| `done` | the process exited (kept for 10 s) |
+
+Claude Code and Codex get the full picture from their transcripts; the others
+are read from CPU alone, so they show `working` or `idle`. Only the shape of a
+transcript is read, never your prompts or the replies. The fine print is in
+[`docs/detection.md`](docs/detection.md).
+
+## Drive it from a script
+
+The daemon serves newline-delimited JSON on a private socket, and the CLI wraps
+it: `list`, `watch`, `wait`, `prompt`, `spawn`, `adopt`, `ack` and `restore`.
+One agent can wait for another to need attention, then answer it:
 
 ```sh
 zj-herdr wait dev:3 blocked --timeout 600 && zj-herdr prompt dev:3 "yes, go ahead"
 ```
 
-### Socket API
+Every command, the socket API and remote hosts are in
+[`docs/cli.md`](docs/cli.md).
 
-Newline-delimited JSON on the socket; one response line per request:
+## How is this different?
 
-```json
-{"op":"list"}
-{"op":"wait","agent":"box/123","state":"blocked","timeout":60}
-{"op":"prompt","agent":"dev:3","text":"continue","submit":true}
-{"op":"spawn","session":"dev","cwd":"/work","command":["claude"]}
-{"op":"subscribe"}
-{"op":"adopt","agent":"box/123","session":"dev"}
-{"op":"ack","agent":"box/123"}
-```
+| | [zj-radar](https://github.com/marktoda/zj-radar) | zj-herdr |
+|---|---|---|
+| State source | a hook installed in each agent CLI | process inspection plus the transcripts agents already write |
+| Coverage | agents in the current Zellij session | every agent process on the machine, inside Zellij or not |
+| Machines | local only | local plus remote hosts over SSH |
+| Control | display | socket API and CLI: `list`, `wait`, `prompt`, `spawn`, `watch`, `adopt` |
+| Restore | none | reopens agent sessions with their resume command |
 
-Responses look like `{"ok":true,"state":{...}}` or
-`{"ok":false,"error":"..."}`. `subscribe` streams
-`{"event":"snapshot","state":{...}}` and then
-`{"event":"change","agent":{...},"from":"working"}` lines. Snapshots use the
-versioned `zj_herdr.state.v1` format from `crates/core`.
+The name and the socket-driven control come from
+[herdr](https://herdr.dev/docs/); the rail borrows from zj-radar (the tab tree,
+cards, the `earlier` list) and abtop (context bars, short model names, task
+trees).
 
-## Remote machines
+## Documentation
 
-List hosts in `~/.config/zj-herdr/config.toml`:
-
-```toml
-# plugin = "zj_herdr"     # Zellij alias or URL that types prompts
-
-[[remote]]
-name = "l30n4rd0d4v1nc1"
-ssh = "l30n4rd0d4v1nc1"   # a Host alias from ~/.ssh/config
-# command = "zj-herdr"    # remote binary, if not on the non-interactive PATH
-# interval_secs = 5
-# timeout_secs = 10
-```
-
-The daemon runs `ssh -o BatchMode=yes <ssh> zj-herdr scan --json` on each
-interval and merges the result under `name`; a failure or timeout marks the
-machine `unreachable` and keeps its last known agents. It relies on your own
-SSH config and agent: zj-herdr never reads, copies or stores keys, and the
-config holds no credentials. Remote agents are listed and can be waited on;
-`prompt` and jumping only work for local agents.
-
-## Session restore
-
-The daemon records, per pane, the agent kind, cwd and agent session id in
-`$XDG_STATE_HOME/zj-herdr/sessions.json` (default
-`~/.local/state/zj-herdr/sessions.json`). After Zellij resurrects a session,
-`zj-herdr restore --session S` opens a pane per record running
-`claude --resume <id>` or `codex resume <id>` in its cwd, skipping sessions
-that are already running. Layout is left to Zellij's session resurrection.
-`zj-herdr restore --session S --dry-run --json` prints what it would
-reopen as `{"count":N,"panes":[{"session","pane_id","cwd","command"}]}`.
-
-The plugin offers this itself: once permitted (and again whenever it is
-shown), each instance runs that dry run for its own session, and when it
-would reopen anything, shows `↻ restore N agents` under the header.
-Clicking it runs `zj-herdr restore --session S` and hides the banner.
-Since `restore` skips agent sessions that are already running (a resumed
-Claude counts from the moment it starts), clicking the banner of another
-tab's rail afterwards opens nothing twice.
+| Doc | What's in it |
+|---|---|
+| [`docs/rail.md`](docs/rail.md) | Reading the rail, buttons, plugin options, pipe commands, prompt delivery. |
+| [`docs/zellij.kdl`](docs/zellij.kdl) | A complete plugin alias, keybinds and pinned-rail layout to copy. |
+| [`docs/cli.md`](docs/cli.md) | The daemon, every CLI command, the socket API, remote machines, session restore. |
+| [`docs/detection.md`](docs/detection.md) | How each state is derived, which transcripts are read, token counting, known limits. |
+| [`docs/development.md`](docs/development.md) | Lints, tests, the end-to-end suites and the coverage gate. |
+| [`docs/plan.md`](docs/plan.md) | The original design. |
+| [`CHANGELOG.md`](CHANGELOG.md) | What changed in each release. |
 
 ## Development
 
 ```sh
-cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test
+cargo test    # fixture transcripts only, never your real ~/.claude
 cargo build -p zj-herdr-plugin --target wasm32-wasip1 --release
 ```
 
-Tests use the fixture transcripts in `crates/cli/tests/fixtures/` and never
-read the real `~/.claude`, `~/.codex` or `~/.ssh`. See
-[docs/plan.md](docs/plan.md) for the design.
-
-Two end-to-end suites run the real programs in a private `HOME` and
-`TMPDIR`: `crates/cli/tests/e2e_cli.rs` drives the `zj-herdr` binary and
-its daemon over a real socket, and `crates/plugin/tests/e2e_zellij.rs`
-starts a headless Zellij session (named `zj-herdr-e2e`, in its own socket
-directory), loads the built `zj_herdr.wasm` with its permissions granted,
-pipes it a state and reads the rail back with `zellij action dump-screen`.
-Where Unix sockets cannot be bound (some sandboxes) or Zellij is missing,
-they skip; `ZJ_HERDR_E2E_ZELLIJ=1` makes the Zellij one fail instead.
-
-The plugin's behaviour lives in `crates/plugin/src/app.rs`, which reaches
-Zellij only through a `Host` trait, so it is tested natively;
-`crates/plugin/src/main.rs` only implements that trait on Zellij's API and
-is left out of the coverage figure. CI (`.github/workflows/ci.yml`) holds
-the rest to 95% of lines:
-
-```sh
-cargo build -p zj-herdr-plugin --target wasm32-wasip1 --release
-ZJ_HERDR_E2E_ZELLIJ=1 cargo llvm-cov --workspace \
-  --ignore-filename-regex 'plugin/src/main\.rs' --fail-under-lines 95
-```
+CI holds formatting, `clippy -D warnings`, a real headless Zellij end-to-end
+run and 95% line coverage; see [`docs/development.md`](docs/development.md).

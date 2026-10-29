@@ -52,6 +52,43 @@ keybinds {
                 floating true
             }
         }
+
+        // Drive the pinned rail of the layout below, which is unselectable
+        // and so never gets keys of its own. Zellij delivers a pipe to the
+        // instances whose URL and configuration match, so these binds
+        // repeat the rail's options (here `pinned "true"` and
+        // `deliver_prompts "false"`) exactly. `name`, `payload` and
+        // `floating` are not part of the configuration. Every rail of the
+        // session gets the message; only the one in the active tab acts.
+        // If no rail matches, Zellij launches a floating one instead: check
+        // that the options are the same as in the layout.
+        bind "Ctrl Alt j" {
+            MessagePlugin "zj_herdr" {
+                name "zj_herdr.cmd.v1"
+                payload "select-next"
+                floating true
+                pinned "true"
+                deliver_prompts "false"
+            }
+        }
+        bind "Ctrl Alt k" {
+            MessagePlugin "zj_herdr" {
+                name "zj_herdr.cmd.v1"
+                payload "select-prev"
+                floating true
+                pinned "true"
+                deliver_prompts "false"
+            }
+        }
+        bind "Ctrl Alt g" {
+            MessagePlugin "zj_herdr" {
+                name "zj_herdr.cmd.v1"
+                payload "jump"
+                floating true
+                pinned "true"
+                deliver_prompts "false"
+            }
+        }
     }
 }
 

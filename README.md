@@ -118,8 +118,31 @@ first snapshot with `zj-herdr list --json`). Plugin options:
 | `rename_tabs` | `true` | name each tab of the current session after the directory of its first agent (in pane order), as long as the tab still has Zellij's default `Tab #<n>` name or the name this instance gave it; a tab you renamed is never touched. Only the instance in the active tab renames, so one rail per tab do not race |
 
 Pipe commands (`zellij pipe --name zj_herdr.cmd.v1 -- <payload>`):
-`attention-next`, `attention-prev`, `toggle`, and
-`{"cmd":"prompt","pane_id":N,"text":"..."}`.
+`attention-next`, `attention-prev`, `toggle`, `select-next`,
+`select-prev`, `jump`, and `{"cmd":"prompt","pane_id":N,"text":"..."}`.
+
+A pinned rail is unselectable, so it never gets keys; `select-next`,
+`select-prev` (move the cursor) and `jump` (go to the agent under it) drive
+it from keybinds instead. Every rail of the session receives them, and only
+the one whose own tab is active acts. Zellij delivers a keybind's message
+to the instances whose URL and configuration match, so the bind must repeat
+the rail's options from the layout exactly (`name`, `payload` and
+`floating` are not part of the configuration):
+
+```kdl
+bind "Ctrl Alt j" {
+    MessagePlugin "zj_herdr" {
+        name "zj_herdr.cmd.v1"
+        payload "select-next"
+        floating true          // if nothing matches, launch floating, not tiled
+        pinned "true"          // the rail's own options, as in the layout
+        deliver_prompts "false"
+    }
+}
+```
+
+[`docs/zellij.kdl`](docs/zellij.kdl) has all three binds next to the layout
+they match.
 
 `zj-herdr prompt` runs `zellij --session S action pipe --plugin zj_herdr
 --plugin-configuration deliver_prompts=true --floating-plugin true` in the

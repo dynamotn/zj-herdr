@@ -37,6 +37,14 @@ pub enum PluginCommand {
     AttentionPrev,
     /// Show or hide the picker.
     Toggle,
+    /// Move the cursor to the next agent row. Like `select-prev` and
+    /// `jump`, only the instance whose own tab is active acts on it, so a
+    /// keybind can drive the pinned rail of the tab in view.
+    SelectNext,
+    /// Move the cursor to the previous agent row.
+    SelectPrev,
+    /// Jump to the agent under the cursor.
+    Jump,
     /// Type `text` into a terminal pane of this session.
     Prompt { pane_id: u32, text: String },
 }
@@ -56,6 +64,9 @@ impl PluginCommand {
             "attention-next" => Ok(PluginCommand::AttentionNext),
             "attention-prev" => Ok(PluginCommand::AttentionPrev),
             "toggle" => Ok(PluginCommand::Toggle),
+            "select-next" => Ok(PluginCommand::SelectNext),
+            "select-prev" => Ok(PluginCommand::SelectPrev),
+            "jump" => Ok(PluginCommand::Jump),
             other => Err(format!("unknown {CMD_SCHEMA} command {other:?}")),
         }
     }
@@ -76,8 +87,22 @@ mod tests {
             PluginCommand::parse(r#"{"cmd":"attention-prev"}"#),
             Ok(PluginCommand::AttentionPrev)
         );
-        assert!(PluginCommand::parse("jump").is_err());
+        assert!(PluginCommand::parse("leap").is_err());
         assert!(PluginCommand::parse(r#"{"cmd":"prompt"}"#).is_err());
+    }
+
+    #[test]
+    fn rail_commands_parse() {
+        for (word, cmd) in [
+            ("select-next", PluginCommand::SelectNext),
+            ("select-prev", PluginCommand::SelectPrev),
+            ("jump", PluginCommand::Jump),
+        ] {
+            assert_eq!(PluginCommand::parse(&format!("{word}\n")), Ok(cmd.clone()));
+            assert_eq!(cmd.to_json(), format!(r#"{{"cmd":"{word}"}}"#));
+            assert_eq!(PluginCommand::parse(&cmd.to_json()), Ok(cmd));
+        }
+        assert!(PluginCommand::parse("select").is_err());
     }
 
     #[test]

@@ -215,42 +215,53 @@ impl ZellijPlugin for Plugin {
             }
             return false;
         }
-        let redraw = match msg.name.as_str() {
-            STATE_SCHEMA => match StateV1::from_json(payload) {
-                Ok(state) => {
-                    self.set_state(state);
-                    true
-                }
-                Err(e) => {
-                    self.error = Some(e.to_string());
-                    true
-                }
-            },
-            CMD_SCHEMA => match PluginCommand::parse(payload) {
-                // Answers (and unblocks) its CLI pipe itself, maybe later.
-                Ok(PluginCommand::Prompt { pane_id, text }) => {
-                    self.prompt(cli, pane_id, text);
-                    return false;
-                }
-                Ok(cmd) => {
-                    let redraw = self.on_command(cmd.clone());
-                    if self.pending.is_some() {
-                        self.hide_after_pending = true;
-                    } else if cmd != PluginCommand::Toggle {
-                        self.hide_unless_in_use();
+        let redraw =
+            match msg.name.as_str() {
+                STATE_SCHEMA => match StateV1::from_json(payload) {
+                    Ok(state) => {
+                        self.set_state(state);
+                        true
                     }
-                    redraw
-                }
-                Err(e) => {
-                    if let Some(id) = &cli {
-                        cli_pipe_output(id, &format!("{PROMPT_NACK} {e}\n"));
+                    Err(e) => {
+                        self.error = Some(e.to_string());
+                        true
                     }
-                    self.error = Some(e);
-                    true
-                }
-            },
-            _ => false,
-        };
+                },
+                CMD_SCHEMA => match PluginCommand::parse(payload) {
+                    // Answers (and unblocks) its CLI pipe itself, maybe later.
+                    Ok(PluginCommand::Prompt { pane_id, text }) => {
+                        self.prompt(cli, pane_id, text);
+                        return false;
+                    }
+                    // Every rail of the session gets these; the one in view acts.
+                    Ok(
+                        PluginCommand::SelectNext | PluginCommand::SelectPrev | PluginCommand::Jump,
+                    ) if !acts_on_rail_command(self.own_tab_active()) => false,
+                    Ok(cmd) => {
+                        let redraw = self.on_command(cmd.clone());
+                        let keeps_open = matches!(
+                            cmd,
+                            PluginCommand::Toggle
+                                | PluginCommand::SelectNext
+                                | PluginCommand::SelectPrev
+                        );
+                        if self.pending.is_some() {
+                            self.hide_after_pending = true;
+                        } else if !keeps_open {
+                            self.hide_unless_in_use();
+                        }
+                        redraw
+                    }
+                    Err(e) => {
+                        if let Some(id) = &cli {
+                            cli_pipe_output(id, &format!("{PROMPT_NACK} {e}\n"));
+                        }
+                        self.error = Some(e);
+                        true
+                    }
+                },
+                _ => false,
+            };
         if let Some(id) = &cli {
             unblock_cli_pipe_input(id);
         }
@@ -511,12 +522,7 @@ impl Plugin {
         match key.bare_key {
             BareKey::Down | BareKey::Char('j') => self.move_cursor(1),
             BareKey::Up | BareKey::Char('k') => self.move_cursor(-1),
-            BareKey::Enter => {
-                if let Some(agent) = self.selected.clone().and_then(|id| self.find(&id)) {
-                    self.jump(&agent);
-                }
-                true
-            }
+            BareKey::Enter => self.on_command(PluginCommand::Jump),
             BareKey::Char('n') => self.on_command(PluginCommand::AttentionNext),
             BareKey::Char('p') => self.on_command(PluginCommand::AttentionPrev),
             BareKey::Esc | BareKey::Char('q') => {
@@ -539,6 +545,14 @@ impl Plugin {
                 let order = view::attention_order(state);
                 if let Some(agent) = view::cycle(&order, from.as_deref(), forward).cloned() {
                     self.selected = Some(agent.id.clone());
+                    self.jump(&agent);
+                }
+                true
+            }
+            PluginCommand::SelectNext => self.move_cursor(1),
+            PluginCommand::SelectPrev => self.move_cursor(-1),
+            PluginCommand::Jump => {
+                if let Some(agent) = self.selected.clone().and_then(|id| self.find(&id)) {
                     self.jump(&agent);
                 }
                 true
@@ -579,6 +593,13 @@ impl Plugin {
             switch_session_with_focus(&pane.session, None, Some((pane.pane_id, false)));
         }
     }
+}
+
+/// `select-next`, `select-prev` and `jump` reach every rail of a session;
+/// only the one in the active tab acts. An instance that does not know its
+/// tab yet (one Zellij just launched to deliver the pipe) acts too.
+fn acts_on_rail_command(own_tab_active: Option<bool>) -> bool {
+    own_tab_active != Some(false)
 }
 
 /// Position of the tab that holds plugin pane `plugin_id`.
@@ -650,6 +671,13 @@ mod tests {
         assert_eq!(own_tab(&manifest, 7), Some(1));
         assert_eq!(own_tab(&manifest, 1), Some(0));
         assert_eq!(own_tab(&manifest, 9), None);
+    }
+
+    #[test]
+    fn only_the_rail_in_view_acts_on_rail_commands() {
+        assert!(acts_on_rail_command(Some(true)));
+        assert!(!acts_on_rail_command(Some(false)));
+        assert!(acts_on_rail_command(None));
     }
 
     #[test]

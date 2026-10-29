@@ -111,6 +111,7 @@ first snapshot with `zj-herdr list --json`). Plugin options:
 | `deliver_prompts` | `false` | type prompts sent to this instance; `zj-herdr prompt` sets it on its own instance, so leave it unset in layouts |
 | `zj_herdr_bin` | `zj-herdr` | binary used for the first snapshot (and by `start_daemon`) |
 | `start_daemon` | `false` | start `zj-herdr daemon` in the background once permitted, unless one runs already; it logs to `$XDG_STATE_HOME/zj-herdr/daemon.log` and outlives Zellij |
+| `rename_tabs` | `true` | name each tab of the current session after the directory of its first agent (in pane order), as long as the tab still has Zellij's default `Tab #<n>` name or the name this instance gave it; a tab you renamed is never touched. Only the instance in the active tab renames, so one rail per tab do not race |
 
 Pipe commands (`zellij pipe --name zj_herdr.cmd.v1 -- <payload>`):
 `attention-next`, `attention-prev`, `toggle`, and

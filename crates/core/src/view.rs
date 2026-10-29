@@ -1,6 +1,8 @@
 //! What the plugin shows, kept free of Zellij so it is tested natively:
 //! the grouped agent list and the attention cycle.
 
+use std::collections::BTreeMap;
+
 use crate::{Agent, AgentState, Machine, MachineStatus, StateV1};
 
 /// Label for agents running outside Zellij.
@@ -219,6 +221,65 @@ pub fn with_agent_tabs(state: &StateV1, mut layouts: Vec<SessionLayout>) -> Vec<
     layouts.retain(|l| !built.iter().any(|b| b.name == l.name));
     layouts.extend(built);
     layouts
+}
+
+/// The last component of a path: `proj` for `/w/proj/`.
+pub fn basename(path: &str) -> &str {
+    path.trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or(path)
+}
+
+/// Zellij's name for a tab nobody named: `Tab #<n>`.
+pub fn is_default_tab_name(name: &str) -> bool {
+    name.strip_prefix("Tab #")
+        .is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// Tabs of `layout` (the current session) to rename after their agent's
+/// directory, as `(position, name)`: a tab still named `Tab #<n>`, or
+/// named what `given` (by position) says this instance last named it,
+/// that holds a running local agent with a cwd, takes the basename of the
+/// first such agent's cwd in pane order. A tab the user renamed is left
+/// alone, and so is one whose rename is already on its way.
+pub fn tab_renames(
+    state: &StateV1,
+    layout: &SessionLayout,
+    given: &BTreeMap<usize, String>,
+) -> Vec<(usize, String)> {
+    let mut agents: Vec<&Agent> = state
+        .machines
+        .iter()
+        .filter(|m| is_local(m))
+        .flat_map(|m| &m.agents)
+        .filter(|a| a.state != AgentState::Done && a.cwd.is_some())
+        .filter(|a| a.pane.as_ref().is_some_and(|p| p.session == layout.name))
+        .collect();
+    agents.sort_by_key(|a| a.pane.as_ref().map(|p| p.pane_id));
+    let mut out = Vec::new();
+    for tab in &layout.tabs {
+        let ours = given.get(&tab.position);
+        if !is_default_tab_name(&tab.name) && ours != Some(&tab.name) {
+            continue;
+        }
+        let first = agents.iter().find(|a| {
+            a.pane
+                .as_ref()
+                .is_some_and(|p| tab.panes.contains(&p.pane_id))
+        });
+        let Some(name) = first
+            .and_then(|a| a.cwd.as_deref())
+            .map(basename)
+            .filter(|n| !n.is_empty())
+        else {
+            continue;
+        };
+        if name != tab.name && ours.map(String::as_str) != Some(name) {
+            out.push((tab.position, name.to_string()));
+        }
+    }
+    out
 }
 
 /// Agents the plugin can jump to: local, inside Zellij, blocked or idle.
@@ -449,6 +510,50 @@ mod tests {
                 "A 5"
             ]
         );
+    }
+
+    #[test]
+    fn default_tab_names() {
+        assert!(is_default_tab_name("Tab #1"));
+        assert!(is_default_tab_name("Tab #12"));
+        assert!(!is_default_tab_name("Tab #"));
+        assert!(!is_default_tab_name("Tab #2 api"));
+        assert!(!is_default_tab_name("api"));
+    }
+
+    #[test]
+    fn tabs_take_their_first_agents_directory() {
+        let mut st = state();
+        for a in &mut st.machines[1].agents {
+            a.cwd = Some(format!("/w/proj{}/", a.pid));
+        }
+        // The first agent in pane order (pid 1) has exited.
+        st.machines[1].agents[0].state = AgentState::Done;
+        let layout = SessionLayout {
+            name: "a".into(),
+            tabs: vec![
+                tab(0, "Tab #1", &[3, 1]),
+                tab(1, "mine", &[1]),
+                tab(2, "Tab #3", &[8]),
+                tab(3, "proj3", &[3]),
+                tab(4, "old", &[3]),
+                tab(5, "Tab #6", &[3]),
+            ],
+        };
+        let given = BTreeMap::from([(4, "old".to_string()), (5, "proj3".to_string())]);
+        assert_eq!(
+            tab_renames(&st, &layout, &given),
+            // 0: default name; 4: the name this instance gave it. Not 1
+            // (renamed by the user), 2 (no agent), 3 (already right) or 5
+            // (its rename is on the way).
+            [(0, "proj3".to_string()), (4, "proj3".to_string())]
+        );
+        // Agents of other sessions do not count.
+        let other = SessionLayout {
+            name: "b".into(),
+            ..layout.clone()
+        };
+        assert!(tab_renames(&st, &other, &BTreeMap::new()).is_empty());
     }
 
     #[test]

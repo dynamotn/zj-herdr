@@ -67,6 +67,12 @@ struct Plugin {
     /// A key was pressed since the picker was last shown: the user is
     /// using it, so commands from pipes leave it open.
     in_use: bool,
+    /// This instance's plugin id, to find its own pane in `PaneUpdate`.
+    plugin_id: u32,
+    /// Name tabs of this session after their agent's directory.
+    rename_tabs: bool,
+    /// The name this instance last gave each tab, by tab id.
+    given_names: BTreeMap<usize, String>,
 }
 
 register_plugin!(Plugin);
@@ -87,6 +93,8 @@ impl ZellijPlugin for Plugin {
             .cloned()
             .unwrap_or_else(|| "zj-herdr".into());
         self.start_daemon = config.get("start_daemon").is_some_and(|v| v == "true");
+        self.rename_tabs = config.get("rename_tabs").is_none_or(|v| v != "false");
+        self.plugin_id = get_plugin_ids().plugin_id;
         request_permission(&[
             PermissionType::ReadApplicationState,
             PermissionType::ChangeApplicationState,
@@ -118,10 +126,12 @@ impl ZellijPlugin for Plugin {
             Event::PaneUpdate(manifest) => {
                 self.panes = Some(manifest);
                 self.sync_selectable();
+                self.name_tabs_after_agents();
                 self.visible
             }
             Event::TabUpdate(tabs) => {
                 self.tabs = tabs;
+                self.name_tabs_after_agents();
                 self.visible
             }
             Event::SessionUpdate(sessions, _) => {
@@ -148,6 +158,7 @@ impl ZellijPlugin for Plugin {
             Event::PermissionRequestResult(PermissionStatus::Granted) => {
                 self.permitted = true;
                 self.sync_selectable();
+                self.name_tabs_after_agents();
                 if self.start_daemon {
                     // Detached, so it outlives Zellij and is never a zombie of
                     // its server; a second daemon exits at once (socket in use).
@@ -275,6 +286,7 @@ impl Plugin {
     fn set_state(&mut self, state: StateV1) {
         self.state = Some(state);
         self.error = None;
+        self.name_tabs_after_agents();
         let ids = self.selectable_ids();
         if self.selected.as_ref().is_none_or(|s| !ids.contains(s)) {
             self.selected = ids.first().cloned();
@@ -414,17 +426,42 @@ impl Plugin {
         if !self.pinned {
             return;
         }
-        let own = get_plugin_ids().plugin_id;
         let tab_has_terminal = self.panes.as_ref().is_some_and(|m| {
-            m.panes
-                .values()
-                .find(|ps| ps.iter().any(|p| p.is_plugin && p.id == own))
+            own_tab(m, self.plugin_id)
+                .and_then(|tab| m.panes.get(&tab))
                 .is_some_and(|ps| ps.iter().any(|p| !p.is_plugin))
         });
         let want = !((self.permitted || self.denied) && tab_has_terminal);
         if self.selectable != Some(want) {
             self.selectable = Some(want);
             set_selectable(want);
+        }
+    }
+
+    /// Whether the tab holding this instance is the active one; `None`
+    /// until Zellij has said where the instance is.
+    fn own_tab_active(&self) -> Option<bool> {
+        let tab = own_tab(self.panes.as_ref()?, self.plugin_id)?;
+        Some(self.tabs.iter().any(|t| t.position == tab && t.active))
+    }
+
+    /// Name this session's tabs after their agents' directories. There is
+    /// one rail per tab, so only the instance in the active tab does it.
+    fn name_tabs_after_agents(&mut self) {
+        if !self.rename_tabs || !self.permitted || self.own_tab_active() != Some(true) {
+            return;
+        }
+        let (Some(state), Some(session)) = (&self.state, &self.session) else {
+            return;
+        };
+        let layout = layout(session, &self.tabs, self.panes.as_ref());
+        let given = given_by_position(&self.tabs, &self.given_names);
+        for (position, name) in view::tab_renames(state, &layout, &given) {
+            let Some(tab) = self.tabs.iter().find(|t| t.position == position) else {
+                continue;
+            };
+            rename_tab_with_id(tab.tab_id as u64, &name);
+            self.given_names.insert(tab.tab_id, name);
         }
     }
 
@@ -544,6 +581,22 @@ impl Plugin {
     }
 }
 
+/// Position of the tab that holds plugin pane `plugin_id`.
+fn own_tab(manifest: &PaneManifest, plugin_id: u32) -> Option<usize> {
+    manifest
+        .panes
+        .iter()
+        .find(|(_, ps)| ps.iter().any(|p| p.is_plugin && p.id == plugin_id))
+        .map(|(tab, _)| *tab)
+}
+
+/// Names given by tab id, re-keyed by the tabs' current positions.
+fn given_by_position(tabs: &[TabInfo], given: &BTreeMap<usize, String>) -> BTreeMap<usize, String> {
+    tabs.iter()
+        .filter_map(|t| Some((t.position, given.get(&t.tab_id)?.clone())))
+        .collect()
+}
+
 /// A [`SessionLayout`] from Zellij's tabs and panes, keyed by tab position.
 fn layout(name: &str, tabs: &[TabInfo], panes: Option<&PaneManifest>) -> SessionLayout {
     let tabs = tabs
@@ -561,5 +614,62 @@ fn layout(name: &str, tabs: &[TabInfo], panes: Option<&PaneManifest>) -> Session
     SessionLayout {
         name: name.to_string(),
         tabs,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pane(id: u32, is_plugin: bool) -> PaneInfo {
+        PaneInfo {
+            id,
+            is_plugin,
+            ..PaneInfo::default()
+        }
+    }
+
+    fn tab(position: usize, tab_id: usize) -> TabInfo {
+        TabInfo {
+            position,
+            tab_id,
+            ..TabInfo::default()
+        }
+    }
+
+    #[test]
+    fn finds_its_own_tab_by_plugin_id() {
+        let manifest = PaneManifest {
+            panes: [
+                (0, vec![pane(7, false), pane(1, true)]),
+                (1, vec![pane(2, true), pane(7, true)]),
+            ]
+            .into(),
+        };
+        // Terminal 7 and plugin 7 are different panes.
+        assert_eq!(own_tab(&manifest, 7), Some(1));
+        assert_eq!(own_tab(&manifest, 1), Some(0));
+        assert_eq!(own_tab(&manifest, 9), None);
+    }
+
+    #[test]
+    fn given_names_follow_their_tab_when_tabs_move() {
+        let given = BTreeMap::from([(10, "api".to_string()), (11, "web".to_string())]);
+        // Tab 10 was closed; tab 11 moved from position 1 to 0.
+        let tabs = [tab(0, 11), tab(1, 12)];
+        assert_eq!(
+            given_by_position(&tabs, &given),
+            BTreeMap::from([(0, "web".to_string())])
+        );
+    }
+
+    #[test]
+    fn layouts_list_terminal_panes_by_tab() {
+        let manifest = PaneManifest {
+            panes: [(0, vec![pane(3, false), pane(1, true)])].into(),
+        };
+        let l = layout("dev", &[tab(0, 5), tab(1, 6)], Some(&manifest));
+        assert_eq!(l.tabs[0].panes, [3]);
+        assert!(l.tabs[1].panes.is_empty());
     }
 }

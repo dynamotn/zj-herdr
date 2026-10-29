@@ -26,13 +26,6 @@ fn truncate(text: &str, cols: usize) -> String {
     out
 }
 
-fn basename(path: &str) -> &str {
-    path.trim_end_matches('/')
-        .rsplit('/')
-        .next()
-        .unwrap_or(path)
-}
-
 /// What a click on a rendered line does.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Target {
@@ -57,7 +50,7 @@ fn agent_text(agent: &Agent, branch: &str, local: bool, ssh: Option<&str>, now: 
         (_, false) => format!("ssh:{}", ssh.unwrap_or(&agent.machine)),
         (None, true) => format!("pid {}", agent.pid),
     };
-    let cwd = agent.cwd.as_deref().map(basename).unwrap_or("-");
+    let cwd = agent.cwd.as_deref().map(view::basename).unwrap_or("-");
     format!(
         "{branch}{} {:<8} {:<7} {:<6} {} {}",
         agent.state.glyph(),

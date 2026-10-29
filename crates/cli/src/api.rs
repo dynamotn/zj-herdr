@@ -138,7 +138,8 @@ pub enum Event {
         state: StateV1,
     },
     Change {
-        agent: Agent,
+        // Boxed: an agent is far larger than the other variants.
+        agent: Box<Agent>,
         /// `None` when the agent just appeared.
         from: Option<AgentState>,
     },

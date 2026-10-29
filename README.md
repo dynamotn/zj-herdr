@@ -55,6 +55,12 @@ Transcripts read:
   process cwd (`$CODEX_HOME` is honoured; `codex resume <id>` picks that one).
 - Other agents: CPU only, so they show `working` or `idle`, never `blocked`.
 
+For Claude Code the session's token use is sent as `tokens` (`input`,
+`output`, `cache_read`, `cache_write`): the sums of `message.usage` over the
+transcript's `assistant` entries. Each line is parsed once, as it is
+appended; a transcript that is replaced or shrinks is summed again from the
+start. Codex and the other agents report no tokens yet.
+
 Only the shape of each entry is read, never message text, with one
 exception: for a `blocked` agent, the name of the tool call it waits on and,
 for a shell tool (Claude `Bash`, Codex `shell`/`exec_command`), its command.
@@ -94,8 +100,11 @@ CLI, and the daemon serves only connections from its own uid.
 [`docs/zellij.kdl`](docs/zellij.kdl) has the plugin alias and keybinds:
 
 - `Alt a` opens the floating picker: one row per agent across all sessions
-  and machines, grouped by machine then session, blocked first, with a state
-  glyph and the time in that state. `j`/`k` or arrows move, `Enter` jumps to
+  and machines, grouped by machine then session, blocked first, with a
+  coloured state glyph, the agent kind, the time in that state, the session's
+  token total (`812`, `97k`, `4.8M`; `-` when unknown), the pane and the
+  directory, for example `! claude 1m  4.8M #12 zj-herdr`. `j`/`k` or
+  arrows move, `Enter` jumps to
   the pane (switching session if needed), `n`/`p` cycle attention, `Esc`
   hides it. Remote rows show their SSH target and do not jump.
   On this machine, the agents of each Zellij session sit under the tab that

@@ -1,7 +1,7 @@
 //! Text rendering for the picker, independent of the Zellij host.
 
 use zj_herdr_core::view::{self, Row};
-use zj_herdr_core::{fmt_elapsed, Agent, AgentState, MachineStatus, StateV1};
+use zj_herdr_core::{fmt_elapsed, fmt_tokens, Agent, AgentState, MachineStatus, StateV1};
 
 const RESET: &str = "\x1b[0m";
 const BOLD: &str = "\x1b[1m";
@@ -56,12 +56,15 @@ fn agent_text(agent: &Agent, branch: &str, local: bool, ssh: Option<&str>, now: 
         (None, true) => format!("pid {}", agent.pid),
     };
     let cwd = agent.cwd.as_deref().map(view::basename).unwrap_or("-");
+    let tokens = agent.tokens.map(|t| fmt_tokens(t.total()));
+    // The coloured glyph carries the state, leaving room in a 32-column
+    // rail for the token total and some of the cwd.
     format!(
-        "{branch}{} {:<8} {:<7} {:<6} {} {}",
+        "{branch}{} {:<6} {:<3} {:>4} {} {}",
         agent.state.glyph(),
-        agent.state.as_str(),
         agent.kind,
         fmt_elapsed(now.saturating_sub(agent.since)),
+        tokens.as_deref().unwrap_or("-"),
         place,
         cwd
     )
@@ -273,7 +276,7 @@ pub fn render(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zj_herdr_core::{Machine, Pane};
+    use zj_herdr_core::{Machine, Pane, Tokens};
 
     fn state(n: u32) -> StateV1 {
         let agents = (1..=n)
@@ -293,6 +296,11 @@ mod tests {
                 session_id: None,
                 waiting: None,
                 started: 0,
+                tokens: (pid == 1).then_some(Tokens {
+                    input: 4_800_000,
+                    output: 70_000,
+                    ..Tokens::default()
+                }),
             })
             .collect();
         let remote = Machine {
@@ -405,7 +413,7 @@ mod tests {
         };
         let (lines, targets) = render(frame, &tree, (6, 80));
         let lines = plain(&lines);
-        assert_eq!(lines[3], "    ! blocked  claude  1m     #1 proj1");
+        assert_eq!(lines[3], "    ! claude 1m  4.8M #1 proj1");
         assert_eq!(lines[5], "    ● click again to move here");
         assert_eq!(targets[5], Some(Target::Agent("box/2".into())));
     }
@@ -417,7 +425,7 @@ mod tests {
         assert_eq!(lines[0], "zj-herdr  1 blocked  0 idle  1 working");
         assert_eq!(lines[1], "box");
         assert_eq!(lines[2], "  dev");
-        assert_eq!(lines[3], "    ! blocked  claude  1m     #1 proj1");
+        assert_eq!(lines[3], "    ! claude 1m  4.8M #1 proj1");
         assert_eq!(lines[5], "far (unreachable: timeout)");
     }
 
@@ -484,8 +492,8 @@ mod tests {
         let lines = plain(&lines);
         assert_eq!(lines[2], "  dev");
         assert_eq!(lines[3], "  ▌! 1 code");
-        assert_eq!(lines[4], "  ├ ! blocked  claude  1m     #1 proj1");
-        assert_eq!(lines[5], "  └ ● working  claude  1m     #2 proj2");
+        assert_eq!(lines[4], "  ├ ! claude 1m  4.8M #1 proj1");
+        assert_eq!(lines[5], "  └ ● claude 1m     - #2 proj2");
         assert_eq!(lines[6], "   ● 2 notes");
         assert_eq!(lines[8], "   +2 tabs", "tabs without agents fold");
         assert_eq!(targets[8], None);
@@ -523,11 +531,11 @@ mod tests {
         let tree = view::tree(&st, Some("dev"), &layouts);
         let (lines, targets) = render(dev_frame(&st), &tree, (20, 80));
         let lines = plain(&lines);
-        assert_eq!(lines[4], "  ├ ! blocked  claude  1m     #1 proj1");
+        assert_eq!(lines[4], "  ├ ! claude 1m  4.8M #1 proj1");
         assert_eq!(lines[5], "  │ ↳ Bash: make 1");
-        assert_eq!(lines[6], "  ├ ! blocked  claude  1m     #2 proj2");
+        assert_eq!(lines[6], "  ├ ! claude 1m     - #2 proj2");
         assert_eq!(lines[7], "  │ ↳ Bash: make 2");
-        assert_eq!(lines[8], "  └ ● working  claude  1m     #3 proj3");
+        assert_eq!(lines[8], "  └ ● claude 1m     - #3 proj3");
         assert_eq!(lines[9], "far (unreachable: timeout)");
         assert_eq!(targets[5], Some(Target::Agent("box/1".into())));
         assert_eq!(selectable(&tree), ["box/1", "box/2", "box/3"]);
@@ -555,6 +563,26 @@ mod tests {
         for line in draw(&st, None, Some("a very long error message"), 0, (10, 12)) {
             assert!(line.chars().count() <= 12, "{line:?}");
         }
+    }
+
+    #[test]
+    fn agent_rows_fit_the_rail_with_tokens_and_cwd() {
+        let mut st = state(1);
+        st.machines[0].agents[0].pane = Some(Pane::new("dev", 12));
+        st.machines[0].agents[0].cwd = Some("/w/zj-herdr".into());
+        let layouts = vec![view::SessionLayout {
+            name: "dev".into(),
+            tabs: vec![view::TabLayout {
+                position: 0,
+                name: "code".into(),
+                active: true,
+                panes: vec![12],
+            }],
+        }];
+        let tree = view::tree(&st, Some("dev"), &layouts);
+        let lines = plain(&render(dev_frame(&st), &tree, (20, 32)).0);
+        assert_eq!(lines[4], "  └ ! claude 1m  4.8M #12 zj-he…");
+        assert_eq!(lines[4].chars().count(), 32);
     }
 
     #[test]

@@ -254,6 +254,7 @@ mod tests {
             session_id: Some("abc".into()),
             waiting: None,
             started: 1000,
+            tokens: None,
         }
     }
 

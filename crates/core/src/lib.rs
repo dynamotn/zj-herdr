@@ -149,10 +149,33 @@ pub struct Agent {
     /// the agent apart from a later process that reuses its pid.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub started: u64,
+    /// Tokens used by the session so far, from its transcript; `None` when
+    /// the agent's transcript is not read or records no usage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens: Option<Tokens>,
 }
 
 fn is_zero(n: &u64) -> bool {
     *n == 0
+}
+
+/// Token counts summed over a session's replies.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Tokens {
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+}
+
+impl Tokens {
+    pub fn total(&self) -> u64 {
+        self.input
+            .saturating_add(self.output)
+            .saturating_add(self.cache_read)
+            .saturating_add(self.cache_write)
+    }
 }
 
 /// Longest [`Agent::waiting`] text.
@@ -307,9 +330,51 @@ pub fn fmt_elapsed(secs: u64) -> String {
     }
 }
 
+/// Compact token count, at most four characters below 1000G: `812`,
+/// `4.8k`, `97k`, `4.8M`, `12G`. Rounds down, so `9999` is `9.9k`.
+pub fn fmt_tokens(n: u64) -> String {
+    for (size, unit) in [(1_000_000_000, "G"), (1_000_000, "M"), (1_000, "k")] {
+        if n >= size {
+            let whole = n / size;
+            return if whole < 10 {
+                format!("{whole}.{}{unit}", n % size * 10 / size)
+            } else {
+                format!("{whole}{unit}")
+            };
+        }
+    }
+    n.to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tokens_are_compact() {
+        assert_eq!(fmt_tokens(0), "0");
+        assert_eq!(fmt_tokens(812), "812");
+        assert_eq!(fmt_tokens(999), "999");
+        assert_eq!(fmt_tokens(1_000), "1.0k");
+        assert_eq!(fmt_tokens(9_999), "9.9k");
+        assert_eq!(fmt_tokens(97_400), "97k");
+        assert_eq!(fmt_tokens(999_999), "999k");
+        assert_eq!(fmt_tokens(4_870_000), "4.8M");
+        assert_eq!(fmt_tokens(48_000_000), "48M");
+        assert_eq!(fmt_tokens(12_300_000_000), "12G");
+        assert_eq!(fmt_tokens(u64::MAX), "18446744073G");
+    }
+
+    #[test]
+    fn token_total_adds_every_kind() {
+        let t = Tokens {
+            input: 1,
+            output: 2,
+            cache_read: 3,
+            cache_write: 4,
+        };
+        assert_eq!(t.total(), 10);
+    }
 
     #[test]
     fn elapsed_is_compact() {
@@ -348,6 +413,12 @@ mod tests {
                         session_id: Some("abc".into()),
                         waiting: None,
                         started: 0,
+                        tokens: Some(Tokens {
+                            input: 1,
+                            output: 2,
+                            cache_read: 3,
+                            cache_write: 4,
+                        }),
                     }],
                 },
                 Machine {
@@ -368,6 +439,7 @@ mod tests {
         assert!(json.contains("\"schema\":\"zj_herdr.state.v1\""));
         assert!(json.contains("\"state\":\"blocked\""));
         assert!(json.contains("\"status\":\"unreachable\""));
+        assert!(json.contains("\"tokens\":{\"input\":1,"), "{json}");
         assert_eq!(StateV1::from_json(&json).unwrap(), state);
     }
 
@@ -387,7 +459,9 @@ mod tests {
         let state = StateV1::from_json(json).unwrap();
         let agent = state.agents().next().unwrap();
         assert_eq!(agent.pane, None);
+        assert_eq!(agent.tokens, None);
         assert_eq!(state.machines[0].status, MachineStatus::Ok);
+        assert!(!state.to_json().contains("\"tokens\""));
     }
 
     #[test]

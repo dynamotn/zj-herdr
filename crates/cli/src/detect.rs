@@ -5,10 +5,10 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use zj_herdr_core::AgentState;
+use zj_herdr_core::{AgentState, Tokens};
 
 use crate::procs::ProcInfo;
-use crate::transcript::{self, FileTimes, LastTurn, Transcript};
+use crate::transcript::{self, FileTimes, LastTurn, Transcript, UsageCursor};
 
 /// A TUI redrawing a spinner or streaming a reply stays above this share of
 /// one core; one sitting at a prompt stays below it.
@@ -31,6 +31,8 @@ pub struct AgentStatus {
     pub last_activity: Option<u64>,
     /// For a `blocked` agent, the pending call it waits on.
     pub waiting: Option<String>,
+    /// Token totals of the session, where the transcript records them.
+    pub tokens: Option<Tokens>,
 }
 
 pub trait Detector: Send + Sync {
@@ -72,6 +74,7 @@ pub fn signals_only(proc: &ProcInfo) -> AgentStatus {
         session_id: None,
         last_activity: None,
         waiting: None,
+        tokens: None,
     }
 }
 
@@ -82,6 +85,7 @@ fn status(proc: &ProcInfo, transcript: Transcript) -> AgentStatus {
         last_activity: Some(transcript.modified),
         session_id: Some(transcript.session_id),
         waiting: transcript.pending.filter(|_| state == AgentState::Blocked),
+        tokens: None,
     }
 }
 
@@ -199,6 +203,8 @@ pub struct ClaudeDetector {
     /// Transcript per pid from the last [`Detector::prepare`]; `None` means
     /// the process was considered and given none.
     assigned: Mutex<HashMap<u32, Option<Assigned>>>,
+    /// Token totals read so far, per transcript in use.
+    usage: Mutex<HashMap<PathBuf, UsageCursor>>,
 }
 
 impl ClaudeDetector {
@@ -207,7 +213,17 @@ impl ClaudeDetector {
             projects,
             sessions: None,
             assigned: Mutex::new(HashMap::new()),
+            usage: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Token totals of the transcript at `path`, reading only what was
+    /// appended since the last scan.
+    fn tokens(&self, path: &Path) -> Option<Tokens> {
+        let mut usage = self.usage.lock().unwrap_or_else(|e| e.into_inner());
+        let cursor = usage.entry(path.to_path_buf()).or_default();
+        transcript::claude_usage(path, cursor).ok()?;
+        Some(cursor.tokens).filter(|t| t.total() > 0)
     }
 
     /// The transcript named by the process's session file, if any.
@@ -292,13 +308,20 @@ impl Detector for ClaudeDetector {
 
     fn prepare(&self, procs: &[&ProcInfo]) {
         let fresh = self.assign(procs);
+        self.usage
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|path, _| fresh.values().flatten().any(|(p, _)| p == path));
         *self.assigned.lock().unwrap_or_else(|e| e.into_inner()) = fresh;
     }
 
     fn detect(&self, proc: &ProcInfo) -> Option<AgentStatus> {
         let (path, from_session_file) = self.transcript_path(proc)?;
         match transcript::read_claude(&path) {
-            Some(transcript) => Some(status(proc, transcript)),
+            Some(transcript) => Some(AgentStatus {
+                tokens: self.tokens(&path),
+                ..status(proc, transcript)
+            }),
             // Named by Claude itself, so the id holds before the first write.
             None if from_session_file => Some(AgentStatus {
                 session_id: path.file_stem().map(|s| s.to_string_lossy().into_owned()),

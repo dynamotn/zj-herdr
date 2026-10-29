@@ -144,6 +144,7 @@ mod tests {
                     session_id: Some("r1".into()),
                     waiting: None,
                     started: 0,
+                    tokens: None,
                 }],
             }],
         );

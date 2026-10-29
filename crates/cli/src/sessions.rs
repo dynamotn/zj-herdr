@@ -246,6 +246,7 @@ mod tests {
             session_id: sid.map(str::to_owned),
             waiting: None,
             started: 0,
+            tokens: None,
         }
     }
 

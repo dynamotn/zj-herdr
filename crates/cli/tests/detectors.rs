@@ -398,6 +398,41 @@ fn codex_started_after_its_cwds_rollouts_inherits_none() {
     assert!(detector.detect(&p).is_none());
 }
 
+#[test]
+fn scanner_reports_claude_token_totals_as_they_grow() {
+    let tmp = tempfile::tempdir().unwrap();
+    install_claude(tmp.path(), "/work/proj", "turn-ended", "s1", T0 - 1);
+    let path = tmp
+        .path()
+        .join(claude_slug(Path::new("/work/proj")))
+        .join("s1.jsonl");
+    let reply = r#"{"type":"assistant","message":{"usage":{"input_tokens":3,"output_tokens":4,"cache_read_input_tokens":1000,"cache_creation_input_tokens":20}}}"#;
+    let mut scanner = Scanner::with_detectors(
+        "box".into(),
+        vec![Box::new(ClaudeDetector::new(tmp.path().to_path_buf()))],
+    );
+    let mut agent = raw(101, 1, &["claude"], 0.0);
+    agent.cwd = Some("/work/proj".into());
+
+    // The fixture records no usage.
+    let scan = scanner.scan_from(std::slice::from_ref(&agent), T0 + 30);
+    assert_eq!(scan.agents[0].tokens, None);
+
+    for _ in 0..2 {
+        let mut text = fs::read_to_string(&path).unwrap();
+        text.push_str(reply);
+        text.push('\n');
+        fs::write(&path, text).unwrap();
+        set_mtime(&path, T0 - 1);
+    }
+    let scan = scanner.scan_from(std::slice::from_ref(&agent), T0 + 31);
+    let tokens = scan.agents[0].tokens.unwrap();
+    assert_eq!(
+        (tokens.input, tokens.cache_read, tokens.total()),
+        (6, 2000, 2054)
+    );
+}
+
 /// Write Claude's `<sessions>/<pid>.json`, with a field zj-herdr must ignore.
 fn write_session_file(sessions: &Path, pid: u32, id: &str, cwd: &str, started_at_secs: u64) {
     fs::create_dir_all(sessions).unwrap();

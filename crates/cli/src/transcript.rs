@@ -1,7 +1,8 @@
 //! Readers for the transcripts agents already write. Only the tail of a file
-//! is read, and only the shape of each entry matters, never message text:
-//! the one exception is the name of a pending tool call and, for a shell
-//! tool, its command (see [`describe_call`]).
+//! is read for state (token totals read each line once, as it is appended),
+//! and only the shape of each entry matters, never message text: the one
+//! exception is the name of a pending tool call and, for a shell tool, its
+//! command (see [`describe_call`]).
 
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
@@ -10,7 +11,7 @@ use std::time::UNIX_EPOCH;
 
 use serde::Deserialize;
 use serde_json::Value;
-use zj_herdr_core::WAITING_MAX_CHARS;
+use zj_herdr_core::{Tokens, WAITING_MAX_CHARS};
 
 /// Enough of a transcript tail to see where the last turn stands.
 const TAIL_BYTES: u64 = 256 * 1024;
@@ -306,6 +307,84 @@ pub fn read_claude(path: &Path) -> Option<Transcript> {
         last: turn.last,
         pending: turn.pending,
     })
+}
+
+/// The usage counts of one transcript line; every other field (message
+/// text included) is skipped by the parser.
+#[derive(Deserialize)]
+struct UsageLine {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    message: Option<UsageMessage>,
+}
+
+#[derive(Deserialize)]
+struct UsageMessage {
+    usage: Option<Usage>,
+}
+
+#[derive(Deserialize)]
+struct Usage {
+    #[serde(default)]
+    input_tokens: u64,
+    #[serde(default)]
+    output_tokens: u64,
+    #[serde(default)]
+    cache_read_input_tokens: u64,
+    #[serde(default)]
+    cache_creation_input_tokens: u64,
+}
+
+/// How far a transcript's token totals have been read.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UsageCursor {
+    /// `(dev, inode)` of the file read so far.
+    identity: Option<(u64, u64)>,
+    /// Bytes read, always at the end of a complete line.
+    offset: u64,
+    pub tokens: Tokens,
+}
+
+/// Bring `cursor` up to date with the end of the Claude transcript at
+/// `path`, summing `message.usage` over the `assistant` lines appended since
+/// the last call. A trailing line without its newline is left for the next
+/// call; a replaced or truncated file is read again from the start.
+pub fn claude_usage(path: &Path, cursor: &mut UsageCursor) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let file = File::open(path)?;
+    let meta = file.metadata()?;
+    let identity = Some((meta.dev(), meta.ino()));
+    if cursor.identity != identity || meta.len() < cursor.offset {
+        *cursor = UsageCursor {
+            identity,
+            ..UsageCursor::default()
+        };
+    }
+    let mut reader = BufReader::new(file);
+    reader.seek(SeekFrom::Start(cursor.offset))?;
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        let n = reader.read_until(b'\n', &mut line)?;
+        if n == 0 || line.last() != Some(&b'\n') {
+            return Ok(());
+        }
+        cursor.offset += n as u64;
+        let Ok(UsageLine {
+            kind: Some(kind),
+            message: Some(UsageMessage { usage: Some(u) }),
+        }) = serde_json::from_slice(&line)
+        else {
+            continue;
+        };
+        if kind == "assistant" {
+            let t = &mut cursor.tokens;
+            t.input = t.input.saturating_add(u.input_tokens);
+            t.output = t.output.saturating_add(u.output_tokens);
+            t.cache_read = t.cache_read.saturating_add(u.cache_read_input_tokens);
+            t.cache_write = t.cache_write.saturating_add(u.cache_creation_input_tokens);
+        }
+    }
 }
 
 fn content_items(entry: &Value) -> &[Value] {
@@ -606,6 +685,83 @@ mod tests {
             json!({"type":"file-history-snapshot"}),
         ];
         assert_eq!(claude_last_turn(entries.into_iter()), LastTurn::TurnEnded);
+    }
+
+    fn append(path: &Path, text: &str) {
+        use std::io::Write;
+        let mut f = File::options()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap();
+        f.write_all(text.as_bytes()).unwrap();
+    }
+
+    const REPLY: &str = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":100,"cache_creation_input_tokens":7}}}"#;
+
+    fn tokens(input: u64, output: u64, cache_read: u64, cache_write: u64) -> Tokens {
+        Tokens {
+            input,
+            output,
+            cache_read,
+            cache_write,
+        }
+    }
+
+    #[test]
+    fn claude_usage_sums_replies_incrementally() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("s.jsonl");
+        append(&path, &format!("{REPLY}\n"));
+        // Only assistant lines count; missing counts are zero.
+        append(
+            &path,
+            r#"{"type":"user","message":{"content":"x","usage":{"input_tokens":999}}}
+{"type":"assistant","message":{"usage":{"output_tokens":1}}}
+{"type":"summary","summary":"x"}
+"#,
+        );
+        let mut cursor = UsageCursor::default();
+        claude_usage(&path, &mut cursor).unwrap();
+        assert_eq!(cursor.tokens, tokens(10, 6, 100, 7));
+        let offset = cursor.offset;
+
+        // A line still being written waits for its newline.
+        let (head, tail) = REPLY.split_at(40);
+        append(&path, head);
+        claude_usage(&path, &mut cursor).unwrap();
+        assert_eq!(
+            (cursor.tokens, cursor.offset),
+            (tokens(10, 6, 100, 7), offset)
+        );
+        append(&path, &format!("{tail}\n"));
+        claude_usage(&path, &mut cursor).unwrap();
+        assert_eq!(cursor.tokens, tokens(20, 11, 200, 14));
+    }
+
+    #[test]
+    fn claude_usage_starts_over_on_a_new_or_shorter_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("s.jsonl");
+        append(&path, &format!("{REPLY}\n{REPLY}\n"));
+        let mut cursor = UsageCursor::default();
+        claude_usage(&path, &mut cursor).unwrap();
+        assert_eq!(cursor.tokens.input, 20);
+
+        // Truncated in place: same inode, fewer bytes.
+        fs::write(&path, format!("{REPLY}\n")).unwrap();
+        claude_usage(&path, &mut cursor).unwrap();
+        assert_eq!(cursor.tokens.input, 10);
+
+        // Replaced by another file of the same length.
+        let other = tmp.path().join("other.jsonl");
+        let reply = REPLY.replace("\"input_tokens\":10", "\"input_tokens\":30");
+        append(&other, &format!("{reply}\n"));
+        let keep = File::open(&path).unwrap(); // the old inode stays in use
+        fs::rename(&other, &path).unwrap();
+        claude_usage(&path, &mut cursor).unwrap();
+        assert_eq!(cursor.tokens.input, 30);
+        drop(keep);
     }
 
     #[test]

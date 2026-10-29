@@ -262,6 +262,7 @@ mod tests {
             session_id: None,
             waiting: None,
             started: 0,
+            tokens: None,
         }
     }
 

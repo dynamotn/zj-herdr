@@ -151,7 +151,7 @@ impl Registry {
         }
         lines.extend(changes.iter().map(|c| {
             api::to_line(&Event::Change {
-                agent: c.agent.clone(),
+                agent: Box::new(c.agent.clone()),
                 from: c.from,
             })
         }));
@@ -304,6 +304,7 @@ mod tests {
             session_id: None,
             waiting: None,
             started: 0,
+            tokens: None,
         }
     }
 

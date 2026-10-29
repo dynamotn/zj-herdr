@@ -41,6 +41,7 @@ pub fn to_agent(machine: &str, detectors: &[Box<dyn Detector>], proc: &ProcInfo)
         session_id: status.session_id,
         waiting: status.waiting,
         started: proc.start_time,
+        tokens: status.tokens,
     }
 }
 

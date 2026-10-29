@@ -189,50 +189,71 @@ pub fn push_targets(attached: &[String], before: &[String], due: bool) -> Vec<St
         .collect()
 }
 
+/// What the pusher remembers between rounds.
+#[derive(Default)]
+struct Pusher {
+    /// The change count last delivered to every attached session.
+    pushed: Option<u64>,
+    last: Option<Instant>,
+    /// Sessions attached at the last round.
+    before: Vec<String>,
+}
+
+impl Pusher {
+    /// One round at `now`: deliver the state where [`push_targets`] says.
+    fn round(
+        &mut self,
+        registry: &Registry,
+        zellij: &dyn Zellij,
+        now: Instant,
+    ) -> Result<(), String> {
+        let count = registry.change_count();
+        let due = self.pushed != Some(count)
+            || self
+                .last
+                .is_none_or(|l| now.duration_since(l) >= PUSH_HEARTBEAT);
+        let sessions = zellij.sessions()?;
+        // An unanswered `list-clients` counts as attached: better a wasted
+        // pipe than a rail left stale.
+        let attached: Vec<String> = sessions
+            .into_iter()
+            .filter(|s| zellij.attached(s).unwrap_or(true))
+            .collect();
+        let targets = push_targets(&attached, &self.before, due);
+        self.before = attached;
+        if due {
+            self.pushed = Some(count);
+            self.last = Some(now);
+        }
+        if targets.is_empty() {
+            return Ok(());
+        }
+        let json = registry.snapshot().to_json();
+        let failed: Vec<String> = targets
+            .iter()
+            .filter_map(|s| {
+                zellij
+                    .pipe(s, STATE_SCHEMA, &json)
+                    .err()
+                    .map(|e| format!("session {s}: {e}"))
+            })
+            .collect();
+        if failed.is_empty() {
+            Ok(())
+        } else {
+            Err(failed.join("; "))
+        }
+    }
+}
+
 /// Deliver `zj_herdr.state.v1` to every attached session on change, and on a
 /// heartbeat. Sessions without the plugin simply ignore the pipe.
 fn push_loop(registry: &Registry, zellij: &dyn Zellij) {
-    let mut pushed: Option<u64> = None;
-    let mut last = Instant::now();
-    let mut before: Vec<String> = Vec::new();
+    let mut pusher = Pusher::default();
     let mut last_error = String::new();
     loop {
         thread::sleep(PUSH_POLL);
-        let count = registry.change_count();
-        let due = pushed != Some(count) || last.elapsed() >= PUSH_HEARTBEAT;
-        let result = zellij.sessions().and_then(|sessions| {
-            // An unanswered `list-clients` counts as attached: better a
-            // wasted pipe than a rail left stale.
-            let attached: Vec<String> = sessions
-                .into_iter()
-                .filter(|s| zellij.attached(s).unwrap_or(true))
-                .collect();
-            let targets = push_targets(&attached, &before, due);
-            before = attached;
-            if due {
-                pushed = Some(count);
-                last = Instant::now();
-            }
-            if targets.is_empty() {
-                return Ok(());
-            }
-            let json = registry.snapshot().to_json();
-            let failed: Vec<String> = targets
-                .iter()
-                .filter_map(|s| {
-                    zellij
-                        .pipe(s, STATE_SCHEMA, &json)
-                        .err()
-                        .map(|e| format!("session {s}: {e}"))
-                })
-                .collect();
-            if failed.is_empty() {
-                Ok(())
-            } else {
-                Err(failed.join("; "))
-            }
-        });
-        match result {
+        match pusher.round(registry, zellij, Instant::now()) {
             Err(e) if e != last_error => {
                 eprintln!("zj-herdr: push: {e}");
                 last_error = e;
@@ -247,7 +268,7 @@ fn push_loop(registry: &Registry, zellij: &dyn Zellij) {
 mod tests {
     use super::*;
     use std::sync::Mutex;
-    use zj_herdr_core::{AgentState, Pane};
+    use zj_herdr_core::{AgentState, Machine, MachineStatus, Pane};
 
     #[test]
     fn pushes_to_attached_sessions_only() {
@@ -258,6 +279,89 @@ mod tests {
         assert_eq!(push_targets(&attached, &v(&["a"]), false), v(&["b"]));
         assert!(push_targets(&attached, &attached, false).is_empty());
         assert!(push_targets(&[], &attached, true).is_empty());
+    }
+
+    /// Sessions `a` (attached), `b` (detached) and `c` (unanswered, and its
+    /// pipe fails); records each pipe.
+    #[derive(Default)]
+    struct PushZellij {
+        down: bool,
+        piped: Mutex<Vec<String>>,
+    }
+
+    impl Zellij for PushZellij {
+        fn sessions(&self) -> Result<Vec<String>, String> {
+            if self.down {
+                return Err("no server".into());
+            }
+            Ok(vec!["a".into(), "b".into(), "c".into()])
+        }
+        fn attached(&self, session: &str) -> Result<bool, String> {
+            match session {
+                "c" => Err("timeout".into()),
+                s => Ok(s == "a"),
+            }
+        }
+        fn pipe(&self, session: &str, name: &str, _: &str) -> Result<(), String> {
+            assert_eq!(name, STATE_SCHEMA);
+            self.piped.lock().unwrap().push(session.to_string());
+            if session == "c" {
+                return Err("gone".into());
+            }
+            Ok(())
+        }
+        fn deliver(&self, _: &str, _: &str, _: &str, _: &str) -> Result<String, String> {
+            Ok(String::new())
+        }
+        fn run(&self, _: &str, _: Option<&str>, _: &[String]) -> Result<(), String> {
+            Ok(())
+        }
+        fn panes(&self, _: &str) -> Result<HashMap<u32, PaneTab>, String> {
+            Ok(HashMap::new())
+        }
+    }
+
+    #[test]
+    fn pusher_delivers_on_change_and_heartbeat_to_attached_sessions() {
+        let registry = Registry::default();
+        let zellij = PushZellij::default();
+        let piped = || std::mem::take(&mut *zellij.piped.lock().unwrap());
+        let mut pusher = Pusher::default();
+        let t0 = Instant::now();
+        // First round: to `a`, and to `c` whose clients are unknown.
+        let err = pusher.round(&registry, &zellij, t0).unwrap_err();
+        assert_eq!(err, "session c: gone");
+        assert_eq!(piped(), ["a", "c"]);
+        // Nothing changed, no heartbeat yet: nothing sent.
+        assert!(pusher.round(&registry, &zellij, t0).is_ok());
+        assert!(piped().is_empty());
+        // The heartbeat sends again.
+        let later = t0 + PUSH_HEARTBEAT;
+        assert!(pusher.round(&registry, &zellij, later).is_err());
+        assert_eq!(piped(), ["a", "c"]);
+        // So does a change.
+        registry.publish(
+            Machine {
+                name: "box".into(),
+                ssh: None,
+                status: MachineStatus::Ok,
+                error: None,
+                agents: vec![agent(1, None)],
+            },
+            0,
+        );
+        assert!(pusher.round(&registry, &zellij, later).is_err());
+        assert_eq!(piped(), ["a", "c"]);
+        // No sessions to ask: the error, and nothing sent.
+        let down = PushZellij {
+            down: true,
+            ..PushZellij::default()
+        };
+        assert_eq!(
+            pusher.round(&registry, &down, later),
+            Err("no server".into())
+        );
+        assert!(down.piped.lock().unwrap().is_empty());
     }
 
     /// Answers `panes` for `dev` only, and counts the questions.

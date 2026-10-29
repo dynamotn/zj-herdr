@@ -186,20 +186,39 @@ pub fn assign_transcripts(claimants: &[Claimant], files: &[FileTimes]) -> HashMa
     out
 }
 
+/// A transcript given to a process, and whether Claude's own session file
+/// named it (then the session id holds even before the file exists).
+type Assigned = (PathBuf, bool);
+
 /// Claude Code: `<projects>/<cwd-slug>/<session-id>.jsonl`.
 pub struct ClaudeDetector {
     pub projects: PathBuf,
+    /// Claude Code's `<config>/sessions`, holding `<pid>.json` per running
+    /// process; when `None`, transcripts are assigned by timestamps only.
+    pub sessions: Option<PathBuf>,
     /// Transcript per pid from the last [`Detector::prepare`]; `None` means
     /// the process was considered and given none.
-    assigned: Mutex<HashMap<u32, Option<PathBuf>>>,
+    assigned: Mutex<HashMap<u32, Option<Assigned>>>,
 }
 
 impl ClaudeDetector {
     pub fn new(projects: PathBuf) -> Self {
         ClaudeDetector {
             projects,
+            sessions: None,
             assigned: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// The transcript named by the process's session file, if any.
+    fn session_file_transcript(&self, proc: &ProcInfo) -> Option<PathBuf> {
+        let (id, cwd) =
+            transcript::claude_session_file(self.sessions.as_deref()?, proc.pid, proc.start_time)?;
+        Some(transcript::claude_session_transcript(
+            &self.projects,
+            &cwd,
+            &id,
+        ))
     }
 
     fn claimant(proc: &ProcInfo, dir: &Path, files: &[FileTimes]) -> Claimant {
@@ -226,29 +245,36 @@ impl ClaudeDetector {
         }
     }
 
-    fn assign(&self, procs: &[&ProcInfo]) -> HashMap<u32, Option<PathBuf>> {
-        let mut out: HashMap<u32, Option<PathBuf>> = procs.iter().map(|p| (p.pid, None)).collect();
+    /// Session files first; [`assign_transcripts`] shares out the rest of
+    /// each cwd's transcripts between the processes that have none.
+    fn assign(&self, procs: &[&ProcInfo]) -> HashMap<u32, Option<Assigned>> {
+        let mut out: HashMap<u32, Option<Assigned>> = procs.iter().map(|p| (p.pid, None)).collect();
+        let mut pinned: Vec<PathBuf> = Vec::new();
         let mut by_dir: HashMap<PathBuf, Vec<&ProcInfo>> = HashMap::new();
         for proc in procs {
-            if let Some(cwd) = proc.cwd.as_deref() {
+            if let Some(path) = self.session_file_transcript(proc) {
+                pinned.push(path.clone());
+                out.insert(proc.pid, Some((path, true)));
+            } else if let Some(cwd) = proc.cwd.as_deref() {
                 let dir = transcript::claude_project_dir(&self.projects, cwd);
                 by_dir.entry(dir).or_default().push(proc);
             }
         }
         for (dir, procs) in by_dir {
-            let files = transcript::files_with_times(&dir, "jsonl");
+            let mut files = transcript::files_with_times(&dir, "jsonl");
+            files.retain(|f| !pinned.contains(&f.path));
             let claimants: Vec<Claimant> = procs
                 .iter()
                 .map(|p| Self::claimant(p, &dir, &files))
                 .collect();
             for (pid, path) in assign_transcripts(&claimants, &files) {
-                out.insert(pid, Some(path));
+                out.insert(pid, Some((path, false)));
             }
         }
         out
     }
 
-    fn transcript_path(&self, proc: &ProcInfo) -> Option<PathBuf> {
+    fn transcript_path(&self, proc: &ProcInfo) -> Option<Assigned> {
         let mut assigned = self.assigned.lock().unwrap_or_else(|e| e.into_inner());
         if !assigned.contains_key(&proc.pid) {
             // Not seen by `prepare` (a one-off call): judge it on its own.
@@ -270,8 +296,16 @@ impl Detector for ClaudeDetector {
     }
 
     fn detect(&self, proc: &ProcInfo) -> Option<AgentStatus> {
-        let transcript = transcript::read_claude(&self.transcript_path(proc)?)?;
-        Some(status(proc, transcript))
+        let (path, from_session_file) = self.transcript_path(proc)?;
+        match transcript::read_claude(&path) {
+            Some(transcript) => Some(status(proc, transcript)),
+            // Named by Claude itself, so the id holds before the first write.
+            None if from_session_file => Some(AgentStatus {
+                session_id: path.file_stem().map(|s| s.to_string_lossy().into_owned()),
+                ..signals_only(proc)
+            }),
+            None => None,
+        }
     }
 }
 
@@ -436,6 +470,8 @@ signal_detector! {
 #[derive(Debug, Clone, Default)]
 pub struct Roots {
     pub claude_projects: Option<PathBuf>,
+    /// Claude Code's per-process `<pid>.json` files, beside `projects`.
+    pub claude_sessions: Option<PathBuf>,
     pub codex_sessions: Option<PathBuf>,
 }
 
@@ -448,8 +484,10 @@ impl Roots {
                 .map(PathBuf::from)
                 .or_else(|| home.as_ref().map(|h| h.join(default)))
         };
+        let claude = dir("CLAUDE_CONFIG_DIR", ".claude");
         Roots {
-            claude_projects: dir("CLAUDE_CONFIG_DIR", ".claude").map(|d| d.join("projects")),
+            claude_projects: claude.as_ref().map(|d| d.join("projects")),
+            claude_sessions: claude.map(|d| d.join("sessions")),
             codex_sessions: dir("CODEX_HOME", ".codex").map(|d| d.join("sessions")),
         }
     }
@@ -459,7 +497,9 @@ impl Roots {
     pub fn detectors(&self) -> Vec<Box<dyn Detector>> {
         let mut out: Vec<Box<dyn Detector>> = Vec::new();
         if let Some(p) = &self.claude_projects {
-            out.push(Box::new(ClaudeDetector::new(p.clone())));
+            let mut claude = ClaudeDetector::new(p.clone());
+            claude.sessions = self.claude_sessions.clone();
+            out.push(Box::new(claude));
         }
         if let Some(s) = &self.codex_sessions {
             out.push(Box::new(CodexDetector::new(s.clone())));
@@ -520,6 +560,7 @@ mod tests {
     fn every_family_has_exactly_one_detector() {
         let roots = Roots {
             claude_projects: Some("/p".into()),
+            claude_sessions: Some("/c".into()),
             codex_sessions: Some("/s".into()),
         };
         let detectors = roots.detectors();

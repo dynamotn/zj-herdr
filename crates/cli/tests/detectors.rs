@@ -397,3 +397,136 @@ fn codex_started_after_its_cwds_rollouts_inherits_none() {
     p.start_time = T0 + 100;
     assert!(detector.detect(&p).is_none());
 }
+
+/// Write Claude's `<sessions>/<pid>.json`, with a field zj-herdr must ignore.
+fn write_session_file(sessions: &Path, pid: u32, id: &str, cwd: &str, started_at_secs: u64) {
+    fs::create_dir_all(sessions).unwrap();
+    let body = serde_json::json!({
+        "pid": pid,
+        "sessionId": id,
+        "cwd": cwd,
+        "startedAt": started_at_secs * 1000 + 250,
+        "kind": "interactive",
+    });
+    fs::write(sessions.join(format!("{pid}.json")), body.to_string()).unwrap();
+}
+
+/// `<tmp>/projects` and `<tmp>/sessions`, like a Claude config dir.
+fn claude_config() -> (tempfile::TempDir, PathBuf, PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    let projects = tmp.path().join("projects");
+    let sessions = tmp.path().join("sessions");
+    fs::create_dir_all(&projects).unwrap();
+    (tmp, projects, sessions)
+}
+
+fn claude_with_sessions(projects: &Path, sessions: &Path) -> ClaudeDetector {
+    let mut detector = ClaudeDetector::new(projects.to_path_buf());
+    detector.sessions = Some(sessions.to_path_buf());
+    detector
+}
+
+#[test]
+fn claude_session_file_wins_over_timestamps() {
+    let (_tmp, projects, sessions) = claude_config();
+    install_claude(&projects, "/work/proj", "turn-ended", "mine", T0 - 100);
+    install_claude(&projects, "/work/proj", "pending-tool", "newer", T0);
+    let p = proc("claude", "/work/proj", T0 + 30, 0.0);
+    write_session_file(&sessions, p.pid, "mine", "/work/proj", p.start_time);
+    let status = claude_with_sessions(&projects, &sessions)
+        .detect(&p)
+        .unwrap();
+    assert_eq!(status.session_id.as_deref(), Some("mine"));
+    assert_eq!(status.state, AgentState::Idle);
+}
+
+#[test]
+fn claude_session_file_reports_its_id_before_the_transcript_exists() {
+    let (_tmp, projects, sessions) = claude_config();
+    install_claude(&projects, "/work/proj", "pending-tool", "other", T0);
+    let p = proc("claude", "/work/proj", T0 + 30, 0.0);
+    write_session_file(&sessions, p.pid, "fresh", "/work/proj", p.start_time);
+    let status = claude_with_sessions(&projects, &sessions)
+        .detect(&p)
+        .unwrap();
+    assert_eq!(status.session_id.as_deref(), Some("fresh"));
+    assert_eq!(status.state, AgentState::Idle);
+}
+
+#[test]
+fn claude_session_file_of_an_earlier_process_is_ignored() {
+    let (_tmp, projects, sessions) = claude_config();
+    install_claude(&projects, "/work/proj", "turn-ended", "stale", T0 - 100);
+    install_claude(&projects, "/work/proj", "pending-tool", "newer", T0);
+    let p = proc("claude", "/work/proj", T0 + 30, 0.0);
+    // Same pid, but written by a process that started a minute earlier.
+    write_session_file(&sessions, p.pid, "stale", "/work/proj", p.start_time - 60);
+    let status = claude_with_sessions(&projects, &sessions)
+        .detect(&p)
+        .unwrap();
+    assert_eq!(status.session_id.as_deref(), Some("newer"));
+}
+
+#[test]
+fn claude_session_file_with_a_bad_id_is_ignored() {
+    let (_tmp, projects, sessions) = claude_config();
+    install_claude(&projects, "/work/proj", "pending-tool", "newer", T0);
+    let p = proc("claude", "/work/proj", T0 + 30, 0.0);
+    write_session_file(&sessions, p.pid, "--evil", "/work/proj", p.start_time);
+    let status = claude_with_sessions(&projects, &sessions)
+        .detect(&p)
+        .unwrap();
+    assert_eq!(status.session_id.as_deref(), Some("newer"));
+}
+
+#[test]
+fn claude_session_file_finds_a_transcript_in_a_sibling_project_dir() {
+    // Started in /work/proj, then moved into a worktree: the transcript
+    // sits under the worktree's slug.
+    let (_tmp, projects, sessions) = claude_config();
+    install_claude(
+        &projects,
+        "/work/proj/.worktrees/x",
+        "pending-tool",
+        "wt",
+        T0,
+    );
+    install_claude(&projects, "/work/proj", "turn-ended", "newer", T0 + 5);
+    let p = proc("claude", "/work/proj", T0 + 30, 0.0);
+    write_session_file(&sessions, p.pid, "wt", "/work/proj", p.start_time);
+    let status = claude_with_sessions(&projects, &sessions)
+        .detect(&p)
+        .unwrap();
+    assert_eq!(status.session_id.as_deref(), Some("wt"));
+    assert_eq!(status.state, AgentState::Blocked);
+}
+
+#[test]
+fn scanner_keeps_session_file_transcripts_out_of_the_shared_pool() {
+    let (_tmp, projects, sessions) = claude_config();
+    install_claude(&projects, "/work/proj", "pending-tool", "s1", T0 - 1);
+    install_claude(&projects, "/work/proj", "turn-ended", "s2", T0 - 2);
+    let mut scanner = Scanner::with_detectors(
+        "box".into(),
+        vec![Box::new(claude_with_sessions(&projects, &sessions))],
+    );
+    let claude = |pid| {
+        let mut p = raw(pid, 1, &["claude"], 0.0);
+        p.cwd = Some("/work/proj".into());
+        p
+    };
+    // 101 says it writes s1, the newest file, which timestamps alone would
+    // have given to either process.
+    write_session_file(&sessions, 101, "s1", "/work/proj", T0 - 3600);
+    let scan = scanner.scan_from(&[claude(101), claude(102)], T0 + 30);
+    let id = |pid: u32| {
+        scan.agents
+            .iter()
+            .find(|a| a.pid == pid)
+            .unwrap()
+            .session_id
+            .as_deref()
+    };
+    assert_eq!(id(101), Some("s1"));
+    assert_eq!(id(102), Some("s2"));
+}

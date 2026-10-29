@@ -36,12 +36,19 @@ inherited from the daemon.
 
 Transcripts read:
 
-- Claude Code: the newest `~/.claude/projects/<cwd-slug>/*.jsonl`, where the
-  slug is the cwd with `/` and `.` replaced by `-` (falling back to Claude's
-  own form, which also replaces `_` and other symbols). `$CLAUDE_CONFIG_DIR`
-  is honoured and `--resume <id>` picks that file. When several Claude
-  agents share a cwd, each transcript goes to the process that was running
-  when it was created, so two agents never report the same session.
+- Claude Code: the session Claude records for the process in
+  `~/.claude/sessions/<pid>.json` (only its `pid`, `sessionId`, `cwd` and
+  `startedAt` are read; a file left by an earlier process with the same pid
+  is ignored), whose transcript is
+  `~/.claude/projects/<cwd-slug>/<sessionId>.jsonl` or, for a session that
+  moved into a worktree, the same file in another project directory. Without
+  a session file: the newest `~/.claude/projects/<cwd-slug>/*.jsonl`, where
+  the slug is the cwd with `/` and `.` replaced by `-` (falling back to
+  Claude's own form, which also replaces `_` and other symbols), and
+  `--resume <id>` picks that file. `$CLAUDE_CONFIG_DIR` is honoured. When
+  several Claude agents share a cwd, each remaining transcript goes to the
+  process that was running when it was created, so two agents never report
+  the same session.
 - Codex: the newest `~/.codex/sessions/**/rollout-*.jsonl` recorded for the
   process cwd (`$CODEX_HOME` is honoured; `codex resume <id>` picks that one).
 - Other agents: CPU only, so they show `working` or `idle`, never `blocked`.

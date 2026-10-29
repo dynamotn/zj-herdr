@@ -8,6 +8,7 @@ use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
+use serde::Deserialize;
 use serde_json::Value;
 use zj_herdr_core::WAITING_MAX_CHARS;
 
@@ -242,6 +243,57 @@ pub fn claude_project_dir(projects: &Path, cwd: &Path) -> PathBuf {
     } else {
         plain
     }
+}
+
+/// The only fields read from Claude Code's `<config>/sessions/<pid>.json`;
+/// the parser skips everything else in the file.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionFile {
+    pid: u32,
+    session_id: String,
+    cwd: PathBuf,
+    started_at: u64,
+}
+
+/// Larger than any real session file; a bigger one is not parsed.
+const SESSION_FILE_MAX: u64 = 64 * 1024;
+/// `startedAt` (milliseconds, from the agent) and the process start time
+/// (whole seconds, from the OS) never quite agree.
+const SESSION_FILE_SLACK_SECS: u64 = 5;
+
+/// Session id and cwd Claude Code recorded for process `pid` in
+/// `<sessions>/<pid>.json`. `None` without such a file, when it was written
+/// for an earlier process with the same pid, or when its id is malformed.
+pub fn claude_session_file(
+    sessions: &Path,
+    pid: u32,
+    start_time: u64,
+) -> Option<(String, PathBuf)> {
+    let file = File::open(sessions.join(format!("{pid}.json"))).ok()?;
+    let rec: SessionFile = serde_json::from_reader(file.take(SESSION_FILE_MAX)).ok()?;
+    let fresh = rec.started_at / 1000 + SESSION_FILE_SLACK_SECS >= start_time;
+    (rec.pid == pid && fresh && crate::agents::is_valid_session_id(&rec.session_id))
+        .then_some((rec.session_id, rec.cwd))
+}
+
+/// The transcript of session `id` started in `cwd`:
+/// `<projects>/<slug>/<id>.jsonl`, else the same file name in another
+/// project directory (a session that entered a worktree), else the first
+/// path, not written yet.
+pub fn claude_session_transcript(projects: &Path, cwd: &Path, id: &str) -> PathBuf {
+    let name = format!("{id}.jsonl");
+    let home = claude_project_dir(projects, cwd).join(&name);
+    if home.is_file() {
+        return home;
+    }
+    fs::read_dir(projects)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|e| e.path().join(&name))
+        .find(|p| p.is_file())
+        .unwrap_or(home)
 }
 
 pub fn read_claude(path: &Path) -> Option<Transcript> {

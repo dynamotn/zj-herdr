@@ -537,6 +537,27 @@ fn claude_session_file_finds_a_transcript_in_a_sibling_project_dir() {
 }
 
 #[test]
+fn claude_session_file_search_is_not_repeated_every_scan() {
+    // Nothing written yet anywhere: the project directories are searched
+    // once, then not again for a while, however often the daemon scans.
+    let (_tmp, projects, sessions) = claude_config();
+    let p = proc("claude", "/work/proj", T0 + 30, 0.0);
+    write_session_file(&sessions, p.pid, "late", "/work/proj", p.start_time);
+    let detector = claude_with_sessions(&projects, &sessions);
+    detector.prepare(&[&p]);
+    assert_eq!(detector.detect(&p).unwrap().state, AgentState::Idle);
+    install_claude(
+        &projects,
+        "/work/proj/.worktrees/x",
+        "pending-tool",
+        "late",
+        T0,
+    );
+    detector.prepare(&[&p]);
+    assert_eq!(detector.detect(&p).unwrap().state, AgentState::Idle);
+}
+
+#[test]
 fn scanner_keeps_session_file_transcripts_out_of_the_shared_pool() {
     let (_tmp, projects, sessions) = claude_config();
     install_claude(&projects, "/work/proj", "pending-tool", "s1", T0 - 1);

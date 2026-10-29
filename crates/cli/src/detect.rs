@@ -205,7 +205,15 @@ pub struct ClaudeDetector {
     assigned: Mutex<HashMap<u32, Option<Assigned>>>,
     /// Token totals read so far, per transcript in use.
     usage: Mutex<HashMap<PathBuf, UsageCursor>>,
+    /// Per session id, where its transcript was found away from its own
+    /// project directory, and when: that search reads every project
+    /// directory, too much to repeat every scan.
+    found: Mutex<HashMap<String, (PathBuf, u64)>>,
 }
+
+/// How long a session with no transcript found yet waits before the project
+/// directories are searched again.
+const SEARCH_AGAIN_SECS: u64 = 10;
 
 impl ClaudeDetector {
     pub fn new(projects: PathBuf) -> Self {
@@ -214,6 +222,7 @@ impl ClaudeDetector {
             sessions: None,
             assigned: Mutex::new(HashMap::new()),
             usage: Mutex::new(HashMap::new()),
+            found: Mutex::new(HashMap::new()),
         }
     }
 
@@ -230,11 +239,20 @@ impl ClaudeDetector {
     fn session_file_transcript(&self, proc: &ProcInfo) -> Option<PathBuf> {
         let (id, cwd) =
             transcript::claude_session_file(self.sessions.as_deref()?, proc.pid, proc.start_time)?;
-        Some(transcript::claude_session_transcript(
-            &self.projects,
-            &cwd,
-            &id,
-        ))
+        let home = transcript::claude_project_dir(&self.projects, &cwd).join(format!("{id}.jsonl"));
+        if home.is_file() {
+            return Some(home);
+        }
+        let now = crate::scan::now_secs();
+        let mut found = self.found.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((path, at)) = found.get(&id) {
+            if path.is_file() || now.saturating_sub(*at) < SEARCH_AGAIN_SECS {
+                return Some(path.clone());
+            }
+        }
+        let path = transcript::claude_session_transcript(&self.projects, &cwd, &id);
+        found.insert(id, (path.clone(), now));
+        Some(path)
     }
 
     fn claimant(proc: &ProcInfo, dir: &Path, files: &[FileTimes]) -> Claimant {
@@ -308,10 +326,15 @@ impl Detector for ClaudeDetector {
 
     fn prepare(&self, procs: &[&ProcInfo]) {
         let fresh = self.assign(procs);
+        let in_use = |path: &Path| fresh.values().flatten().any(|(p, _)| p == path);
         self.usage
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .retain(|path, _| fresh.values().flatten().any(|(p, _)| p == path));
+            .retain(|path, _| in_use(path));
+        self.found
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|_, (path, _)| in_use(path));
         *self.assigned.lock().unwrap_or_else(|e| e.into_inner()) = fresh;
     }
 

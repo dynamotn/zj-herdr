@@ -29,6 +29,8 @@ pub struct AgentStatus {
     pub session_id: Option<String>,
     /// Unix seconds of the last observed activity (transcript write).
     pub last_activity: Option<u64>,
+    /// For a `blocked` agent, the pending call it waits on.
+    pub waiting: Option<String>,
 }
 
 pub trait Detector: Send + Sync {
@@ -69,14 +71,17 @@ pub fn signals_only(proc: &ProcInfo) -> AgentStatus {
         state: classify(proc, None),
         session_id: None,
         last_activity: None,
+        waiting: None,
     }
 }
 
 fn status(proc: &ProcInfo, transcript: Transcript) -> AgentStatus {
+    let state = classify(proc, Some(&transcript));
     AgentStatus {
-        state: classify(proc, Some(&transcript)),
+        state,
         last_activity: Some(transcript.modified),
         session_id: Some(transcript.session_id),
+        waiting: transcript.pending.filter(|_| state == AgentState::Blocked),
     }
 }
 

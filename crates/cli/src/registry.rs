@@ -283,6 +283,7 @@ mod tests {
             since,
             pane: None,
             session_id: None,
+            waiting: None,
         }
     }
 

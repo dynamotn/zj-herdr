@@ -39,6 +39,7 @@ pub fn to_agent(machine: &str, detectors: &[Box<dyn Detector>], proc: &ProcInfo)
         since,
         pane: proc.pane.clone(),
         session_id: status.session_id,
+        waiting: status.waiting,
     }
 }
 

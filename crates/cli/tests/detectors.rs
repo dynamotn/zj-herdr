@@ -81,6 +81,24 @@ fn claude_pending_tool_with_quiet_process_is_blocked() {
 }
 
 #[test]
+fn claude_blocked_agent_says_what_it_waits_on() {
+    let tmp = tempfile::tempdir().unwrap();
+    install_claude(tmp.path(), "/work/proj", "pending-tool", "s1", T0);
+    let detector = ClaudeDetector::new(tmp.path().to_path_buf());
+    let blocked = detector
+        .detect(&proc("claude", "/work/proj", T0 + 30, 0.0))
+        .unwrap();
+    assert_eq!(blocked.state, AgentState::Blocked);
+    assert_eq!(blocked.waiting.as_deref(), Some("Bash: cargo test"));
+    // The same call while the tool runs is no wait at all.
+    let working = detector
+        .detect(&proc("claude", "/work/proj", T0 + 30, 85.0))
+        .unwrap();
+    assert_eq!(working.state, AgentState::Working);
+    assert_eq!(working.waiting, None);
+}
+
+#[test]
 fn claude_pending_tool_with_busy_tree_is_working() {
     // The tool itself (e.g. `cargo test`) is burning CPU under the agent.
     assert_eq!(claude_state("pending-tool", 30, 85.0), AgentState::Working);
@@ -183,11 +201,13 @@ fn codex_newest_rollout_for_cwd_decides_state() {
         Some("0196a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b")
     );
     assert_eq!(status.state, AgentState::Blocked);
+    assert_eq!(status.waiting.as_deref(), Some("shell: make"));
 
     let status = detector
         .detect(&proc("codex", "/work/codex-proj", T0 + 30, 50.0))
         .unwrap();
     assert_eq!(status.state, AgentState::Working);
+    assert_eq!(status.waiting, None);
 }
 
 #[test]

@@ -60,6 +60,7 @@ pub fn merge_remote(remote: &Remote, stdout: &str) -> Result<Machine, String> {
                 }),
             }),
             session_id: a.session_id.as_deref().map(clean),
+            waiting: a.waiting.as_deref().map(clean),
             ..a
         })
         .collect();
@@ -140,6 +141,7 @@ mod tests {
                     since: 3,
                     pane: Some(Pane::new("ops", 2)),
                     session_id: Some("r1".into()),
+                    waiting: None,
                 }],
             }],
         );

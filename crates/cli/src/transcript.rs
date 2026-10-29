@@ -1,13 +1,15 @@
 //! Readers for the transcripts agents already write. Only the tail of a file
-//! is read, and only the shape of each entry matters, never its text.
+//! is read, and only the shape of each entry matters, never message text:
+//! the one exception is the name of a pending tool call and, for a shell
+//! tool, its command (see [`describe_call`]).
 
-use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use serde_json::Value;
+use zj_herdr_core::WAITING_MAX_CHARS;
 
 /// Enough of a transcript tail to see where the last turn stands.
 const TAIL_BYTES: u64 = 256 * 1024;
@@ -32,6 +34,111 @@ pub struct Transcript {
     /// Unix seconds of the last write.
     pub modified: u64,
     pub last: LastTurn,
+    /// For [`LastTurn::PendingTool`], the most recent unanswered call, from
+    /// [`describe_call`].
+    pub pending: Option<String>,
+}
+
+/// Where the conversation stands, and the call it waits on if any.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Turn {
+    pub last: LastTurn,
+    pub pending: Option<String>,
+}
+
+/// Tool calls asked for and not answered yet, oldest first, each with its
+/// [`describe_call`] text.
+#[derive(Default)]
+struct OpenCalls(Vec<(String, String)>);
+
+impl OpenCalls {
+    fn open(&mut self, id: &str, desc: String) {
+        self.close(id);
+        self.0.push((id.to_string(), desc));
+    }
+
+    fn close(&mut self, id: &str) {
+        self.0.retain(|(open, _)| open != id);
+    }
+
+    fn clear(&mut self) {
+        self.0.clear();
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    fn latest(&self) -> Option<String> {
+        self.0.last().map(|(_, desc)| desc.clone())
+    }
+}
+
+/// Tool names whose command is worth showing: Claude's `Bash`, Codex's
+/// shell tools.
+const SHELL_TOOLS: &[&str] = &[
+    "Bash",
+    "shell",
+    "shell_command",
+    "exec_command",
+    "local_shell",
+    "container.exec",
+];
+
+/// What a pending call waits on, for [`zj_herdr_core::Agent::waiting`]:
+/// `Bash: cargo test` for a shell tool, the bare tool name otherwise. One
+/// line (control characters become spaces), at most
+/// [`WAITING_MAX_CHARS`] characters.
+pub fn describe_call(name: &str, command: Option<&str>) -> String {
+    let command = command
+        .map(str::trim)
+        .filter(|c| !c.is_empty() && SHELL_TOOLS.contains(&name));
+    let text = match command {
+        Some(c) => format!("{name}: {c}"),
+        None => name.to_string(),
+    };
+    let line: String = text
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    if line.chars().count() <= WAITING_MAX_CHARS {
+        return line;
+    }
+    let mut out: String = line.chars().take(WAITING_MAX_CHARS - 1).collect();
+    out.push('…');
+    out
+}
+
+/// A shell command from a tool's arguments: a string as is; an argv
+/// (`["bash", "-lc", "make"]`) as the script it runs, or joined by spaces.
+fn command_text(value: &Value) -> Option<String> {
+    match value {
+        Value::String(s) => Some(s.clone()),
+        Value::Array(items) => {
+            let argv: Vec<&str> = items.iter().filter_map(Value::as_str).collect();
+            match argv.as_slice() {
+                [_, flag, script, ..] if matches!(*flag, "-c" | "-lc") => Some(script.to_string()),
+                _ => Some(argv.join(" ")),
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The command in a tool's arguments, under `command` or `cmd`. Codex
+/// sends arguments as a JSON string.
+fn args_command(args: &Value) -> Option<String> {
+    let parsed;
+    let args = match args {
+        Value::String(s) => {
+            parsed = serde_json::from_str::<Value>(s).ok()?;
+            &parsed
+        }
+        other => other,
+    };
+    ["command", "cmd"]
+        .iter()
+        .find_map(|key| command_text(&args[*key]))
 }
 
 pub fn modified_secs(path: &Path) -> Option<u64> {
@@ -139,11 +246,13 @@ pub fn claude_project_dir(projects: &Path, cwd: &Path) -> PathBuf {
 
 pub fn read_claude(path: &Path) -> Option<Transcript> {
     let lines = tail_lines(path).ok()?;
+    let turn = claude_turn(parse_lines(&lines));
     Some(Transcript {
         path: path.to_path_buf(),
         session_id: stem(path),
         modified: modified_secs(path)?,
-        last: claude_last_turn(parse_lines(&lines)),
+        last: turn.last,
+        pending: turn.pending,
     })
 }
 
@@ -154,7 +263,11 @@ fn content_items(entry: &Value) -> &[Value] {
 }
 
 pub fn claude_last_turn(entries: impl Iterator<Item = Value>) -> LastTurn {
-    let mut open: HashSet<String> = HashSet::new();
+    claude_turn(entries).last
+}
+
+pub fn claude_turn(entries: impl Iterator<Item = Value>) -> Turn {
+    let mut open = OpenCalls::default();
     let mut last = LastTurn::Unknown;
     for entry in entries {
         // Subagent (Task tool) traffic does not end or block the main turn.
@@ -166,7 +279,9 @@ pub fn claude_last_turn(entries: impl Iterator<Item = Value>) -> LastTurn {
                 for item in content_items(&entry) {
                     if item["type"] == "tool_use" {
                         if let Some(id) = item["id"].as_str() {
-                            open.insert(id.to_string());
+                            let name = item["name"].as_str().unwrap_or("tool");
+                            let command = item["input"]["command"].as_str();
+                            open.open(id, describe_call(name, command));
                         }
                     }
                 }
@@ -193,7 +308,7 @@ pub fn claude_last_turn(entries: impl Iterator<Item = Value>) -> LastTurn {
                     };
                 } else {
                     for id in results {
-                        open.remove(id);
+                        open.close(id);
                     }
                     last = LastTurn::AwaitingReply;
                 }
@@ -202,9 +317,15 @@ pub fn claude_last_turn(entries: impl Iterator<Item = Value>) -> LastTurn {
         }
     }
     if open.is_empty() {
-        last
+        Turn {
+            last,
+            pending: None,
+        }
     } else {
-        LastTurn::PendingTool
+        Turn {
+            last: LastTurn::PendingTool,
+            pending: open.latest(),
+        }
     }
 }
 
@@ -270,18 +391,36 @@ fn codex_id_from_name(path: &Path) -> String {
 
 pub fn read_codex(path: &Path, session_id: String) -> Option<Transcript> {
     let lines = tail_lines(path).ok()?;
+    let turn = codex_turn(parse_lines(&lines));
     Some(Transcript {
         path: path.to_path_buf(),
         session_id,
         modified: modified_secs(path)?,
-        last: codex_last_turn(parse_lines(&lines)),
+        last: turn.last,
+        pending: turn.pending,
     })
 }
 
 pub fn codex_last_turn(entries: impl Iterator<Item = Value>) -> LastTurn {
-    let mut open: HashSet<String> = HashSet::new();
+    codex_turn(entries).last
+}
+
+/// [`describe_call`] for a Codex `response_item` that requests a tool.
+fn codex_call(payload: &Value) -> String {
+    if payload["type"] == "local_shell_call" {
+        let command = command_text(&payload["action"]["command"]);
+        return describe_call("shell", command.as_deref());
+    }
+    let name = payload["name"].as_str().unwrap_or("tool");
+    let command = args_command(&payload["arguments"]);
+    describe_call(name, command.as_deref())
+}
+
+pub fn codex_turn(entries: impl Iterator<Item = Value>) -> Turn {
+    let mut open = OpenCalls::default();
     let mut last = LastTurn::Unknown;
-    let mut approval = false;
+    // An approval request, with what it asks to run.
+    let mut approval: Option<String> = None;
     for entry in entries {
         let payload = &entry["payload"];
         let kind = payload["type"].as_str().unwrap_or_default();
@@ -289,15 +428,15 @@ pub fn codex_last_turn(entries: impl Iterator<Item = Value>) -> LastTurn {
             Some("response_item") => match kind {
                 "function_call" | "custom_tool_call" | "local_shell_call" => {
                     if let Some(id) = payload["call_id"].as_str() {
-                        open.insert(id.to_string());
+                        open.open(id, codex_call(payload));
                     }
                     last = LastTurn::AwaitingReply;
                 }
                 "function_call_output" | "custom_tool_call_output" => {
                     if let Some(id) = payload["call_id"].as_str() {
-                        open.remove(id);
+                        open.close(id);
                     }
-                    approval = false;
+                    approval = None;
                     last = LastTurn::AwaitingReply;
                 }
                 "message" if payload["role"] == "assistant" => last = LastTurn::TurnEnded,
@@ -305,16 +444,22 @@ pub fn codex_last_turn(entries: impl Iterator<Item = Value>) -> LastTurn {
                 _ => {}
             },
             Some("event_msg") => match kind {
-                "exec_approval_request" | "apply_patch_approval_request" => approval = true,
+                "exec_approval_request" => {
+                    let command = command_text(&payload["command"]);
+                    approval = Some(describe_call("shell", command.as_deref()));
+                }
+                "apply_patch_approval_request" => {
+                    approval = Some(describe_call("apply_patch", None))
+                }
                 "task_started" => last = LastTurn::AwaitingReply,
                 "user_message" => {
                     open.clear();
-                    approval = false;
+                    approval = None;
                     last = LastTurn::AwaitingReply;
                 }
                 "task_complete" | "turn_aborted" => {
                     open.clear();
-                    approval = false;
+                    approval = None;
                     last = LastTurn::TurnEnded;
                 }
                 _ => {}
@@ -322,10 +467,16 @@ pub fn codex_last_turn(entries: impl Iterator<Item = Value>) -> LastTurn {
             _ => {}
         }
     }
-    if approval || !open.is_empty() {
-        LastTurn::PendingTool
+    if approval.is_some() || !open.is_empty() {
+        Turn {
+            last: LastTurn::PendingTool,
+            pending: open.latest().or(approval),
+        }
     } else {
-        last
+        Turn {
+            last,
+            pending: None,
+        }
     }
 }
 
@@ -412,6 +563,75 @@ mod tests {
         assert_eq!(
             codex_id_from_name(p),
             "0196a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b"
+        );
+    }
+
+    #[test]
+    fn calls_are_described_on_one_short_line() {
+        assert_eq!(
+            describe_call("Bash", Some(" cargo test ")),
+            "Bash: cargo test"
+        );
+        assert_eq!(describe_call("Edit", Some("ignored")), "Edit");
+        assert_eq!(describe_call("Bash", Some("")), "Bash");
+        assert_eq!(
+            describe_call("Bash", Some("a\nb\r\x1b[31mc")),
+            "Bash: a b  [31mc"
+        );
+        let long = describe_call("Bash", Some(&"x".repeat(100)));
+        assert_eq!(long.chars().count(), WAITING_MAX_CHARS);
+        assert!(long.starts_with("Bash: xxx") && long.ends_with('…'));
+    }
+
+    #[test]
+    fn claude_pending_call_is_the_latest_unanswered() {
+        let entries = vec![
+            json!({"type":"assistant","message":{"content":[
+                {"type":"tool_use","id":"a","name":"Bash","input":{"command":"ls"}},
+                {"type":"tool_use","id":"b","name":"Read","input":{"file_path":"/x"}}]}}),
+            json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"b"}]}}),
+        ];
+        let turn = claude_turn(entries.clone().into_iter());
+        assert_eq!(turn.last, LastTurn::PendingTool);
+        assert_eq!(turn.pending.as_deref(), Some("Bash: ls"));
+        let mut done = entries;
+        done.push(
+            json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"a"}]}}),
+        );
+        assert_eq!(claude_turn(done.into_iter()).pending, None);
+    }
+
+    #[test]
+    fn codex_shell_calls_show_their_command() {
+        let call = |payload: Value| {
+            codex_turn(std::iter::once(
+                json!({"type":"response_item","payload":payload}),
+            ))
+            .pending
+            .unwrap()
+        };
+        assert_eq!(
+            call(json!({"type":"function_call","name":"shell","call_id":"1",
+                "arguments":"{\"command\":[\"bash\",\"-lc\",\"make test\"]}"})),
+            "shell: make test"
+        );
+        assert_eq!(
+            call(
+                json!({"type":"function_call","name":"exec_command","call_id":"1",
+                "arguments":"{\"cmd\":\"git status\"}"})
+            ),
+            "exec_command: git status"
+        );
+        assert_eq!(
+            call(json!({"type":"local_shell_call","call_id":"1",
+                "action":{"type":"exec","command":["rg","-n","x"]}})),
+            "shell: rg -n x"
+        );
+        assert_eq!(
+            call(
+                json!({"type":"custom_tool_call","name":"apply_patch","call_id":"1","input":"*** Begin"})
+            ),
+            "apply_patch"
         );
     }
 

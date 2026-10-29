@@ -154,12 +154,11 @@ pub fn render(
                         body.push((format!("{style}{text}{RESET}"), false, Some(target)));
                     }
                     Row::Agent { agent, local } => {
-                        let branch = if !in_tab {
-                            "    "
-                        } else if matches!(tree.get(i + 1), Some(Row::Agent { .. })) {
-                            "  ├ "
-                        } else {
-                            "  └ "
+                        let more = in_tab && matches!(tree.get(i + 1), Some(Row::Agent { .. }));
+                        let branch = match (in_tab, more) {
+                            (false, _) => "    ",
+                            (true, true) => "  ├ ",
+                            (true, false) => "  └ ",
                         };
                         let ssh = ssh_of(&agent.machine);
                         let text = truncate(
@@ -173,6 +172,19 @@ pub fn render(
                             format!("{}{text}{RESET}", color(agent.state))
                         };
                         body.push((styled, is_sel, Some(Target::Agent(agent.id.clone()))));
+                        if let Some(waiting) = agent
+                            .waiting
+                            .as_deref()
+                            .filter(|_| agent.state == AgentState::Blocked)
+                        {
+                            let stem = if more { "  │ " } else { "    " };
+                            let text = truncate(&format!("{stem}↳ {waiting}"), cols);
+                            body.push((
+                                format!("{DIM}{text}{RESET}"),
+                                false,
+                                Some(Target::Agent(agent.id.clone())),
+                            ));
+                        }
                     }
                 }
             }
@@ -221,6 +233,7 @@ mod tests {
                 since: 100,
                 pane: Some(Pane::new("dev", pid)),
                 session_id: None,
+                waiting: None,
             })
             .collect();
         let remote = Machine {
@@ -332,6 +345,45 @@ mod tests {
         );
         assert_eq!(targets[5], Some(Target::Agent("box/2".into())));
         assert_eq!(lines.len(), targets.len());
+    }
+
+    #[test]
+    fn blocked_agents_show_what_they_wait_on() {
+        let mut st = state(3);
+        for a in &mut st.machines[0].agents {
+            a.state = AgentState::Blocked;
+            a.waiting = Some(format!("Bash: make {}", a.pid));
+        }
+        // Not blocked any more: a stale reason is not shown.
+        st.machines[0].agents[2].state = AgentState::Working;
+        let layouts = vec![view::SessionLayout {
+            name: "dev".into(),
+            tabs: vec![view::TabLayout {
+                position: 0,
+                name: "code".into(),
+                active: true,
+                panes: vec![1, 2, 3],
+            }],
+        }];
+        let tree = view::tree(&st, Some("dev"), &layouts);
+        let (lines, targets) = render(Some(&st), &tree, Some("dev"), None, None, 160, (20, 80));
+        let lines = plain(&lines);
+        assert_eq!(lines[4], "  ├ ! blocked  claude  1m     #1 proj1");
+        assert_eq!(lines[5], "  │ ↳ Bash: make 1");
+        assert_eq!(lines[6], "  ├ ! blocked  claude  1m     #2 proj2");
+        assert_eq!(lines[7], "  │ ↳ Bash: make 2");
+        assert_eq!(lines[8], "  └ ● working  claude  1m     #3 proj3");
+        assert_eq!(lines[9], "far (unreachable: timeout)");
+        assert_eq!(targets[5], Some(Target::Agent("box/1".into())));
+        assert_eq!(selectable(&tree), ["box/1", "box/2", "box/3"]);
+
+        // The last agent of a tab, and one outside any tab.
+        st.machines[0].agents[2].state = AgentState::Blocked;
+        let tree = view::tree(&st, Some("dev"), &layouts);
+        let lines = plain(&render(Some(&st), &tree, Some("dev"), None, None, 160, (20, 80)).0);
+        assert_eq!(lines[9], "    ↳ Bash: make 3");
+        let lines = draw(&st, None, None, 160, (20, 80));
+        assert_eq!(lines[4], "    ↳ Bash: make 1");
     }
 
     #[test]

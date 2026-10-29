@@ -220,6 +220,7 @@ mod tests {
             since: 0,
             pane,
             session_id: None,
+            waiting: None,
         }
     }
 

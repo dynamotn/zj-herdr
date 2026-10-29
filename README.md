@@ -42,7 +42,12 @@ Transcripts read:
   process cwd (`$CODEX_HOME` is honoured; `codex resume <id>` picks that one).
 - Other agents: CPU only, so they show `working` or `idle`, never `blocked`.
 
-Only the shape of each entry is read, never message text. Known limits: a
+Only the shape of each entry is read, never message text, with one
+exception: for a `blocked` agent, the name of the tool call it waits on and,
+for a shell tool (Claude `Bash`, Codex `shell`/`exec_command`), its command.
+That text is sent as `waiting` (one line, at most 60 characters, absent in
+other states) and shown by the plugin under the agent as `↳ Bash: cargo
+test`. Tool results, prompts and replies are never read. Known limits: a
 quiet tool (a long `sleep`, a stalled download) awaiting no permission looks
 `blocked`, and when two Claude agents in one directory both `/clear` at
 about the same time their new transcripts can be swapped.

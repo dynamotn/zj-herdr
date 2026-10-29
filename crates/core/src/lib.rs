@@ -140,7 +140,15 @@ pub struct Agent {
     /// The agent's own session id (Claude transcript stem, Codex rollout id).
     #[serde(default)]
     pub session_id: Option<String>,
+    /// What a `blocked` agent waits on: the pending tool's name and, for a
+    /// shell tool, its command, on one line of at most
+    /// [`WAITING_MAX_CHARS`]. `None` in any other state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting: Option<String>,
 }
+
+/// Longest [`Agent::waiting`] text.
+pub const WAITING_MAX_CHARS: usize = 60;
 
 impl Agent {
     pub fn make_id(machine: &str, pid: u32) -> String {
@@ -295,6 +303,7 @@ mod tests {
                             }),
                         }),
                         session_id: Some("abc".into()),
+                        waiting: None,
                     }],
                 },
                 Machine {

@@ -273,6 +273,7 @@ mod tests {
             since,
             pane: session.map(|s| Pane::new(s, pid)),
             session_id: None,
+            waiting: None,
         }
     }
 

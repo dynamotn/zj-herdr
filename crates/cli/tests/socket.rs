@@ -70,6 +70,7 @@ fn agent(machine: &str, pid: u32, state: AgentState, pane: Option<Pane>) -> Agen
         since: 0,
         pane,
         session_id: None,
+        waiting: None,
     }
 }
 

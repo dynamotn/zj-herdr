@@ -86,9 +86,13 @@ CLI, and the daemon serves only connections from its own uid.
   the pane (switching session if needed), `n`/`p` cycle attention, `Esc`
   hides it. Remote rows show their SSH target and do not jump.
   On this machine, the agents of each Zellij session sit under the tab that
-  holds their pane, as in zj-radar: the current session first with all its
-  tabs (`▌` marks the active one), other sessions with the tabs that have
-  agents. Agents outside Zellij and remote machines stay grouped by host
+  holds their pane, as in zj-radar: the current session first with its
+  active tab (marked `▌`) and every tab that has agents, the tabs without
+  agents folded into one dim `+N tabs` line; other sessions with the tabs
+  that have agents. When the list leaves at least two lines free, the
+  counts move from the header to a footer on the last line,
+  `3 working · 2 need you` (blocked plus idle; the second part only when
+  some agent needs you). Agents outside Zellij and remote machines stay grouped by host
   and session. Click an agent, tab or session row to jump to it.
   Zellij does not always describe other sessions to a plugin, so the
   daemon also records each agent's tab: every 5 s at most, it runs

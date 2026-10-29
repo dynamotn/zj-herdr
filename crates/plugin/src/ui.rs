@@ -62,9 +62,24 @@ fn agent_text(agent: &Agent, branch: &str, local: bool, ssh: Option<&str>, now: 
     )
 }
 
+/// `3 working · 2 need you`, where blocked and idle agents need you; the
+/// second part only when some do.
+fn tally(state: &StateV1) -> String {
+    let count = |f: fn(AgentState) -> bool| state.agents().filter(|a| f(a.state)).count();
+    let working = count(|s| s == AgentState::Working);
+    let need = count(|s| matches!(s, AgentState::Blocked | AgentState::Idle));
+    if need > 0 {
+        format!("{working} working · {need} need you")
+    } else {
+        format!("{working} working")
+    }
+}
+
 /// The picker as lines, each with what a click on it does: a summary,
 /// then `tree` (from [`view::tree`]), scrolled so the selected agent stays
 /// visible within `rows`. `current` is the session this instance runs in.
+/// When the tree leaves two lines spare, the counts move from the header to
+/// a footer on the last line.
 pub fn render(
     state: Option<&StateV1>,
     tree: &[Row],
@@ -179,6 +194,12 @@ pub fn render(
                             ));
                         }
                     }
+                    Row::FoldedTabs { count } => {
+                        in_tab = false;
+                        let noun = if *count == 1 { "tab" } else { "tabs" };
+                        let text = truncate(&format!("   +{count} {noun}"), cols);
+                        body.push((format!("{DIM}{text}{RESET}"), false, None));
+                    }
                 }
             }
             if state.agents().next().is_none() {
@@ -188,6 +209,17 @@ pub fn render(
     }
     if let Some(e) = error {
         head.push(format!("\x1b[31m{}{RESET}", truncate(e, cols)));
+    }
+    if let Some(state) = state {
+        // With two lines to spare, the counts move to a footer at the
+        // bottom of the rail, under a rule.
+        let spare = rows.saturating_sub(head.len() + body.len());
+        if spare >= 2 {
+            head[0] = truncate("zj-herdr", cols);
+            body.extend((2..spare).map(|_| (String::new(), false, None)));
+            body.push((format!("{DIM}{}{RESET}", "─".repeat(cols)), false, None));
+            body.push((truncate(&tally(state), cols), false, None));
+        }
     }
 
     let room = rows.saturating_sub(head.len());
@@ -285,12 +317,38 @@ mod tests {
     #[test]
     fn renders_summary_groups_and_rows() {
         let st = state(2);
-        let lines = draw(&st, Some("box/1"), None, 160, (20, 80));
+        let lines = draw(&st, Some("box/1"), None, 160, (6, 80));
         assert_eq!(lines[0], "zj-herdr  1 blocked  0 idle  1 working");
         assert_eq!(lines[1], "box");
         assert_eq!(lines[2], "  dev");
         assert_eq!(lines[3], "    ! blocked  claude  1m     #1 proj1");
         assert_eq!(lines[5], "far (unreachable: timeout)");
+    }
+
+    #[test]
+    fn spare_room_moves_the_counts_to_a_footer() {
+        let st = state(2);
+        // Header and five tree lines leave exactly two spare in eight rows.
+        let lines = draw(&st, None, None, 160, (8, 30));
+        assert_eq!(lines.len(), 8);
+        assert_eq!(lines[0], "zj-herdr");
+        assert_eq!(lines[5], "far (unreachable: timeout)");
+        assert_eq!(lines[6], "─".repeat(30));
+        assert_eq!(lines[7], "1 working · 1 need you");
+        // More room pads above the rule, so the tally stays on the last line.
+        let lines = draw(&st, None, None, 160, (12, 30));
+        assert_eq!(lines.len(), 12);
+        assert_eq!(lines[6..10], ["", "", "", ""]);
+        assert_eq!(lines[11], "1 working · 1 need you");
+        // One line short: no footer, the header keeps the counts.
+        let lines = draw(&st, None, None, 160, (7, 80));
+        assert_eq!(lines.len(), 6);
+        assert!(lines[0].starts_with("zj-herdr  1 blocked"));
+        // Nobody needs you: just the working count.
+        let mut st = state(2);
+        st.machines[0].agents[0].state = AgentState::Done;
+        let lines = draw(&st, None, None, 160, (12, 80));
+        assert_eq!(lines[11], "1 working");
     }
 
     #[test]
@@ -317,6 +375,12 @@ mod tests {
                     active: false,
                     panes: vec![],
                 },
+                view::TabLayout {
+                    position: 3,
+                    name: "logs".into(),
+                    active: false,
+                    panes: vec![9],
+                },
             ],
         }];
         let tree = view::tree(&st, Some("dev"), &layouts);
@@ -327,7 +391,9 @@ mod tests {
         assert_eq!(lines[4], "  ├ ! blocked  claude  1m     #1 proj1");
         assert_eq!(lines[5], "  └ ● working  claude  1m     #2 proj2");
         assert_eq!(lines[6], "   ● 2 notes");
-        assert_eq!(lines[8], "     3 shell");
+        assert_eq!(lines[8], "   +2 tabs", "tabs without agents fold");
+        assert_eq!(targets[8], None);
+        assert_eq!(lines[9], "far (unreachable: timeout)");
         assert_eq!(targets[2], None, "the current session is no target");
         assert_eq!(
             targets[3],

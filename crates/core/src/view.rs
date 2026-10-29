@@ -25,6 +25,11 @@ pub enum Row<'a> {
         agent: &'a Agent,
         local: bool,
     },
+    /// Tabs of the current session with no agent, other than the active
+    /// one, folded into one line after the session's tabs.
+    FoldedTabs {
+        count: usize,
+    },
 }
 
 /// A tab of a local Zellij session, as the plugin sees it.
@@ -94,7 +99,8 @@ pub fn rows(state: &StateV1) -> Vec<Row<'_>> {
 /// Like [`rows`], but local sessions found in `layouts` list their agents
 /// under the tab that holds each pane, in tab and pane order, as zj-radar
 /// does. The `current` session comes first on the local machine and shows
-/// every tab; other sessions show only tabs with agents. Remote machines
+/// its active tab and every tab with agents, the others folded into one
+/// [`Row::FoldedTabs`]; other sessions show only tabs with agents. Remote machines
 /// and agents outside Zellij keep the flat session grouping.
 pub fn tree<'a>(
     state: &'a StateV1,
@@ -133,6 +139,7 @@ pub fn tree<'a>(
             if let Some(layout) = layout {
                 let mut tabs: Vec<&TabLayout> = layout.tabs.iter().collect();
                 tabs.sort_by_key(|t| t.position);
+                let mut folded = 0;
                 for tab in tabs {
                     let mut here: Vec<&Agent> = in_session
                         .iter()
@@ -144,6 +151,10 @@ pub fn tree<'a>(
                         })
                         .collect();
                     if here.is_empty() && Some(s) != current {
+                        continue;
+                    }
+                    if here.is_empty() && !tab.active {
+                        folded += 1;
                         continue;
                     }
                     in_session.retain(|a| !here.contains(a));
@@ -158,6 +169,9 @@ pub fn tree<'a>(
                         state,
                     });
                     out.extend(here.into_iter().map(|a| Row::Agent { agent: a, local }));
+                }
+                if folded > 0 {
+                    out.push(Row::FoldedTabs { count: folded });
                 }
             }
             // No layout yet, outside Zellij, remote, or a pane no tab lists.
@@ -375,6 +389,7 @@ mod tests {
                     format!("T {} {}", tab.name, state.map_or("-", |s| s.as_str()))
                 }
                 Row::Agent { agent, .. } => format!("A {}", agent.pid),
+                Row::FoldedTabs { count } => format!("F {count}"),
             })
             .collect()
     }
@@ -420,6 +435,7 @@ mod tests {
                     tab(1, "two", &[1]),
                     tab(0, "one", &[3, 7]),
                     tab(2, "empty", &[8]),
+                    tab(3, "spare", &[]),
                 ],
             },
             SessionLayout {
@@ -432,13 +448,13 @@ mod tests {
             describe(&tree(&st, Some("a"), &layouts)),
             [
                 "M box",
-                // The current session first, every tab shown.
+                // The current session first, tabs without agents folded.
                 "S a",
                 "T one blocked",
                 "A 3",
                 "T two working",
                 "A 1",
-                "T empty -",
+                "F 2",
                 "S b",
                 "T x blocked",
                 "A 5",
@@ -448,6 +464,22 @@ mod tests {
                 "M far",
                 "S x",
                 "A 9"
+            ]
+        );
+
+        // The active tab always shows, agents or not.
+        let mut layouts = layouts;
+        layouts[0].tabs[1].active = false;
+        layouts[0].tabs[3].active = true;
+        assert_eq!(
+            describe(&tree(&st, Some("a"), &layouts))[2..8],
+            [
+                "T one blocked",
+                "A 3",
+                "T two working",
+                "A 1",
+                "T spare -",
+                "F 1"
             ]
         );
     }

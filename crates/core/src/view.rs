@@ -169,6 +169,58 @@ pub fn tree<'a>(
     out
 }
 
+/// `layouts`, plus a layout built from the agents' own `pane.tab` (as the
+/// daemon saw it) for every local session that `layouts` lacks or knows no
+/// tabs of: Zellij's `SessionUpdate` may leave other sessions out.
+pub fn with_agent_tabs(state: &StateV1, mut layouts: Vec<SessionLayout>) -> Vec<SessionLayout> {
+    let known: Vec<String> = layouts
+        .iter()
+        .filter(|l| !l.tabs.is_empty())
+        .map(|l| l.name.clone())
+        .collect();
+    let mut built: Vec<SessionLayout> = Vec::new();
+    let panes = state
+        .machines
+        .iter()
+        .filter(|m| is_local(m))
+        .flat_map(|m| &m.agents)
+        .filter_map(|a| a.pane.as_ref());
+    for pane in panes {
+        let Some(tab) = &pane.tab else {
+            continue;
+        };
+        if known.contains(&pane.session) {
+            continue;
+        }
+        let layout = match built.iter_mut().position(|l| l.name == pane.session) {
+            Some(i) => &mut built[i],
+            None => {
+                built.push(SessionLayout {
+                    name: pane.session.clone(),
+                    tabs: vec![],
+                });
+                built.last_mut().expect("just pushed")
+            }
+        };
+        let slot = match layout.tabs.iter().position(|t| t.position == tab.position) {
+            Some(i) => &mut layout.tabs[i],
+            None => {
+                layout.tabs.push(TabLayout {
+                    position: tab.position,
+                    name: tab.name.clone(),
+                    active: false,
+                    panes: vec![],
+                });
+                layout.tabs.last_mut().expect("just pushed")
+            }
+        };
+        slot.panes.push(pane.pane_id);
+    }
+    layouts.retain(|l| !built.iter().any(|b| b.name == l.name));
+    layouts.extend(built);
+    layouts
+}
+
 /// Agents the plugin can jump to: local, inside Zellij, blocked or idle.
 /// Blocked come before idle, each longest-waiting first.
 pub fn attention_order(state: &StateV1) -> Vec<&Agent> {
@@ -219,10 +271,7 @@ mod tests {
             cwd: None,
             state,
             since,
-            pane: session.map(|s| Pane {
-                session: s.into(),
-                pane_id: pid,
-            }),
+            pane: session.map(|s| Pane::new(s, pid)),
             session_id: None,
         }
     }
@@ -337,6 +386,66 @@ mod tests {
                 "M far",
                 "S x",
                 "A 9"
+            ]
+        );
+    }
+
+    #[test]
+    fn sessions_zellij_left_out_get_tabs_from_the_daemon() {
+        let mut st = state();
+        let set_tab = |st: &mut StateV1, machine: usize, pid: u32, position, name: &str| {
+            let a = st.machines[machine]
+                .agents
+                .iter_mut()
+                .find(|a| a.pid == pid)
+                .unwrap();
+            a.pane.as_mut().unwrap().tab = Some(crate::PaneTab {
+                position,
+                name: name.into(),
+            });
+        };
+        set_tab(&mut st, 1, 2, 1, "docs");
+        set_tab(&mut st, 1, 5, 0, "api");
+        set_tab(&mut st, 1, 3, 0, "stale");
+        set_tab(&mut st, 0, 9, 0, "remote");
+        // `a` is known with its tabs; `b` came back from SessionUpdate empty.
+        let given = vec![
+            SessionLayout {
+                name: "a".into(),
+                tabs: vec![tab(0, "one", &[3, 1])],
+            },
+            SessionLayout {
+                name: "b".into(),
+                tabs: vec![],
+            },
+        ];
+        let layouts = with_agent_tabs(&st, given);
+        assert_eq!(layouts.len(), 2);
+        assert_eq!(layouts[0].tabs[0].name, "one", "Zellij's own answer wins");
+        let b = &layouts[1];
+        assert_eq!(b.name, "b");
+        assert_eq!(
+            b.tabs
+                .iter()
+                .map(|t| (t.position, t.name.as_str(), t.panes.clone()))
+                .collect::<Vec<_>>(),
+            [(1, "docs", vec![2]), (0, "api", vec![5])]
+        );
+        assert!(
+            layouts.iter().all(|l| l.name != "x"),
+            "remote sessions get none"
+        );
+        assert_eq!(
+            describe(&tree(&st, Some("a"), &layouts))[..8],
+            [
+                "M box",
+                "S a",
+                "T one blocked",
+                "A 1",
+                "A 3",
+                "S b",
+                "T api blocked",
+                "A 5"
             ]
         );
     }

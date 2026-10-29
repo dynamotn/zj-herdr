@@ -375,7 +375,8 @@ impl Plugin {
     }
 
     /// Tabs and terminal panes of every local session this instance knows:
-    /// its own from `TabUpdate`/`PaneUpdate`, the rest from `SessionUpdate`.
+    /// its own from `TabUpdate`/`PaneUpdate`, the rest from `SessionUpdate`,
+    /// and sessions that update left out from the daemon's `pane.tab`.
     fn layouts(&self) -> Vec<SessionLayout> {
         let mut out: Vec<SessionLayout> = self
             .sessions
@@ -386,7 +387,10 @@ impl Plugin {
         if let Some(name) = &self.session {
             out.push(layout(name, &self.tabs, self.panes.as_ref()));
         }
-        out
+        match &self.state {
+            Some(state) => view::with_agent_tabs(state, out),
+            None => out,
+        }
     }
 
     fn tree<'a>(&'a self, layouts: &'a [SessionLayout]) -> Vec<view::Row<'a>> {

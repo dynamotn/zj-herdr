@@ -227,10 +227,7 @@ mod tests {
             cwd: Some(format!("/w/{pid}")),
             state,
             since: 0,
-            pane: Some(Pane {
-                session: session.into(),
-                pane_id: pane,
-            }),
+            pane: Some(Pane::new(session, pane)),
             session_id: sid.map(str::to_owned),
         }
     }

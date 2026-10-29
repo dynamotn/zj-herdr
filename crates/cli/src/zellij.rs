@@ -1,7 +1,11 @@
 //! The few Zellij CLI calls the daemon makes, behind a trait for tests.
 
+use std::collections::HashMap;
 use std::process::Command;
 use std::time::Duration;
+
+use serde_json::Value;
+use zj_herdr_core::PaneTab;
 
 use crate::exec;
 
@@ -29,6 +33,9 @@ pub trait Zellij: Send + Sync {
     ) -> Result<String, String>;
     /// `zellij --session S run [--cwd C] -- COMMAND...`
     fn run(&self, session: &str, cwd: Option<&str>, command: &[String]) -> Result<(), String>;
+    /// The tab of each terminal pane in a session, by pane id, from
+    /// `zellij --session S action list-panes --json --tab`.
+    fn panes(&self, session: &str) -> Result<HashMap<u32, PaneTab>, String>;
 }
 
 pub struct ZellijCli;
@@ -86,6 +93,33 @@ pub fn parse_sessions(stdout: &str) -> Vec<String> {
         .collect()
 }
 
+/// Terminal panes and their tabs from `list-panes --json --tab`: an array
+/// of objects with `id`, `is_plugin`, `tab_position` and `tab_name` (a
+/// `{"panes": [...]}` wrapper is accepted too). Plugin panes and entries
+/// missing a field are skipped.
+pub fn parse_panes(stdout: &str) -> Result<HashMap<u32, PaneTab>, String> {
+    let value: Value =
+        serde_json::from_str(stdout.trim()).map_err(|e| format!("list-panes: {e}"))?;
+    let entries = match &value {
+        Value::Array(items) => items,
+        Value::Object(map) => match map.get("panes") {
+            Some(Value::Array(items)) => items,
+            _ => return Err("list-panes: no pane array".to_string()),
+        },
+        _ => return Err("list-panes: no pane array".to_string()),
+    };
+    Ok(entries
+        .iter()
+        .filter(|p| p["is_plugin"].as_bool() != Some(true))
+        .filter_map(|p| {
+            let id = u32::try_from(p["id"].as_u64()?).ok()?;
+            let position = usize::try_from(p["tab_position"].as_u64()?).ok()?;
+            let name = p["tab_name"].as_str()?.to_string();
+            Some((id, PaneTab { position, name }))
+        })
+        .collect())
+}
+
 impl Zellij for ZellijCli {
     fn sessions(&self) -> Result<Vec<String>, String> {
         let mut cmd = Command::new("zellij");
@@ -124,6 +158,19 @@ impl Zellij for ZellijCli {
         cmd.args(run_args(session, cwd, command));
         exec::run(cmd, ZELLIJ_TIMEOUT).map(drop)
     }
+
+    fn panes(&self, session: &str) -> Result<HashMap<u32, PaneTab>, String> {
+        let mut cmd = Command::new("zellij");
+        cmd.args([
+            "--session",
+            session,
+            "action",
+            "list-panes",
+            "--json",
+            "--tab",
+        ]);
+        exec::run(cmd, ZELLIJ_TIMEOUT).and_then(|out| parse_panes(&out.stdout))
+    }
 }
 
 #[cfg(test)]
@@ -135,6 +182,29 @@ mod tests {
         let out =
             "main\nwork [Created 2h ago]\nold [Created 1d ago] (EXITED - attach to resurrect)\n\n";
         assert_eq!(parse_sessions(out), vec!["main", "work"]);
+    }
+
+    #[test]
+    fn parses_pane_tabs() {
+        let out = r#"[
+            {"id":0,"is_plugin":false,"title":"zsh","tab_id":0,"tab_position":0,"tab_name":"Tab #1"},
+            {"id":0,"is_plugin":true,"title":"zj_herdr","tab_id":0,"tab_position":0,"tab_name":"Tab #1"},
+            {"id":3,"is_plugin":false,"title":"claude","tab_id":4,"tab_position":1,"tab_name":"api"},
+            {"id":5,"is_plugin":false,"title":"half a record"}
+        ]"#;
+        let panes = parse_panes(out).unwrap();
+        assert_eq!(panes.len(), 2, "{panes:?}");
+        assert_eq!(
+            panes[&0],
+            PaneTab {
+                position: 0,
+                name: "Tab #1".into()
+            }
+        );
+        assert_eq!(panes[&3].name, "api");
+        assert_eq!(panes[&3].position, 1);
+        assert_eq!(parse_panes(r#"{"panes":[]}"#), Ok(HashMap::new()));
+        assert!(parse_panes("There is no active session!").is_err());
     }
 
     #[test]

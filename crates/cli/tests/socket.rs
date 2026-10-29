@@ -3,6 +3,7 @@
 //! Connections use `UnixStream::pair()` so the protocol is tested even where
 //! binding a socket file is not allowed; `bind` itself has its own test.
 
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
@@ -16,8 +17,8 @@ use zj_herdr::registry::Registry;
 use zj_herdr::server::{self, Context};
 use zj_herdr::zellij::Zellij;
 use zj_herdr_core::{
-    Agent, AgentState, Machine, MachineStatus, Pane, PluginCommand, CMD_SCHEMA, PROMPT_ACK,
-    PROMPT_NACK,
+    Agent, AgentState, Machine, MachineStatus, Pane, PaneTab, PluginCommand, CMD_SCHEMA,
+    PROMPT_ACK, PROMPT_NACK,
 };
 
 #[derive(Default)]
@@ -53,6 +54,9 @@ impl Zellij for FakeZellij {
         self.calls.lock().unwrap().push(call);
         Ok(())
     }
+    fn panes(&self, _session: &str) -> Result<HashMap<u32, PaneTab>, String> {
+        Ok(HashMap::new())
+    }
 }
 
 fn agent(machine: &str, pid: u32, state: AgentState, pane: Option<Pane>) -> Agent {
@@ -80,10 +84,7 @@ fn machine(name: &str, agents: Vec<Agent>) -> Machine {
 }
 
 fn dev_pane() -> Option<Pane> {
-    Some(Pane {
-        session: "dev".into(),
-        pane_id: 3,
-    })
+    Some(Pane::new("dev", 3))
 }
 
 struct Daemon {

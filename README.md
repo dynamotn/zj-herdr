@@ -85,6 +85,11 @@ CLI, and the daemon serves only connections from its own uid.
   tabs (`▌` marks the active one), other sessions with the tabs that have
   agents. Agents outside Zellij and remote machines stay grouped by host
   and session. Click an agent, tab or session row to jump to it.
+  Zellij does not always describe other sessions to a plugin, so the
+  daemon also records each agent's tab: every 5 s at most, it runs
+  `zellij --session S action list-panes --json --tab` in each session
+  that has agents, and sends the result as `pane.tab`
+  (`{"position":0,"name":"api"}`, absent when unknown) in the snapshot.
 - A pinned rail (`pinned "true"` in a layout) makes itself unselectable
   once its permissions are answered, like Zellij's status bar, so closing
   the last terminal pane still closes the tab and the session.

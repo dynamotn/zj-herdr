@@ -57,10 +57,7 @@ pub fn pane_from_env<'a>(vars: impl IntoIterator<Item = (&'a str, &'a str)>) -> 
             _ => {}
         }
     }
-    Some(Pane {
-        session: session?,
-        pane_id: pane_id?,
-    })
+    Some(Pane::new(session?, pane_id?))
 }
 
 /// Pick the agent processes out of a process table.
@@ -222,10 +219,7 @@ mod tests {
     }
 
     fn pane(session: &str, id: u32) -> Option<Pane> {
-        Some(Pane {
-            session: session.into(),
-            pane_id: id,
-        })
+        Some(Pane::new(session, id))
     }
 
     #[test]

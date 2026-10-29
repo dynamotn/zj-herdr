@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use zj_herdr_core::{Agent, Machine, MachineStatus, Pane, StateV1};
+use zj_herdr_core::{Agent, Machine, MachineStatus, Pane, PaneTab, StateV1};
 
 use crate::config::Remote;
 use crate::exec;
@@ -53,7 +53,11 @@ pub fn merge_remote(remote: &Remote, stdout: &str) -> Result<Machine, String> {
             cwd: a.cwd.as_deref().map(clean),
             pane: a.pane.map(|p| Pane {
                 session: clean(&p.session),
-                ..p
+                pane_id: p.pane_id,
+                tab: p.tab.map(|t| PaneTab {
+                    name: clean(&t.name),
+                    ..t
+                }),
             }),
             session_id: a.session_id.as_deref().map(clean),
             ..a
@@ -134,10 +138,7 @@ mod tests {
                     cwd: Some("/srv/app\x1b[2J".into()),
                     state: AgentState::Blocked,
                     since: 3,
-                    pane: Some(Pane {
-                        session: "ops".into(),
-                        pane_id: 2,
-                    }),
+                    pane: Some(Pane::new("ops", 2)),
                     session_id: Some("r1".into()),
                 }],
             }],

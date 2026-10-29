@@ -219,10 +219,7 @@ mod tests {
                     AgentState::Working
                 },
                 since: 100,
-                pane: Some(Pane {
-                    session: "dev".into(),
-                    pane_id: pid,
-                }),
+                pane: Some(Pane::new("dev", pid)),
                 session_id: None,
             })
             .collect();

@@ -97,6 +97,27 @@ impl FromStr for AgentState {
 pub struct Pane {
     pub session: String,
     pub pane_id: u32,
+    /// The tab holding the pane, as the daemon last saw it; `None` when
+    /// unknown (an older daemon, or Zellij did not answer).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tab: Option<PaneTab>,
+}
+
+impl Pane {
+    pub fn new(session: impl Into<String>, pane_id: u32) -> Self {
+        Pane {
+            session: session.into(),
+            pane_id,
+            tab: None,
+        }
+    }
+}
+
+/// A Zellij tab, by 0-based position and name.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct PaneTab {
+    pub position: usize,
+    pub name: String,
 }
 
 /// One agent process.
@@ -268,6 +289,10 @@ mod tests {
                         pane: Some(Pane {
                             session: "main".into(),
                             pane_id: 3,
+                            tab: Some(PaneTab {
+                                position: 1,
+                                name: "work".into(),
+                            }),
                         }),
                         session_id: Some("abc".into()),
                     }],
@@ -310,6 +335,18 @@ mod tests {
         let agent = state.agents().next().unwrap();
         assert_eq!(agent.pane, None);
         assert_eq!(state.machines[0].status, MachineStatus::Ok);
+    }
+
+    #[test]
+    fn old_snapshots_without_tabs_still_parse() {
+        let json = r#"{"schema":"zj_herdr.state.v1","generated_at":1,"machines":[
+            {"name":"m","agents":[{"id":"m/1","machine":"m","kind":"claude","pid":1,
+            "state":"idle","since":0,"pane":{"session":"dev","pane_id":4}}]}]}"#;
+        let state = StateV1::from_json(json).unwrap();
+        let agent = state.agents().next().unwrap();
+        assert_eq!(agent.pane, Some(Pane::new("dev", 4)));
+        // And a pane without a tab is written the old way.
+        assert!(!state.to_json().contains("\"tab\""));
     }
 
     #[test]

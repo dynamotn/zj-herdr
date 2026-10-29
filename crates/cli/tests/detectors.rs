@@ -269,10 +269,7 @@ fn scanner_tracks_cpu_history_between_scans() {
     );
 
     let mut shell = raw(100, 1, &["zsh"], 0.0);
-    shell.pane = Some(Pane {
-        session: "dev".into(),
-        pane_id: 4,
-    });
+    shell.pane = Some(Pane::new("dev", 4));
     let mut agent = raw(101, 100, &["claude"], 0.5);
     agent.cwd = Some("/work/proj".into());
     let tool = raw(102, 101, &["cargo"], 90.0);
@@ -280,13 +277,7 @@ fn scanner_tracks_cpu_history_between_scans() {
     let first = scanner.scan_from(&[shell.clone(), agent.clone(), tool], T0);
     let a = &first.agents[0];
     assert_eq!((a.id.as_str(), a.state), ("box/101", AgentState::Working));
-    assert_eq!(
-        a.pane,
-        Some(Pane {
-            session: "dev".into(),
-            pane_id: 4
-        })
-    );
+    assert_eq!(a.pane, Some(Pane::new("dev", 4)));
     assert_eq!(a.session_id.as_deref(), Some("s1"));
 
     // Tool finished, permission prompt for the next one: quiet for 3s only.

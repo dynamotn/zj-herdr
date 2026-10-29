@@ -22,6 +22,9 @@ pub trait Processes: Send + Sync {
     /// Whether `agent.pid` still runs that agent, not a process that took
     /// over its pid.
     fn is_agent(&self, agent: &Agent) -> bool;
+    /// Child processes of the agent's own kind: the native helper a script
+    /// launcher (`node .../codex`) runs, which must exit too.
+    fn helpers(&self, agent: &Agent) -> Vec<u32>;
     /// Send SIGTERM.
     fn terminate(&self, pid: u32) -> Result<(), String>;
     fn alive(&self, pid: u32) -> bool;
@@ -29,16 +32,35 @@ pub trait Processes: Send + Sync {
 
 pub struct SystemProcesses;
 
-/// Whether a process is the agent: of the agent's kind, in its cwd (when
-/// known), and outside Zellij like it.
+fn kind_of(proc: &RawProc) -> Option<&'static str> {
+    agents::identify(&proc.name, proc.exe.as_deref(), &proc.argv).map(|s| s.kind)
+}
+
+/// Whether a process is the agent: of the agent's kind, in its cwd, and
+/// outside Zellij like it. An agent with no known cwd never matches.
 pub fn is_same_agent(agent: &Agent, proc: &RawProc) -> bool {
-    let kind = agents::identify(&proc.name, proc.exe.as_deref(), &proc.argv).map(|s| s.kind);
-    kind == Some(agent.kind.as_str())
+    kind_of(proc) == Some(agent.kind.as_str())
         && agent
             .cwd
             .as_deref()
-            .is_none_or(|cwd| proc.cwd.as_deref() == Some(Path::new(cwd)))
+            .is_some_and(|cwd| proc.cwd.as_deref() == Some(Path::new(cwd)))
         && proc.pane.is_none()
+}
+
+/// Never init, this process, or a pid that `kill(2)` would read as a
+/// process group (0, or negative once cast).
+pub fn may_signal(pid: u32) -> bool {
+    pid > 1 && pid != std::process::id() && libc::pid_t::try_from(pid).is_ok()
+}
+
+/// Children of `agent.pid` of the agent's kind.
+pub fn same_kind_children(agent: &Agent, table: &[RawProc]) -> Vec<u32> {
+    table
+        .iter()
+        .filter(|p| p.ppid == Some(agent.pid) && p.pid != agent.pid)
+        .filter(|p| kind_of(p) == Some(agent.kind.as_str()))
+        .map(|p| p.pid)
+        .collect()
 }
 
 impl Processes for SystemProcesses {
@@ -46,7 +68,14 @@ impl Processes for SystemProcesses {
         procs::snapshot(agent.pid).is_some_and(|p| is_same_agent(agent, &p))
     }
 
+    fn helpers(&self, agent: &Agent) -> Vec<u32> {
+        same_kind_children(agent, &procs::ProcessTable::new().sample())
+    }
+
     fn terminate(&self, pid: u32) -> Result<(), String> {
+        if !may_signal(pid) {
+            return Err(format!("refusing to stop pid {pid}"));
+        }
         let pid = libc::pid_t::try_from(pid).map_err(|_| format!("bad pid {pid}"))?;
         // SAFETY: kill(2) takes plain integers.
         if unsafe { libc::kill(pid, libc::SIGTERM) } == 0 {
@@ -70,8 +99,10 @@ impl Processes for SystemProcesses {
 }
 
 /// Stop `agent` (a local agent outside Zellij) and resume its session in a
-/// new pane of Zellij session `session`, in its cwd. Nothing is spawned
-/// unless the agent has exited within `timeout`. Returns the command run.
+/// new pane of Zellij session `session`, in its cwd. Nothing is stopped
+/// unless the session is running, and nothing is spawned unless the agent
+/// (and its native helper, if any) exited within `timeout`. Returns the
+/// command run.
 pub fn adopt(
     agent: &Agent,
     session: &str,
@@ -89,17 +120,26 @@ pub fn adopt(
         .session_id
         .as_deref()
         .ok_or_else(|| format!("{} has no known session to resume", agent.id))?;
+    let cwd = agent
+        .cwd
+        .as_deref()
+        .ok_or_else(|| format!("{} has no known cwd to resume in", agent.id))?;
     let argv = agents::resume_command(&agent.kind, session_id)
         .ok_or_else(|| format!("{} has no resume command", agent.kind))?;
+    if !zellij.sessions()?.iter().any(|s| s == session) {
+        return Err(format!("no running Zellij session {session:?}"));
+    }
     if !procs.is_agent(agent) {
         return Err(format!(
             "pid {} is no longer {} ({})",
             agent.pid, agent.id, agent.kind
         ));
     }
+    let mut pids = vec![agent.pid];
+    pids.extend(procs.helpers(agent));
     procs.terminate(agent.pid)?;
     let deadline = Instant::now() + timeout;
-    while procs.alive(agent.pid) {
+    while pids.iter().any(|&pid| procs.alive(pid)) {
         if Instant::now() >= deadline {
             return Err(format!(
                 "{} did not exit within {}s of SIGTERM; nothing was opened",
@@ -109,7 +149,13 @@ pub fn adopt(
         }
         thread::sleep(POLL);
     }
-    zellij.run(session, agent.cwd.as_deref(), &argv)?;
+    zellij.run(session, Some(cwd), &argv).map_err(|e| {
+        format!(
+            "{} stopped, but reopening it failed ({e}); resume it with `{}` in {cwd}",
+            agent.id,
+            argv.join(" ")
+        )
+    })?;
     Ok(argv)
 }
 
@@ -128,7 +174,7 @@ mod tests {
 
     impl Zellij for FakeZellij {
         fn sessions(&self) -> Result<Vec<String>, String> {
-            Ok(vec![])
+            Ok(vec!["dev".into()])
         }
         fn pipe(&self, _: &str, _: &str, _: &str) -> Result<(), String> {
             Ok(())
@@ -147,11 +193,13 @@ mod tests {
     }
 
     /// A process that is (or is not) the agent, and exits on SIGTERM after
-    /// `exits_after` checks (never, when `None`).
+    /// `exits_after` checks (never, when `None`); its helper, if any, after
+    /// its own count.
     struct FakeProcs {
         is_agent: bool,
         exits_after: Option<u32>,
-        checks: Mutex<u32>,
+        helper: Option<(u32, Option<u32>)>,
+        checks: Mutex<HashMap<u32, u32>>,
         signals: Mutex<Vec<u32>>,
     }
 
@@ -160,7 +208,8 @@ mod tests {
             FakeProcs {
                 is_agent,
                 exits_after,
-                checks: Mutex::new(0),
+                helper: None,
+                checks: Mutex::new(HashMap::new()),
                 signals: Mutex::new(vec![]),
             }
         }
@@ -170,14 +219,22 @@ mod tests {
         fn is_agent(&self, _: &Agent) -> bool {
             self.is_agent
         }
+        fn helpers(&self, _: &Agent) -> Vec<u32> {
+            self.helper.iter().map(|(pid, _)| *pid).collect()
+        }
         fn terminate(&self, pid: u32) -> Result<(), String> {
             self.signals.lock().unwrap().push(pid);
             Ok(())
         }
-        fn alive(&self, _: u32) -> bool {
+        fn alive(&self, pid: u32) -> bool {
             let mut checks = self.checks.lock().unwrap();
-            *checks += 1;
-            self.exits_after.is_none_or(|n| *checks <= n)
+            let n = checks.entry(pid).or_default();
+            *n += 1;
+            let limit = match self.helper {
+                Some((helper, limit)) if helper == pid => limit,
+                _ => self.exits_after,
+            };
+            limit.is_none_or(|limit| *n <= limit)
         }
     }
 
@@ -248,6 +305,14 @@ mod tests {
                 true,
                 "no resume command",
             ),
+            (
+                Agent {
+                    cwd: None,
+                    ..outside()
+                },
+                true,
+                "no known cwd",
+            ),
             (outside(), false, "no longer"),
         ];
         for (agent, is_agent, want) in cases {
@@ -256,7 +321,47 @@ mod tests {
             assert!(err.contains(want), "{err}");
             assert!(procs.signals.lock().unwrap().is_empty());
         }
+        // A mistyped session: the agent is left running.
+        let procs = FakeProcs::new(true, Some(0));
+        let err = adopt(&outside(), "deev", &zellij, &procs, SHORT).unwrap_err();
+        assert!(err.contains("no running Zellij session"), "{err}");
+        assert!(procs.signals.lock().unwrap().is_empty());
         assert!(zellij.runs.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn waits_for_the_native_helper_too() {
+        let zellij = FakeZellij::default();
+        let mut procs = FakeProcs::new(true, Some(0));
+        procs.helper = Some((43, None));
+        let err = adopt(&outside(), "dev", &zellij, &procs, SHORT).unwrap_err();
+        assert!(err.contains("did not exit"), "{err}");
+        assert!(zellij.runs.lock().unwrap().is_empty());
+        assert_eq!(*procs.signals.lock().unwrap(), [42], "only the agent");
+
+        let mut procs = FakeProcs::new(true, Some(0));
+        procs.helper = Some((43, Some(3)));
+        adopt(&outside(), "dev", &zellij, &procs, SHORT).unwrap();
+        assert_eq!(zellij.runs.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn finds_native_helpers_of_the_same_kind() {
+        let raw = |pid, ppid, name: &str| RawProc {
+            pid,
+            ppid: Some(ppid),
+            name: name.into(),
+            argv: vec![name.into()],
+            ..RawProc::default()
+        };
+        let table = [
+            raw(42, 1, "claude"),
+            raw(43, 42, "claude"),
+            raw(44, 42, "cargo"),
+            raw(45, 43, "claude"),
+            raw(46, 7, "claude"),
+        ];
+        assert_eq!(same_kind_children(&outside(), &table), [43]);
     }
 
     #[test]
@@ -283,8 +388,22 @@ mod tests {
         assert!(!is_same_agent(&agent, &elsewhere));
         let in_zellij = RawProc {
             pane: Some(Pane::new("dev", 1)),
-            ..proc
+            ..proc.clone()
         };
         assert!(!is_same_agent(&agent, &in_zellij));
+        let unknown_cwd = Agent {
+            cwd: None,
+            ..outside()
+        };
+        assert!(!is_same_agent(&unknown_cwd, &proc));
+    }
+
+    #[test]
+    fn never_signals_init_itself_or_a_process_group() {
+        assert!(!may_signal(0));
+        assert!(!may_signal(1));
+        assert!(!may_signal(std::process::id()));
+        assert!(!may_signal(u32::MAX), "would be -1: every process");
+        assert!(may_signal(4242));
     }
 }

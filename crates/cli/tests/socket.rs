@@ -100,6 +100,9 @@ impl Processes for FakeProcs {
     fn is_agent(&self, _: &Agent) -> bool {
         true
     }
+    fn helpers(&self, _: &Agent) -> Vec<u32> {
+        vec![]
+    }
     fn terminate(&self, pid: u32) -> Result<(), String> {
         self.stopped.lock().unwrap().push(pid);
         Ok(())
@@ -126,6 +129,7 @@ impl Daemon {
             plugin: "zj_herdr".into(),
             procs: Arc::new(FakeProcs::default()),
             adopt_timeout: Duration::from_millis(200),
+            adopting: Default::default(),
         });
         Daemon {
             registry,
@@ -406,6 +410,11 @@ fn adopt_moves_an_outside_agent_into_the_session() {
     assert_eq!(d.last_call(), "run dev Some(\"/w\") claude --resume abc");
 
     let calls = d.fake.calls.lock().unwrap().len();
+    // A second request while the first is still moving it.
+    d.ctx.adopting.lock().unwrap().insert(10);
+    let err = d.request(adopt("box/10")).unwrap_err();
+    assert!(err.contains("already being moved"), "{err}");
+    d.ctx.adopting.lock().unwrap().clear();
     let err = d.request(adopt("box/11")).unwrap_err();
     assert!(err.contains("already runs in Zellij"), "{err}");
     let err = d.request(adopt("far/12")).unwrap_err();

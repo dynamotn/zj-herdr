@@ -1,12 +1,13 @@
 //! The Unix socket server.
 
+use std::collections::HashSet;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -29,6 +30,9 @@ pub struct Context {
     pub procs: Arc<dyn Processes>,
     /// How long `adopt` waits for an agent to exit.
     pub adopt_timeout: Duration,
+    /// Pids an `adopt` is moving now; a second request for one is refused,
+    /// so a double click never opens the agent twice.
+    pub adopting: Mutex<HashSet<u32>>,
 }
 
 /// Bind the socket with mode 0600 in a directory others cannot tamper
@@ -268,14 +272,19 @@ fn adopt_agent(ctx: &Context, selector: &str, session: &str) -> Result<Agent, St
             agent.id, agent.machine
         ));
     }
-    adopt::adopt(
+    let lock = || ctx.adopting.lock().unwrap_or_else(|e| e.into_inner());
+    if !lock().insert(agent.pid) {
+        return Err(format!("{} is already being moved", agent.id));
+    }
+    let result = adopt::adopt(
         &agent,
         session,
         ctx.zellij.as_ref(),
         ctx.procs.as_ref(),
         ctx.adopt_timeout,
-    )?;
-    Ok(agent)
+    );
+    lock().remove(&agent.pid);
+    result.map(|_| agent)
 }
 
 fn prompt(ctx: &Context, selector: &str, mut text: String, submit: bool) -> Result<(), String> {

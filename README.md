@@ -175,12 +175,14 @@ zj-herdr restore [--session S] [--dry-run [--json]]
 zj-herdr adopt <agent> --session S      # move an agent from outside Zellij into S
 ```
 
-`adopt` works on a local agent running outside Zellij whose session id is
-known and whose kind has a resume command (`claude`, `codex`). The daemon
-checks that the pid still runs that agent, sends it SIGTERM, waits up to
-5 s for it to exit (and fails without opening anything if it does not),
-then opens `claude --resume <id>` or `codex resume <id>` in a new pane of
-session S, in the agent's cwd.
+`adopt` works on a local agent running outside Zellij whose session id and
+cwd are known and whose kind has a resume command (`claude`, `codex`). The
+daemon checks that session S is running and that the pid still runs that
+agent (same kind and cwd, outside Zellij), sends it SIGTERM, waits up to
+5 s for it and any native helper of its own kind to exit (and fails
+without opening anything if they do not), then opens `claude --resume
+<id>` or `codex resume <id>` in a new pane of S, in the agent's cwd. A
+second `adopt` of the same agent while one is under way is refused.
 
 `<agent>` is an id (`machine/pid`), a pid, or `session:pane_id`. `wait`
 exits 1 on timeout, so an agent can wait for another to need attention:

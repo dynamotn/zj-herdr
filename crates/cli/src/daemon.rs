@@ -102,6 +102,7 @@ pub fn run(opts: Options) -> Result<(), String> {
         plugin: opts.plugin.clone(),
         procs: Arc::new(SystemProcesses),
         adopt_timeout: ADOPT_TIMEOUT,
+        adopting: Default::default(),
     });
     eprintln!("zj-herdr: listening on {}", opts.socket.display());
 

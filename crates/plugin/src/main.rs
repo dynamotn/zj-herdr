@@ -536,15 +536,9 @@ impl Plugin {
         };
         self.restore_checked = true;
         let context = BTreeMap::from([(RESTORE_CHECK_CONTEXT.to_string(), session.clone())]);
+        let flag = format!("--session={session}");
         run_command(
-            &[
-                self.bin.as_str(),
-                "restore",
-                "--session",
-                &session,
-                "--dry-run",
-                "--json",
-            ],
+            &[self.bin.as_str(), "restore", &flag, "--dry-run", "--json"],
             context,
         );
     }
@@ -558,10 +552,8 @@ impl Plugin {
         };
         self.restorable = 0;
         let context = BTreeMap::from([(RESTORE_CONTEXT.to_string(), session.clone())]);
-        run_command(
-            &[self.bin.as_str(), "restore", "--session", &session],
-            context,
-        );
+        let flag = format!("--session={session}");
+        run_command(&[self.bin.as_str(), "restore", &flag], context);
     }
 
     /// Whether `agent` can be moved into this session: a local agent
@@ -605,10 +597,9 @@ impl Plugin {
                     return;
                 };
                 let context = BTreeMap::from([(ADOPT_CONTEXT.to_string(), id.clone())]);
-                run_command(
-                    &[self.bin.as_str(), "adopt", &id, "--session", &session],
-                    context,
-                );
+                // Ids and names come from pipes: never let one read as a flag.
+                let session = format!("--session={session}");
+                run_command(&[self.bin.as_str(), "adopt", &session, "--", &id], context);
             }
         }
     }

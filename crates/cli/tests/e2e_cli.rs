@@ -124,11 +124,22 @@ fn scan_prints_this_machine_as_json_and_as_a_table() {
     assert!(state.machines[0].ssh.is_none());
     let out = env.run(&["scan"]);
     assert!(out.status.success());
-    assert!(
-        stdout(&out).contains(&state.machines[0].name),
-        "{}",
-        stdout(&out)
-    );
+    let header: Vec<_> = stdout(&out)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .split_whitespace()
+        .map(String::from)
+        .collect();
+    assert_eq!(header[..2], ["ID", "STATE"], "{}", stdout(&out));
+    // The name only shows in agent ids, and a CI runner has no agents.
+    if !state.machines[0].agents.is_empty() {
+        assert!(
+            stdout(&out).contains(&state.machines[0].name),
+            "{}",
+            stdout(&out)
+        );
+    }
 }
 
 #[test]

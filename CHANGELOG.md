@@ -6,6 +6,11 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- A `zj-herdr list` sent just as the daemon starts waits for its first scan
+  instead of answering without this machine.
+
 ## [0.3.0] - 2026-10-29
 
 ### Added

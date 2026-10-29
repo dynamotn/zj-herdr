@@ -137,7 +137,6 @@ pub fn run(opts: Options) -> Result<(), String> {
     });
     eprintln!("zj-herdr: listening on {}", opts.socket.display());
 
-    thread::spawn(move || server::serve(listener, ctx));
     {
         let registry = Arc::clone(&registry);
         let zellij = Arc::clone(&zellij);
@@ -155,8 +154,7 @@ pub fn run(opts: Options) -> Result<(), String> {
         thread::spawn(move || tab_loop(&tabs, zellij.as_ref()));
     }
     let mut scanner = Scanner::new(opts.machine, &opts.roots);
-    loop {
-        let started = Instant::now();
+    let mut scan = || {
         let mut machine = scanner.scan();
         lock(&tabs).apply(&mut machine.agents);
         if store.record(&machine.agents, now_secs()) {
@@ -165,7 +163,17 @@ pub fn run(opts: Options) -> Result<(), String> {
             }
         }
         registry.publish(machine, now_secs());
+    };
+
+    // Serve only once this machine is published, so a client connecting at
+    // startup (it waits in the socket backlog meanwhile) never sees it absent.
+    let mut started = Instant::now();
+    scan();
+    thread::spawn(move || server::serve(listener, ctx));
+    loop {
         thread::sleep(SCAN_INTERVAL.saturating_sub(started.elapsed()));
+        started = Instant::now();
+        scan();
     }
 }
 

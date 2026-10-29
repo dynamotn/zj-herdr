@@ -7,7 +7,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use zj_herdr_core::{Agent, AgentState};
+use zj_herdr_core::{Agent, AgentState, RestorePane, RestorePreview};
 
 use crate::agents;
 
@@ -56,6 +56,21 @@ impl Default for Store {
 pub struct Plan {
     pub record: Record,
     pub argv: Vec<String>,
+}
+
+/// What `restore --dry-run --json` prints for `plans`.
+pub fn preview(plans: &[Plan]) -> RestorePreview {
+    RestorePreview::new(
+        plans
+            .iter()
+            .map(|p| RestorePane {
+                session: p.record.session.clone(),
+                pane_id: p.record.pane_id,
+                cwd: p.record.cwd.clone(),
+                command: p.argv.clone(),
+            })
+            .collect(),
+    )
 }
 
 impl Store {
@@ -324,6 +339,49 @@ mod tests {
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
         assert!(result.is_err(), "started over an unreadable store");
         assert_eq!(fs::read_to_string(&path).unwrap(), "{ not json");
+    }
+
+    #[test]
+    fn a_second_restore_reopens_nothing_already_running() {
+        // Two rails offer the same restore; the second click must not open
+        // every agent twice. Once the first restore's agents run (the
+        // daemon reports their session ids), the plan is empty.
+        let mut store = Store::default();
+        store.record(
+            &[
+                agent(1, "claude", "dev", 1, Some("c1"), AgentState::Idle),
+                agent(2, "codex", "dev", 2, Some("r1"), AgentState::Idle),
+            ],
+            0,
+        );
+        let (first, _) = store.plan(Some("dev"), &[]);
+        assert_eq!(preview(&first).count, 2);
+        let reopened = [
+            agent(11, "claude", "dev", 7, Some("c1"), AgentState::Idle),
+            agent(12, "codex", "dev", 8, Some("r1"), AgentState::Working),
+        ];
+        let (second, skipped) = store.plan(Some("dev"), &reopened);
+        assert!(second.is_empty(), "{second:?}");
+        assert_eq!(preview(&second), RestorePreview::default());
+        assert!(skipped.iter().all(|s| s.contains("already running")));
+    }
+
+    #[test]
+    fn previews_list_what_would_be_reopened() {
+        let mut store = Store::default();
+        store.record(
+            &[agent(1, "claude", "dev", 1, Some("c1"), AgentState::Idle)],
+            0,
+        );
+        let (plans, _) = store.plan(None, &[]);
+        let p = preview(&plans);
+        assert_eq!(p.count, 1);
+        assert_eq!(p.panes[0].command, ["claude", "--resume", "c1"]);
+        assert_eq!(p.panes[0].cwd.as_deref(), Some("/w/1"));
+        assert_eq!(
+            (p.panes[0].session.as_str(), p.panes[0].pane_id),
+            ("dev", 1)
+        );
     }
 
     #[test]

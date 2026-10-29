@@ -254,6 +254,41 @@ impl StateV1 {
     }
 }
 
+/// One pane `zj-herdr restore` would reopen.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestorePane {
+    pub session: String,
+    pub pane_id: u32,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    pub command: Vec<String>,
+}
+
+/// `zj-herdr restore --dry-run --json`: what a restore would reopen.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct RestorePreview {
+    pub count: usize,
+    #[serde(default)]
+    pub panes: Vec<RestorePane>,
+}
+
+impl RestorePreview {
+    pub fn new(panes: Vec<RestorePane>) -> Self {
+        RestorePreview {
+            count: panes.len(),
+            panes,
+        }
+    }
+
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(self).expect("preview serializes")
+    }
+
+    pub fn from_json(text: &str) -> Result<Self, WireError> {
+        serde_json::from_str(text.trim()).map_err(|e| WireError::Json(e.to_string()))
+    }
+}
+
 /// Compact elapsed time: `42s`, `5m`, `3h`, `2d`.
 pub fn fmt_elapsed(secs: u64) -> String {
     match secs {
@@ -356,6 +391,24 @@ mod tests {
         assert_eq!(agent.pane, Some(Pane::new("dev", 4)));
         // And a pane without a tab is written the old way.
         assert!(!state.to_json().contains("\"tab\""));
+    }
+
+    #[test]
+    fn restore_preview_round_trips() {
+        let preview = RestorePreview::new(vec![RestorePane {
+            session: "dev".into(),
+            pane_id: 3,
+            cwd: Some("/w".into()),
+            command: vec!["claude".into(), "--resume".into(), "abc".into()],
+        }]);
+        let json = preview.to_json();
+        assert!(json.starts_with(r#"{"count":1,"#), "{json}");
+        assert_eq!(RestorePreview::from_json(&format!("{json}\n")), Ok(preview));
+        assert_eq!(
+            RestorePreview::from_json(r#"{"count":0}"#).map(|p| p.count),
+            Ok(0)
+        );
+        assert!(RestorePreview::from_json("would reopen dev:3").is_err());
     }
 
     #[test]

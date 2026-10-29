@@ -6,7 +6,7 @@ use zj_herdr::api::{CommandLine, Event, Request};
 use zj_herdr::config::Config;
 use zj_herdr::detect::Roots;
 use zj_herdr::scan::{local_machine_name, now_secs, Scanner};
-use zj_herdr::sessions::Store;
+use zj_herdr::sessions::{self, Store};
 use zj_herdr::zellij::{Zellij, ZellijCli};
 use zj_herdr::{client, daemon, output, paths};
 use zj_herdr_core::{Agent, AgentState, StateV1};
@@ -98,6 +98,9 @@ enum Command {
         /// Print what would be reopened without doing it.
         #[arg(long)]
         dry_run: bool,
+        /// With --dry-run: print `{"count":N,"panes":[...]}` instead.
+        #[arg(long, requires = "dry_run")]
+        json: bool,
     },
 }
 
@@ -118,11 +121,20 @@ fn live_local_agents(socket: &std::path::Path) -> Vec<Agent> {
     }
 }
 
-fn restore(socket: &std::path::Path, session: Option<&str>, dry_run: bool) -> Result<(), String> {
+fn restore(
+    socket: &std::path::Path,
+    session: Option<&str>,
+    dry_run: bool,
+    json: bool,
+) -> Result<(), String> {
     let store = Store::load(&paths::state_dir().join("sessions.json"))?;
     let (plans, skipped) = store.plan(session, &live_local_agents(socket));
     for note in skipped {
         eprintln!("zj-herdr: skip {note}");
+    }
+    if dry_run && json {
+        println!("{}", sessions::preview(&plans).to_json());
+        return Ok(());
     }
     if plans.is_empty() {
         eprintln!("zj-herdr: nothing to restore");
@@ -284,7 +296,11 @@ fn run(cli: Cli) -> Result<(), String> {
                 );
             }
         }
-        Command::Restore { session, dry_run } => restore(&socket, session.as_deref(), dry_run)?,
+        Command::Restore {
+            session,
+            dry_run,
+            json,
+        } => restore(&socket, session.as_deref(), dry_run, json)?,
     }
     Ok(())
 }

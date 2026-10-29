@@ -172,6 +172,28 @@ fn claude_resume_flag_selects_its_transcript() {
 }
 
 #[test]
+fn claude_just_resumed_reports_its_session_before_writing() {
+    // `restore` reopened `resumed`, last written before the process started.
+    let tmp = tempfile::tempdir().unwrap();
+    install_claude(tmp.path(), "/work/proj", "turn-ended", "resumed", T0 - 100);
+    install_claude(tmp.path(), "/work/proj", "pending-tool", "older", T0 - 200);
+    let detector = ClaudeDetector::new(tmp.path().to_path_buf());
+    let mut p = proc("claude", "/work/proj", T0 + 30, 0.0);
+    p.start_time = T0;
+    p.argv = vec!["claude".into(), "--resume".into(), "resumed".into()];
+    let status = detector.detect(&p).unwrap();
+    assert_eq!(status.session_id.as_deref(), Some("resumed"));
+    assert_eq!(status.state, AgentState::Idle);
+
+    // Once it has moved on to a new file (`/clear`), that file is its own.
+    install_claude(tmp.path(), "/work/proj", "pending-tool", "cleared", T0 + 10);
+    let status = ClaudeDetector::new(tmp.path().to_path_buf())
+        .detect(&p)
+        .unwrap();
+    assert_eq!(status.session_id.as_deref(), Some("cleared"));
+}
+
+#[test]
 fn claude_without_transcript_defers_to_process_signals() {
     let tmp = tempfile::tempdir().unwrap();
     let detectors: Vec<Box<dyn Detector>> =

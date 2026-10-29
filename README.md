@@ -111,7 +111,8 @@ CLI, and the daemon serves only connections from its own uid.
 
 The plugin asks for permission to read and change application state, write
 to panes (for `prompt`), read CLI pipes, and run commands (to fetch the
-first snapshot with `zj-herdr list --json`, and for `zj-herdr adopt`).
+first snapshot with `zj-herdr list --json`, and for `zj-herdr adopt` and
+`zj-herdr restore`).
 Plugin options:
 
 | Option | Default | Meaning |
@@ -170,7 +171,7 @@ zj-herdr wait <agent> <state> [--timeout S]
 zj-herdr prompt <agent> <text...> [--no-enter]
 zj-herdr spawn --session S [--cwd DIR] -- <command...>
 zj-herdr watch [--json]                # stream state changes
-zj-herdr restore [--session S] [--dry-run]
+zj-herdr restore [--session S] [--dry-run [--json]]
 zj-herdr adopt <agent> --session S      # move an agent from outside Zellij into S
 ```
 
@@ -237,6 +238,16 @@ The daemon records, per pane, the agent kind, cwd and agent session id in
 `zj-herdr restore --session S` opens a pane per record running
 `claude --resume <id>` or `codex resume <id>` in its cwd, skipping sessions
 that are already running. Layout is left to Zellij's session resurrection.
+`zj-herdr restore --session S --dry-run --json` prints what it would
+reopen as `{"count":N,"panes":[{"session","pane_id","cwd","command"}]}`.
+
+The plugin offers this itself: once permitted (and again whenever it is
+shown), each instance runs that dry run for its own session, and when it
+would reopen anything, shows `↻ restore N agents` under the header.
+Clicking it runs `zj-herdr restore --session S` and hides the banner.
+Since `restore` skips agent sessions that are already running (a resumed
+Claude counts from the moment it starts), clicking the banner of another
+tab's rail afterwards opens nothing twice.
 
 ## Development
 

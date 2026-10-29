@@ -11,8 +11,8 @@ use ui::Target;
 use zellij_tile::prelude::*;
 use zj_herdr_core::view::{SessionLayout, TabLayout};
 use zj_herdr_core::{
-    view, Agent, AgentState, PluginCommand, StateV1, CMD_SCHEMA, PROMPT_ACK, PROMPT_NACK,
-    STATE_SCHEMA,
+    view, Agent, AgentState, PluginCommand, RestorePreview, StateV1, CMD_SCHEMA, PROMPT_ACK,
+    PROMPT_NACK, STATE_SCHEMA,
 };
 
 mod ui;
@@ -23,6 +23,10 @@ const TICK_SECS: f64 = 1.0;
 const FETCH_CONTEXT: &str = "zj_herdr_fetch";
 /// Marks the `run_command` of `zj-herdr adopt`.
 const ADOPT_CONTEXT: &str = "zj_herdr_adopt";
+/// Marks the `run_command` of `zj-herdr restore --dry-run --json`.
+const RESTORE_CHECK_CONTEXT: &str = "zj_herdr_restore_check";
+/// Marks the `run_command` of `zj-herdr restore`.
+const RESTORE_CONTEXT: &str = "zj_herdr_restore";
 /// How long a first click on an agent outside Zellij waits for the second.
 const ARM_SECS: u64 = 5;
 /// `sh -c` script for `start_daemon`; `$1` is the zj-herdr binary.
@@ -80,6 +84,11 @@ struct Plugin {
     given_names: BTreeMap<usize, String>,
     /// Agent outside Zellij clicked once, and when (Unix seconds).
     armed: Option<(String, u64)>,
+    /// Agents `zj-herdr restore` would reopen in this session, from the
+    /// last dry run.
+    restorable: usize,
+    /// A dry run was started since permissions and the session were known.
+    restore_checked: bool,
 }
 
 register_plugin!(Plugin);
@@ -128,6 +137,9 @@ impl ZellijPlugin for Plugin {
         match event {
             Event::ModeUpdate(info) => {
                 self.session = info.session_name;
+                if !self.restore_checked {
+                    self.check_restore();
+                }
                 false
             }
             Event::PaneUpdate(manifest) => {
@@ -157,7 +169,9 @@ impl ZellijPlugin for Plugin {
             }
             Event::Visible(visible) => {
                 self.visible = visible;
-                if !visible {
+                if visible {
+                    self.check_restore();
+                } else {
                     self.in_use = false;
                 }
                 visible
@@ -181,6 +195,7 @@ impl ZellijPlugin for Plugin {
                 // Do not wait up to a heartbeat for the first push.
                 let context = BTreeMap::from([(FETCH_CONTEXT.to_string(), String::new())]);
                 run_command(&[self.bin.as_str(), "list", "--json"], context);
+                self.check_restore();
                 for (pipe, pane_id, text) in std::mem::take(&mut self.queued_prompts) {
                     self.prompt(pipe, pane_id, text);
                 }
@@ -211,12 +226,24 @@ impl ZellijPlugin for Plugin {
                 if context.contains_key(ADOPT_CONTEXT) =>
             {
                 if code != Some(0) {
-                    let stderr = String::from_utf8_lossy(&stderr);
-                    let reason = stderr.lines().last().unwrap_or("zj-herdr adopt failed");
-                    let reason = reason.trim().chars().filter(|c| !c.is_control());
-                    self.error = Some(reason.collect());
+                    self.error = Some(command_error(&stderr, "zj-herdr adopt failed"));
                 }
                 true
+            }
+            Event::RunCommandResult(code, stdout, stderr, context) => {
+                if let Some(session) = context.get(RESTORE_CHECK_CONTEXT) {
+                    // An answer for a session this instance has since left
+                    // says nothing about this one.
+                    if Some(session) == self.session.as_ref() {
+                        self.restorable = restore_count(&stdout);
+                    }
+                    return true;
+                }
+                if context.contains_key(RESTORE_CONTEXT) && code != Some(0) {
+                    self.error = Some(command_error(&stderr, "zj-herdr restore failed"));
+                    return true;
+                }
+                false
             }
             Event::Key(key) => self.on_key(key),
             _ => false,
@@ -300,6 +327,7 @@ impl ZellijPlugin for Plugin {
             selected: self.selected.as_deref(),
             error: self.error.as_deref(),
             armed: self.armed_now(now),
+            restore: self.restorable,
             now,
         };
         let (lines, targets) = ui::render(frame, &tree, (rows, cols));
@@ -499,6 +527,43 @@ impl Plugin {
         }
     }
 
+    /// Ask `zj-herdr restore --dry-run --json` how many agents a restore
+    /// would reopen here, for the banner. Needs the permissions and the
+    /// session name.
+    fn check_restore(&mut self) {
+        let Some(session) = self.session.clone().filter(|_| self.permitted) else {
+            return;
+        };
+        self.restore_checked = true;
+        let context = BTreeMap::from([(RESTORE_CHECK_CONTEXT.to_string(), session.clone())]);
+        run_command(
+            &[
+                self.bin.as_str(),
+                "restore",
+                "--session",
+                &session,
+                "--dry-run",
+                "--json",
+            ],
+            context,
+        );
+    }
+
+    /// Reopen this session's recorded agents. `restore` skips agent
+    /// sessions already running, so another rail's banner clicked after
+    /// this one opens nothing twice.
+    fn restore(&mut self) {
+        let Some(session) = self.session.clone() else {
+            return;
+        };
+        self.restorable = 0;
+        let context = BTreeMap::from([(RESTORE_CONTEXT.to_string(), session.clone())]);
+        run_command(
+            &[self.bin.as_str(), "restore", "--session", &session],
+            context,
+        );
+    }
+
     /// Whether `agent` can be moved into this session: a local agent
     /// outside Zellij with a session to resume.
     fn adoptable(&self, agent: &Agent) -> bool {
@@ -565,6 +630,7 @@ impl Plugin {
                 }
             }
             Target::Session(name) => switch_session(Some(&name)),
+            Target::Restore => self.restore(),
         }
         true
     }
@@ -663,6 +729,23 @@ impl Plugin {
             switch_session_with_focus(&pane.session, None, Some((pane.pane_id, false)));
         }
     }
+}
+
+/// The last line a failed command wrote, without control characters.
+fn command_error(stderr: &[u8], fallback: &str) -> String {
+    let stderr = String::from_utf8_lossy(stderr);
+    let reason = stderr.lines().map(str::trim).rfind(|l| !l.is_empty());
+    reason
+        .unwrap_or(fallback)
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect()
+}
+
+/// Agents to reopen, from `zj-herdr restore --dry-run --json`; 0 when the
+/// output is not that (an older zj-herdr, or the command failed).
+fn restore_count(stdout: &[u8]) -> usize {
+    RestorePreview::from_json(&String::from_utf8_lossy(stdout)).map_or(0, |p| p.count)
 }
 
 /// What activating an agent row does.
@@ -777,6 +860,18 @@ mod tests {
             "too late: arms again"
         );
         assert_eq!(activation(true, Some(("b", 99)), "a", 100), Arm);
+    }
+
+    #[test]
+    fn reads_the_restore_count_and_command_errors() {
+        assert_eq!(restore_count(br#"{"count":2,"panes":[]}"#), 2);
+        assert_eq!(restore_count(b"would reopen dev:1 /w claude"), 0);
+        assert_eq!(restore_count(b""), 0);
+        assert_eq!(
+            command_error(b"zj-herdr: skip x\nzj-herdr: \x1b[31mboom\n\n", "failed"),
+            "zj-herdr: [31mboom"
+        );
+        assert_eq!(command_error(b"", "failed"), "failed");
     }
 
     #[test]

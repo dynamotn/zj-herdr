@@ -30,8 +30,13 @@ fn truncate(text: &str, cols: usize) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Target {
     Agent(String),
-    Tab { session: String, position: usize },
+    Tab {
+        session: String,
+        position: usize,
+    },
     Session(String),
+    /// The `↻ restore N agents` banner.
+    Restore,
 }
 
 /// Ids of the agent rows, in display order: what the cursor moves over.
@@ -86,6 +91,8 @@ pub struct Frame<'a> {
     pub error: Option<&'a str>,
     /// Id of the agent waiting for a second click to move here.
     pub armed: Option<&'a str>,
+    /// Agents `zj-herdr restore` would reopen in this session.
+    pub restore: usize,
     /// Unix seconds.
     pub now: u64,
 }
@@ -105,6 +112,7 @@ pub fn render(
         selected,
         error,
         armed,
+        restore,
         now,
     } = frame;
     let mut head = Vec::new();
@@ -227,15 +235,21 @@ pub fn render(
             }
         }
     }
+    let mut head: Vec<(String, Option<Target>)> = head.into_iter().map(|l| (l, None)).collect();
+    if state.is_some() && restore > 0 {
+        let noun = if restore == 1 { "agent" } else { "agents" };
+        let text = truncate(&format!("↻ restore {restore} {noun}"), cols);
+        head.push((format!("{BOLD}{text}{RESET}"), Some(Target::Restore)));
+    }
     if let Some(e) = error {
-        head.push(format!("\x1b[31m{}{RESET}", truncate(e, cols)));
+        head.push((format!("\x1b[31m{}{RESET}", truncate(e, cols)), None));
     }
     if let Some(state) = state {
         // With two lines to spare, the counts move to a footer at the
         // bottom of the rail, under a rule.
         let spare = rows.saturating_sub(head.len() + body.len());
         if spare >= 2 {
-            head[0] = truncate("zj-herdr", cols);
+            head[0].0 = truncate("zj-herdr", cols);
             body.extend((2..spare).map(|_| (String::new(), false, None)));
             body.push((format!("{DIM}{}{RESET}", "─".repeat(cols)), false, None));
             body.push((truncate(&tally(state), cols), false, None));
@@ -246,7 +260,6 @@ pub fn render(
     let sel_line = body.iter().position(|(_, s, _)| *s).unwrap_or(0);
     let start = (sel_line + 1).saturating_sub(room);
     head.into_iter()
-        .map(|l| (l, None))
         .chain(
             body.into_iter()
                 .skip(start)
@@ -349,6 +362,35 @@ mod tests {
             now: 160,
             ..Frame::default()
         }
+    }
+
+    #[test]
+    fn restore_banner_sits_under_the_header() {
+        let st = state(2);
+        let tree = view::tree(&st, None, &[]);
+        let frame = Frame {
+            restore: 3,
+            error: Some("oops"),
+            ..dev_frame(&st)
+        };
+        let (lines, targets) = render(frame, &tree, (7, 80));
+        let lines = plain(&lines);
+        assert!(lines[0].starts_with("zj-herdr  1 blocked"));
+        assert_eq!(lines[1], "↻ restore 3 agents");
+        assert_eq!(targets[1], Some(Target::Restore));
+        assert_eq!(lines[2], "oops");
+        assert_eq!(lines[3], "box");
+        let frame = Frame {
+            restore: 1,
+            ..dev_frame(&st)
+        };
+        let lines = plain(&render(frame, &tree, (20, 80)).0);
+        assert_eq!(lines[0], "zj-herdr");
+        assert_eq!(lines[1], "↻ restore 1 agent");
+        assert_eq!(lines[19], "1 working · 1 need you");
+        // Nothing to restore, no banner.
+        let lines = plain(&render(dev_frame(&st), &tree, (20, 80)).0);
+        assert_eq!(lines[1], "box");
     }
 
     #[test]

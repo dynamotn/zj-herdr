@@ -202,11 +202,23 @@ impl ClaudeDetector {
         }
     }
 
-    fn claimant(proc: &ProcInfo, dir: &Path) -> Claimant {
-        // An explicit session wins while the agent keeps writing to it.
+    fn claimant(proc: &ProcInfo, dir: &Path, files: &[FileTimes]) -> Claimant {
+        // An explicit session wins while the agent keeps writing to it, and
+        // from the start until the agent begins another file (`/clear`):
+        // a session just resumed by `restore` has written nothing yet, and
+        // must still count as running.
         let explicit = flag_value(&proc.argv, &["--resume", "-r", "--session-id"])
             .map(|id| dir.join(format!("{id}.jsonl")))
-            .filter(|path| transcript::modified_secs(path).is_some_and(|m| m >= proc.start_time));
+            .filter(|path| {
+                files.iter().any(|f| {
+                    &f.path == path
+                        && (f.modified >= proc.start_time
+                            || !files.iter().any(|other| {
+                                &other.path != path
+                                    && other.created + CREATED_SLACK_SECS >= proc.start_time
+                            }))
+                })
+            });
         Claimant {
             pid: proc.pid,
             start_time: proc.start_time,
@@ -216,16 +228,19 @@ impl ClaudeDetector {
 
     fn assign(&self, procs: &[&ProcInfo]) -> HashMap<u32, Option<PathBuf>> {
         let mut out: HashMap<u32, Option<PathBuf>> = procs.iter().map(|p| (p.pid, None)).collect();
-        let mut by_dir: HashMap<PathBuf, Vec<Claimant>> = HashMap::new();
+        let mut by_dir: HashMap<PathBuf, Vec<&ProcInfo>> = HashMap::new();
         for proc in procs {
             if let Some(cwd) = proc.cwd.as_deref() {
                 let dir = transcript::claude_project_dir(&self.projects, cwd);
-                let claimant = Self::claimant(proc, &dir);
-                by_dir.entry(dir).or_default().push(claimant);
+                by_dir.entry(dir).or_default().push(proc);
             }
         }
-        for (dir, claimants) in by_dir {
+        for (dir, procs) in by_dir {
             let files = transcript::files_with_times(&dir, "jsonl");
+            let claimants: Vec<Claimant> = procs
+                .iter()
+                .map(|p| Self::claimant(p, &dir, &files))
+                .collect();
             for (pid, path) in assign_transcripts(&claimants, &files) {
                 out.insert(pid, Some(path));
             }

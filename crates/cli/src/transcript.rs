@@ -320,6 +320,7 @@ struct UsageLine {
 
 #[derive(Deserialize)]
 struct UsageMessage {
+    id: Option<String>,
     usage: Option<Usage>,
 }
 
@@ -342,12 +343,33 @@ pub struct UsageCursor {
     identity: Option<(u64, u64)>,
     /// Bytes read, always at the end of a complete line.
     offset: u64,
+    /// The last reply counted, and what it added: Claude Code writes one
+    /// line per content block of a reply, each with the reply's whole usage.
+    last: Option<(String, Tokens)>,
     pub tokens: Tokens,
+}
+
+fn add(a: &Tokens, b: &Tokens) -> Tokens {
+    Tokens {
+        input: a.input.saturating_add(b.input),
+        output: a.output.saturating_add(b.output),
+        cache_read: a.cache_read.saturating_add(b.cache_read),
+        cache_write: a.cache_write.saturating_add(b.cache_write),
+    }
+}
+
+fn sub(a: &Tokens, b: &Tokens) -> Tokens {
+    Tokens {
+        input: a.input.saturating_sub(b.input),
+        output: a.output.saturating_sub(b.output),
+        cache_read: a.cache_read.saturating_sub(b.cache_read),
+        cache_write: a.cache_write.saturating_sub(b.cache_write),
+    }
 }
 
 /// Bring `cursor` up to date with the end of the Claude transcript at
 /// `path`, summing `message.usage` over the `assistant` lines appended since
-/// the last call. A trailing line without its newline is left for the next
+/// the last call, each reply (`message.id`) once, at its latest usage. A trailing line without its newline is left for the next
 /// call; a replaced or truncated file is read again from the start.
 pub fn claude_usage(path: &Path, cursor: &mut UsageCursor) -> std::io::Result<()> {
     use std::os::unix::fs::MetadataExt;
@@ -372,18 +394,28 @@ pub fn claude_usage(path: &Path, cursor: &mut UsageCursor) -> std::io::Result<()
         cursor.offset += n as u64;
         let Ok(UsageLine {
             kind: Some(kind),
-            message: Some(UsageMessage { usage: Some(u) }),
+            message: Some(UsageMessage { id, usage: Some(u) }),
         }) = serde_json::from_slice(&line)
         else {
             continue;
         };
-        if kind == "assistant" {
-            let t = &mut cursor.tokens;
-            t.input = t.input.saturating_add(u.input_tokens);
-            t.output = t.output.saturating_add(u.output_tokens);
-            t.cache_read = t.cache_read.saturating_add(u.cache_read_input_tokens);
-            t.cache_write = t.cache_write.saturating_add(u.cache_creation_input_tokens);
+        if kind != "assistant" {
+            continue;
         }
+        let reply = Tokens {
+            input: u.input_tokens,
+            output: u.output_tokens,
+            cache_read: u.cache_read_input_tokens,
+            cache_write: u.cache_creation_input_tokens,
+        };
+        // Another block of the reply just counted: replace its usage.
+        if let (Some(id), Some((last_id, counted))) = (&id, &cursor.last) {
+            if id == last_id {
+                cursor.tokens = sub(&cursor.tokens, counted);
+            }
+        }
+        cursor.tokens = add(&cursor.tokens, &reply);
+        cursor.last = id.map(|id| (id, reply));
     }
 }
 
@@ -737,6 +769,27 @@ mod tests {
         append(&path, &format!("{tail}\n"));
         claude_usage(&path, &mut cursor).unwrap();
         assert_eq!(cursor.tokens, tokens(20, 11, 200, 14));
+    }
+
+    #[test]
+    fn claude_usage_counts_each_reply_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("s.jsonl");
+        // One reply written as three blocks, the last with the final output
+        // count, then another reply.
+        let block = |id: &str, out: u64| {
+            format!(
+                r#"{{"type":"assistant","message":{{"id":"{id}","usage":{{"input_tokens":10,"output_tokens":{out},"cache_read_input_tokens":100,"cache_creation_input_tokens":7}}}}}}"#
+            )
+        };
+        append(&path, &format!("{}\n{}\n", block("a", 1), block("a", 3)));
+        let mut cursor = UsageCursor::default();
+        claude_usage(&path, &mut cursor).unwrap();
+        assert_eq!(cursor.tokens, tokens(10, 3, 100, 7));
+        // A block of the same reply in a later read still replaces it.
+        append(&path, &format!("{}\n{}\n", block("a", 5), block("b", 2)));
+        claude_usage(&path, &mut cursor).unwrap();
+        assert_eq!(cursor.tokens, tokens(20, 7, 200, 14));
     }
 
     #[test]

@@ -57,7 +57,10 @@ Transcripts read:
 
 For Claude Code the session's token use is sent as `tokens` (`input`,
 `output`, `cache_read`, `cache_write`): the sums of `message.usage` over the
-transcript's `assistant` entries. Each line is parsed once, as it is
+transcript's `assistant` entries, each reply once. Claude Code writes a reply
+as one entry per content block, each carrying the reply's whole usage, so
+consecutive entries with the same `message.id` count as one, at the usage of
+the last. Each line is parsed once, as it is
 appended; a transcript that is replaced or shrinks is summed again from the
 start. Codex and the other agents report no tokens yet.
 

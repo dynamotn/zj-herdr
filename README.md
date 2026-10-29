@@ -25,14 +25,16 @@ and derives a state. Claude Code's own background machinery is skipped:
 `claude daemon`, its `bg-pty-host` processes, and `bg-spare` workers still
 waiting in the daemon's `spare` directory. A claimed `bg-spare` is a
 background session and is listed outside Zellij, whatever pane variables it
-inherited from the daemon.
+inherited from the daemon. Headless one-shot runs (`claude -p`/`--print`, as
+hooks and plugins start them) are skipped too; long-lived headless sessions
+(`--input-format stream-json`) are listed.
 
 | State | Rule |
 |---|---|
 | `blocked` | the transcript ends with a tool call that has no result, and both the transcript and the agent's process tree have been quiet for 5 s |
 | `working` | the transcript was written in the last 5 s, or the process tree (agent plus the tools it runs) uses CPU |
 | `idle` | the turn ended (or was interrupted) and everything is quiet |
-| `done` | the process exited; kept in the list for 60 s |
+| `done` | the process exited; kept in the list for 10 s. An agent that ran less than 30 s in all was a helper and is dropped as soon as it exits (`wait <agent> done` already waiting on it still returns) |
 
 Transcripts read:
 

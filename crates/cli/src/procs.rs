@@ -82,6 +82,7 @@ pub fn find_agents(procs: &[RawProc], self_pid: u32, sampled_at: u64) -> Vec<Pro
         .filter(|(pid, spec)| {
             let p = by_pid[pid];
             !agents::is_machinery(spec, &p.argv, p.cwd.as_deref())
+                && !agents::is_one_shot(spec, &p.argv)
         })
         .collect();
 
@@ -341,12 +342,17 @@ mod tests {
     #[test]
     fn lists_agents_started_by_other_agents() {
         let outer = proc(10, 1, &["claude"]);
-        let shell = proc(11, 10, &["/bin/zsh", "-c", "claude -p hi"]);
-        let inner = proc(12, 11, &["claude", "-p", "hi"]);
-        let direct = proc(13, 10, &["claude", "-p", "again"]);
+        let shell = proc(11, 10, &["/bin/zsh", "-c", "claude hi"]);
+        let inner = proc(12, 11, &["claude", "hi"]);
+        let direct = proc(13, 10, &["claude", "--input-format", "stream-json"]);
+        let one_shot = proc(14, 10, &["claude", "-p", "summarise"]);
         let codex = proc(20, 1, &["codex"]);
         let sub_codex = proc(21, 20, &["codex", "exec", "x"]);
-        let found = find_agents(&[outer, shell, inner, direct, codex, sub_codex], 999, 0);
+        let found = find_agents(
+            &[outer, shell, inner, direct, one_shot, codex, sub_codex],
+            999,
+            0,
+        );
         let pids: Vec<u32> = found.iter().map(|p| p.pid).collect();
         assert_eq!(pids, vec![10, 12, 13, 20, 21]);
     }

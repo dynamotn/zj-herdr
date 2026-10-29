@@ -160,6 +160,21 @@ pub fn is_machinery(spec: &AgentSpec, argv: &[String], cwd: Option<&Path>) -> bo
     }
 }
 
+/// Whether the process is a headless one-shot run (`claude -p ...`), as
+/// hooks and plugins start: it answers one prompt and exits within seconds,
+/// so it is no agent to watch. Long-lived headless sessions
+/// (`--input-format stream-json`) are agents and are kept.
+pub fn is_one_shot(spec: &AgentSpec, argv: &[String]) -> bool {
+    // `argv[0]` may be retitled (`"claude bg-spare"`); the flags follow it.
+    let mut words = argv
+        .first()
+        .into_iter()
+        .flat_map(|a| a.split_whitespace())
+        .skip(1)
+        .chain(argv.iter().skip(1).map(String::as_str));
+    spec.kind == "claude" && words.any(|w| w == "-p" || w == "--print")
+}
+
 /// Whether the agent is a background session of the Claude Code daemon. It
 /// runs in no pane, whatever Zellij variables it inherited from the pane that
 /// started the daemon.
@@ -262,6 +277,33 @@ mod tests {
         assert!(identify("node", None, &argv(&["node", "server.js"])).is_none());
         assert!(identify("vim", None, &argv(&["vim", "claude.md"])).is_none());
         assert!(identify("pip", None, &argv(&["pip"])).is_none());
+    }
+
+    #[test]
+    fn one_shot_claude_runs_are_not_agents() {
+        let claude = spec("claude").unwrap();
+        assert!(is_one_shot(claude, &argv(&["claude", "-p", "hi"])));
+        assert!(is_one_shot(
+            claude,
+            &argv(&["/opt/claude", "--model", "x", "--print"])
+        ));
+        assert!(is_one_shot(claude, &argv(&["claude bg-spare -p", "x"])));
+        assert!(!is_one_shot(
+            claude,
+            &argv(&[
+                "claude",
+                "--output-format",
+                "stream-json",
+                "--input-format",
+                "stream-json"
+            ])
+        ));
+        assert!(!is_one_shot(claude, &argv(&["claude", "explain -p"])));
+        assert!(!is_one_shot(claude, &argv(&["claude"])));
+        assert!(!is_one_shot(
+            spec("aider").unwrap(),
+            &argv(&["aider", "-p"])
+        ));
     }
 
     #[test]

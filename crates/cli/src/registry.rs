@@ -11,7 +11,10 @@ use zj_herdr_core::{Agent, AgentState, Machine, MachineStatus, StateV1};
 use crate::api::{self, Event};
 
 /// Long enough for `wait <agent> done` and the plugin to see an exit.
-pub const DONE_RETAIN_SECS: u64 = 60;
+pub const DONE_RETAIN_SECS: u64 = 10;
+/// An agent that exits having run less than this was a helper some hook or
+/// plugin started; it is dropped at once instead of shown as `done`.
+pub const HELPER_SECS: u64 = 30;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Change {
@@ -50,6 +53,11 @@ impl Tracker {
             next.insert(agent.id.clone(), agent);
         }
         for (id, mut gone) in std::mem::take(&mut self.agents) {
+            let helper = gone.started != 0 && now.saturating_sub(gone.started) < HELPER_SECS;
+            if gone.state != AgentState::Done && helper {
+                self.expired.push(id);
+                continue;
+            }
             if gone.state != AgentState::Done {
                 let from = gone.state;
                 gone.state = AgentState::Done;
@@ -214,6 +222,9 @@ impl Registry {
         // A deadline past what `Instant` can hold is no deadline at all.
         let deadline = timeout.and_then(|t| Instant::now().checked_add(t));
         let mut inner = self.lock();
+        // A helper that exits is dropped without a `done` entry; one seen
+        // while waiting and then gone has exited all the same.
+        let mut seen: Option<Agent> = None;
         loop {
             let mut matches = inner
                 .machines
@@ -229,6 +240,14 @@ impl Registry {
                 found.filter(|(a, status)| a.state == state && *status == MachineStatus::Ok)
             {
                 return Ok(agent.clone());
+            }
+            match (found, seen.take()) {
+                (Some((agent, MachineStatus::Ok)), _) => seen = Some(agent.clone()),
+                (None, Some(mut gone)) if state == AgentState::Done => {
+                    gone.state = AgentState::Done;
+                    return Ok(gone);
+                }
+                (_, before) => seen = before,
             }
             inner = match deadline {
                 None => self.changed.wait(inner).unwrap_or_else(|e| e.into_inner()),
@@ -361,12 +380,47 @@ mod tests {
         let changes = t.update(vec![], 10);
         assert_eq!(changes[0].agent.state, AgentState::Done);
         assert_eq!(changes[0].from, Some(AgentState::Idle));
-        assert!(t.update(vec![], 20).is_empty());
+        assert!(t.update(vec![], 10 + DONE_RETAIN_SECS - 1).is_empty());
         assert_eq!(t.agents().len(), 1);
         assert!(t.take_expired().is_empty());
         t.update(vec![], 10 + DONE_RETAIN_SECS);
         assert!(t.agents().is_empty());
         assert_eq!(t.take_expired(), vec![Agent::make_id("m", 1)]);
+    }
+
+    #[test]
+    fn tracker_drops_short_lived_helpers_at_once() {
+        let mut t = Tracker::default();
+        let mut helper = agent(1, AgentState::Working, 100);
+        helper.started = 95;
+        let mut long = agent(2, AgentState::Idle, 100);
+        long.started = 10;
+        t.update(vec![helper, long], 100);
+        let changes = t.update(vec![], 100 + HELPER_SECS - 6);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].agent.pid, 2);
+        assert_eq!(changes[0].agent.state, AgentState::Done);
+        assert_eq!(t.take_expired(), vec![Agent::make_id("m", 1)]);
+        assert_eq!(t.agents().len(), 1);
+    }
+
+    #[test]
+    fn wait_for_done_sees_a_helper_vanish() {
+        let reg = Arc::new(Registry::default());
+        let mut helper = agent(1, AgentState::Working, 0);
+        helper.started = 100;
+        reg.publish(machine(vec![helper]), 100);
+        let waiter = {
+            let reg = Arc::clone(&reg);
+            std::thread::spawn(move || {
+                reg.wait_for("m/1", AgentState::Done, Some(Duration::from_secs(5)), "m")
+            })
+        };
+        std::thread::sleep(Duration::from_millis(50));
+        reg.publish(machine(vec![]), 105);
+        let gone = waiter.join().unwrap().unwrap();
+        assert_eq!((gone.pid, gone.state), (1, AgentState::Done));
+        assert!(reg.find_all("m/1").is_empty());
     }
 
     #[test]

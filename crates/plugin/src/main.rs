@@ -288,15 +288,9 @@ impl ZellijPlugin for Plugin {
                     ) if !acts_on_rail_command(self.own_tab_active()) => false,
                     Ok(cmd) => {
                         let redraw = self.on_command(cmd.clone());
-                        let keeps_open = matches!(
-                            cmd,
-                            PluginCommand::Toggle
-                                | PluginCommand::SelectNext
-                                | PluginCommand::SelectPrev
-                        );
                         if self.pending.is_some() {
                             self.hide_after_pending = true;
-                        } else if !keeps_open {
+                        } else if !keeps_open(&cmd, self.armed.is_some()) {
                             self.hide_unless_in_use();
                         }
                         redraw
@@ -750,6 +744,15 @@ enum Activation {
     Adopt,
 }
 
+/// Whether a piped command leaves the picker up. A `jump` that armed an
+/// agent outside Zellij keeps it up, so the "click again" row is seen.
+fn keeps_open(cmd: &PluginCommand, armed: bool) -> bool {
+    matches!(
+        cmd,
+        PluginCommand::Toggle | PluginCommand::SelectNext | PluginCommand::SelectPrev
+    ) || (*cmd == PluginCommand::Jump && armed)
+}
+
 /// An agent that can be moved here is armed by a first activation and
 /// moved by a second one on the same agent within [`ARM_SECS`].
 fn activation(adoptable: bool, armed: Option<(&str, u64)>, id: &str, now: u64) -> Activation {
@@ -806,6 +809,14 @@ fn layout(name: &str, tabs: &[TabInfo], panes: Option<&PaneManifest>) -> Session
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_jump_that_arms_keeps_the_picker_up() {
+        assert!(keeps_open(&PluginCommand::Jump, true));
+        assert!(!keeps_open(&PluginCommand::Jump, false));
+        assert!(keeps_open(&PluginCommand::SelectNext, false));
+        assert!(!keeps_open(&PluginCommand::AttentionNext, true));
+    }
 
     fn pane(id: u32, is_plugin: bool) -> PaneInfo {
         PaneInfo {

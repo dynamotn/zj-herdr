@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -30,38 +30,69 @@ pub const TAB_REFRESH_SECS: u64 = 5;
 
 /// The tab of every agent's pane, so the plugin can group agents of
 /// sessions Zellij did not describe to it. One `list-panes` per session
-/// that has agents, at most every [`TAB_REFRESH_SECS`].
+/// that has agents, at most every [`TAB_REFRESH_SECS`], asked by
+/// [`tab_loop`] off the scan thread so a wedged session never delays state.
 #[derive(Default)]
 pub struct TabCache {
     /// Per session: when it was asked, and its answer (`None` on failure).
     sessions: HashMap<String, (u64, Option<HashMap<u32, PaneTab>>)>,
+    /// Sessions the last scan found agents in.
+    wanted: BTreeSet<String>,
 }
 
 impl TabCache {
-    /// Set `pane.tab` on every agent in a Zellij pane; `None` where the
-    /// session did not answer or does not list the pane.
-    pub fn fill(&mut self, agents: &mut [Agent], zellij: &dyn Zellij, now: u64) {
-        let wanted: BTreeSet<String> = agents
+    /// Note the sessions `agents` run in, drop the others, and set
+    /// `pane.tab` from what is cached: `None` where the session has not
+    /// answered (yet) or does not list the pane.
+    pub fn apply(&mut self, agents: &mut [Agent]) {
+        self.wanted = agents
             .iter()
             .filter_map(|a| a.pane.as_ref().map(|p| p.session.clone()))
             .collect();
+        let wanted = &self.wanted;
         self.sessions.retain(|s, _| wanted.contains(s));
-        for session in wanted {
-            let fresh = self
-                .sessions
-                .get(&session)
-                .is_some_and(|(at, _)| now.saturating_sub(*at) < TAB_REFRESH_SECS);
-            if !fresh {
-                let tabs = zellij.panes(&session).ok();
-                self.sessions.insert(session, (now, tabs));
-            }
-        }
         for pane in agents.iter_mut().filter_map(|a| a.pane.as_mut()) {
             pane.tab = self
                 .sessions
                 .get(&pane.session)
                 .and_then(|(_, tabs)| tabs.as_ref()?.get(&pane.pane_id).cloned());
         }
+    }
+
+    /// Wanted sessions not asked within [`TAB_REFRESH_SECS`].
+    pub fn stale(&self, now: u64) -> Vec<String> {
+        self.wanted
+            .iter()
+            .filter(|s| {
+                self.sessions
+                    .get(*s)
+                    .is_none_or(|(at, _)| now.saturating_sub(*at) >= TAB_REFRESH_SECS)
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Record a session's answer, unless its agents are gone meanwhile.
+    pub fn store(&mut self, session: String, now: u64, tabs: Option<HashMap<u32, PaneTab>>) {
+        if self.wanted.contains(&session) {
+            self.sessions.insert(session, (now, tabs));
+        }
+    }
+}
+
+fn lock(cache: &Mutex<TabCache>) -> std::sync::MutexGuard<'_, TabCache> {
+    cache.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Ask stale sessions for their tabs, never holding the lock across a call.
+fn tab_loop(cache: &Mutex<TabCache>, zellij: &dyn Zellij) {
+    loop {
+        let stale = lock(cache).stale(now_secs());
+        for session in stale {
+            let tabs = zellij.panes(&session).ok();
+            lock(cache).store(session, now_secs(), tabs);
+        }
+        thread::sleep(SCAN_INTERVAL);
     }
 }
 
@@ -117,12 +148,17 @@ pub fn run(opts: Options) -> Result<(), String> {
         thread::spawn(move || remote::poll_loop(r, registry));
     }
 
+    let tabs = Arc::new(Mutex::new(TabCache::default()));
+    {
+        let tabs = Arc::clone(&tabs);
+        let zellij = Arc::clone(&zellij);
+        thread::spawn(move || tab_loop(&tabs, zellij.as_ref()));
+    }
     let mut scanner = Scanner::new(opts.machine, &opts.roots);
-    let mut tabs = TabCache::default();
     loop {
         let started = Instant::now();
         let mut machine = scanner.scan();
-        tabs.fill(&mut machine.agents, zellij.as_ref(), now_secs());
+        lock(&tabs).apply(&mut machine.agents);
         if store.record(&machine.agents, now_secs()) {
             if let Err(e) = store.save(&opts.sessions) {
                 eprintln!("zj-herdr: {}: {e}", opts.sessions.display());
@@ -225,7 +261,31 @@ mod tests {
             pane,
             session_id: None,
             waiting: None,
+            started: 0,
         }
+    }
+
+    impl TabCache {
+        /// One scan as the daemon sees it once `tab_loop` has caught up.
+        fn fill(&mut self, agents: &mut [Agent], zellij: &dyn Zellij, now: u64) {
+            self.apply(agents);
+            for session in self.stale(now) {
+                let tabs = zellij.panes(&session).ok();
+                self.store(session, now, tabs);
+            }
+            self.apply(agents);
+        }
+    }
+
+    #[test]
+    fn tab_cache_drops_answers_for_sessions_gone_meanwhile() {
+        let mut cache = TabCache::default();
+        cache.apply(&mut [agent(1, Some(Pane::new("dev", 3)))]);
+        assert_eq!(cache.stale(100), ["dev"]);
+        cache.apply(&mut [agent(4, None)]);
+        cache.store("dev".into(), 100, None);
+        assert!(cache.sessions.is_empty());
+        assert!(cache.stale(100).is_empty());
     }
 
     #[test]

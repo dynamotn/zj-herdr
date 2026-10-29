@@ -36,10 +36,13 @@ fn kind_of(proc: &RawProc) -> Option<&'static str> {
     agents::identify(&proc.name, proc.exe.as_deref(), &proc.argv).map(|s| s.kind)
 }
 
-/// Whether a process is the agent: of the agent's kind, in its cwd, and
-/// outside Zellij like it. An agent with no known cwd never matches.
+/// Whether a process is the agent: started when it did (not a later
+/// process that reuses its pid), of its kind, in its cwd, and outside
+/// Zellij like it. An agent with no known cwd or start time never matches.
 pub fn is_same_agent(agent: &Agent, proc: &RawProc) -> bool {
-    kind_of(proc) == Some(agent.kind.as_str())
+    agent.started != 0
+        && proc.start_time == agent.started
+        && kind_of(proc) == Some(agent.kind.as_str())
         && agent
             .cwd
             .as_deref()
@@ -250,6 +253,7 @@ mod tests {
             pane: None,
             session_id: Some("abc".into()),
             waiting: None,
+            started: 1000,
         }
     }
 
@@ -365,16 +369,34 @@ mod tests {
     }
 
     #[test]
-    fn recognises_the_agent_by_kind_cwd_and_no_pane() {
+    fn recognises_the_agent_by_start_kind_cwd_and_no_pane() {
         let agent = outside();
         let proc = RawProc {
             pid: 42,
             name: "claude".into(),
             argv: vec!["claude".into()],
             cwd: Some(PathBuf::from("/w/proj")),
+            start_time: 1000,
             ..RawProc::default()
         };
         assert!(is_same_agent(&agent, &proc));
+        // Another claude in the same cwd that took over the pid.
+        let pid_reused = RawProc {
+            start_time: 1001,
+            ..proc.clone()
+        };
+        assert!(!is_same_agent(&agent, &pid_reused));
+        let unknown_start = Agent {
+            started: 0,
+            ..outside()
+        };
+        assert!(!is_same_agent(
+            &unknown_start,
+            &RawProc {
+                start_time: 0,
+                ..proc.clone()
+            }
+        ));
         let reused = RawProc {
             name: "vim".into(),
             argv: vec!["vim".into()],

@@ -284,6 +284,7 @@ mod tests {
             pane: None,
             session_id: None,
             waiting: None,
+            started: 0,
         }
     }
 

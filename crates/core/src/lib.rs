@@ -145,6 +145,14 @@ pub struct Agent {
     /// [`WAITING_MAX_CHARS`]. `None` in any other state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub waiting: Option<String>,
+    /// Unix seconds at which the process started; `0` when unknown. Tells
+    /// the agent apart from a later process that reuses its pid.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub started: u64,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 /// Longest [`Agent::waiting`] text.
@@ -339,6 +347,7 @@ mod tests {
                         }),
                         session_id: Some("abc".into()),
                         waiting: None,
+                        started: 0,
                     }],
                 },
                 Machine {

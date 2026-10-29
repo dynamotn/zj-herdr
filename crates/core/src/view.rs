@@ -349,6 +349,7 @@ mod tests {
             pane: session.map(|s| Pane::new(s, pid)),
             session_id: None,
             waiting: None,
+            started: 0,
         }
     }
 

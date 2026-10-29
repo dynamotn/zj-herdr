@@ -245,6 +245,7 @@ mod tests {
             pane: Some(Pane::new(session, pane)),
             session_id: sid.map(str::to_owned),
             waiting: None,
+            started: 0,
         }
     }
 

@@ -292,6 +292,7 @@ mod tests {
                 pane: Some(Pane::new("dev", pid)),
                 session_id: None,
                 waiting: None,
+                started: 0,
             })
             .collect();
         let remote = Machine {

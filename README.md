@@ -104,9 +104,13 @@ CLI, and the daemon serves only connections from its own uid.
 
 - `Alt a` opens the floating picker: one row per agent across all sessions
   and machines, grouped by machine then session, blocked first, with a
-  coloured state glyph, the agent kind, the time in that state, the session's
-  token total (`812`, `97k`, `4.8M`; `-` when unknown), the pane and the
-  directory, for example `! claude 1m  4.8M #12 zj-herdr`. `j`/`k` or
+  coloured state glyph (`◆` blocked, a spinning `⠋` working, `○` idle,
+  `✓` done), the agent kind as a mark (`✳` claude, `❉` codex, `✺`
+  opencode, `✦` gemini, `✴` pi; other kinds by name), the time in that
+  state, the session's token total (`812`, `97k`, `4.8M`; `-` when
+  unknown), the pane and the directory, for example
+  `◆ ✳ 1m  4.8M #12 zj-herdr`. The header shows the agent count and, in
+  red, how many need you (`zj-herdr  ·3 1!`), over a `═` rule. `j`/`k` or
   arrows move, `Enter` jumps to
   the pane (switching session if needed), `n`/`p` cycle attention, `Esc`
   hides it. Remote rows show their SSH target and do not jump.
@@ -114,15 +118,19 @@ CLI, and the daemon serves only connections from its own uid.
   holds their pane, as in zj-radar: the current session first with its
   active tab (marked `▌`) and every tab that has agents, the tabs without
   agents folded into one dim `+N tabs` line; other sessions with the tabs
-  that have agents. When the list leaves at least two lines free, the
-  counts move from the header to a footer on the last line,
-  `3 working · 2 need you` (blocked plus idle; the second part only when
-  some agent needs you).
-- Clicking (or `jump` on) an agent that runs outside Zellij arms it: its
-  row reads `click again to move here` for 5 s, and a second click within
-  that time runs `zj-herdr adopt <id> --session <this session>`, which
-  moves it into a new pane here. Any other click disarms it. Agents outside Zellij and remote machines stay grouped by host
-  and session. Click an agent, tab or session row to jump to it.
+  that have agents. When the list leaves at least three lines free, a
+  footer fills the bottom: a rule, the tally `3 working · 2 need you`
+  (blocked plus idle; the second part only when some agent needs you), and
+  a bar of clickable buttons, `[↵ jump] [n next] [p prev]`, that do what
+  those keys do (the ones that do not fit a narrow rail are left out).
+- An agent that runs outside Zellij and has a session to resume ends its
+  row with a `⇲` button: clicking it runs
+  `zj-herdr adopt <id> --session <this session>`, which moves it into a
+  new pane here (stopping it where it ran). Only the button does this:
+  `Enter`, `jump` or a click elsewhere on its row only selects it. Agents
+  outside Zellij and
+  remote machines stay grouped by host and session. Click an agent, tab or
+  session row to jump to it.
   Zellij does not always describe other sessions to a plugin, so the
   daemon also records each agent's tab: every 5 s at most, it runs
   `zellij --session S action list-panes --json --tab` in each session

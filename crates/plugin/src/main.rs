@@ -11,8 +11,8 @@ use ui::Target;
 use zellij_tile::prelude::*;
 use zj_herdr_core::view::{SessionLayout, TabLayout};
 use zj_herdr_core::{
-    view, Agent, AgentState, PluginCommand, RestorePreview, StateV1, CMD_SCHEMA, PROMPT_ACK,
-    PROMPT_NACK, STATE_SCHEMA,
+    view, Agent, PluginCommand, RestorePreview, StateV1, CMD_SCHEMA, PROMPT_ACK, PROMPT_NACK,
+    STATE_SCHEMA,
 };
 
 mod ui;
@@ -27,8 +27,6 @@ const ADOPT_CONTEXT: &str = "zj_herdr_adopt";
 const RESTORE_CHECK_CONTEXT: &str = "zj_herdr_restore_check";
 /// Marks the `run_command` of `zj-herdr restore`.
 const RESTORE_CONTEXT: &str = "zj_herdr_restore";
-/// How long a first click on an agent outside Zellij waits for the second.
-const ARM_SECS: u64 = 5;
 /// `sh -c` script for `start_daemon`; `$1` is the zj-herdr binary.
 const START_DAEMON: &str = r#"d="${XDG_STATE_HOME:-$HOME/.local/state}/zj-herdr"
 mkdir -p "$d" && nohup "$1" daemon >>"$d/daemon.log" 2>&1 </dev/null &"#;
@@ -48,8 +46,8 @@ struct Plugin {
     tabs: Vec<TabInfo>,
     /// Every session's tabs and panes, from the last `SessionUpdate`.
     sessions: Vec<SessionInfo>,
-    /// What a click on each rendered line does.
-    targets: Vec<Option<Target>>,
+    /// Where a click on each rendered line lands.
+    targets: Vec<ui::Hits>,
     /// The last value sent with `set_selectable`.
     selectable: Option<bool>,
     error: Option<String>,
@@ -82,8 +80,6 @@ struct Plugin {
     rename_tabs: bool,
     /// The name this instance last gave each tab, by tab id.
     given_names: BTreeMap<usize, String>,
-    /// Agent outside Zellij clicked once, and when (Unix seconds).
-    armed: Option<(String, u64)>,
     /// Agents `zj-herdr restore` would reopen in this session, from the
     /// last dry run.
     restorable: usize,
@@ -157,15 +153,11 @@ impl ZellijPlugin for Plugin {
                 self.sessions = sessions;
                 self.visible
             }
-            Event::Mouse(Mouse::LeftClick(line, _)) => {
+            Event::Mouse(Mouse::LeftClick(line, col)) => {
                 let target = usize::try_from(line)
                     .ok()
-                    .and_then(|l| self.targets.get(l).cloned().flatten());
-                match target {
-                    Some(t) => self.on_click(t),
-                    // A click anywhere else disarms too.
-                    None => self.armed.take().is_some(),
-                }
+                    .and_then(|l| ui::hit(self.targets.get(l)?, col).cloned());
+                target.is_some_and(|t| self.on_click(t))
             }
             Event::Visible(visible) => {
                 self.visible = visible;
@@ -290,7 +282,7 @@ impl ZellijPlugin for Plugin {
                         let redraw = self.on_command(cmd.clone());
                         if self.pending.is_some() {
                             self.hide_after_pending = true;
-                        } else if !keeps_open(&cmd, self.armed.is_some()) {
+                        } else if !keeps_open(&cmd) {
                             self.hide_unless_in_use();
                         }
                         redraw
@@ -320,7 +312,6 @@ impl ZellijPlugin for Plugin {
             current: self.session.as_deref(),
             selected: self.selected.as_deref(),
             error: self.error.as_deref(),
-            armed: self.armed_now(now),
             restore: self.restorable,
             now,
         };
@@ -558,52 +549,34 @@ impl Plugin {
             .as_ref()
             .and_then(|s| s.machines.iter().find(|m| m.name == agent.machine))
             .is_some_and(|m| m.ssh.is_none());
-        local
-            && self.session.is_some()
-            && agent.pane.is_none()
-            && agent.session_id.is_some()
-            && agent.state != AgentState::Done
+        ui::adoptable(agent, local, self.session.as_deref())
     }
 
-    /// The agent whose row asks for a second click, while it may.
-    fn armed_now(&self, now: u64) -> Option<&str> {
-        self.armed
-            .as_ref()
-            .filter(|(_, at)| now.saturating_sub(*at) < ARM_SECS)
-            .map(|(id, _)| id.as_str())
-    }
-
-    /// A click on (or `jump` to) agent `id`: jump to its pane, or for an
-    /// agent outside Zellij, arm it, then move it here on a second go.
-    fn activate(&mut self, id: String) {
-        let armed = self.armed.take();
+    /// Select agent `id` and jump to its pane; with `adopt`, move an agent
+    /// outside Zellij here instead.
+    fn activate(&mut self, id: String, adopt: bool) {
         let Some(agent) = self.find(&id) else {
             return;
         };
         self.selected = Some(id.clone());
-        let now = now_secs();
-        let armed = armed.as_ref().map(|(a, at)| (a.as_str(), *at));
-        match activation(self.adoptable(&agent), armed, &id, now) {
-            Activation::Jump => self.jump(&agent),
-            Activation::Arm => self.armed = Some((id, now)),
-            Activation::Adopt => {
-                let Some(session) = self.session.clone() else {
-                    return;
-                };
-                let context = BTreeMap::from([(ADOPT_CONTEXT.to_string(), id.clone())]);
-                // Ids and names come from pipes: never let one read as a flag.
-                let session = format!("--session={session}");
-                run_command(&[self.bin.as_str(), "adopt", &session, "--", &id], context);
-            }
+        if !(adopt && self.adoptable(&agent)) {
+            return self.jump(&agent);
         }
+        let Some(session) = self.session.clone() else {
+            return;
+        };
+        let context = BTreeMap::from([(ADOPT_CONTEXT.to_string(), id.clone())]);
+        // Ids and names come from pipes: never let one read as a flag.
+        let session = format!("--session={session}");
+        run_command(&[self.bin.as_str(), "adopt", &session, "--", &id], context);
     }
 
     fn on_click(&mut self, target: Target) -> bool {
-        if !matches!(target, Target::Agent(_)) {
-            self.armed = None;
-        }
         match target {
-            Target::Agent(id) => self.activate(id),
+            // Only the `⇲` button adopts: a stray click on the row must not.
+            Target::Agent(id) => self.activate(id, false),
+            Target::Adopt(id) => self.activate(id, true),
+            Target::Command(cmd) => return self.on_command(cmd),
             Target::Tab { session, position } => {
                 if !self.pinned {
                     hide_self();
@@ -674,7 +647,8 @@ impl Plugin {
             PluginCommand::SelectPrev => self.move_cursor(-1),
             PluginCommand::Jump => {
                 if let Some(id) = self.selected.clone() {
-                    self.activate(id);
+                    // Adopting stops the agent where it runs: only `⇲` does it.
+                    self.activate(id, false);
                 }
                 true
             }
@@ -733,34 +707,12 @@ fn restore_count(stdout: &[u8]) -> usize {
     RestorePreview::from_json(&String::from_utf8_lossy(stdout)).map_or(0, |p| p.count)
 }
 
-/// What activating an agent row does.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Activation {
-    /// Focus its pane (nothing, for an agent with no pane here).
-    Jump,
-    /// Ask for a second click within [`ARM_SECS`].
-    Arm,
-    /// Run `zj-herdr adopt`.
-    Adopt,
-}
-
-/// Whether a piped command leaves the picker up. A `jump` that armed an
-/// agent outside Zellij keeps it up, so the "click again" row is seen.
-fn keeps_open(cmd: &PluginCommand, armed: bool) -> bool {
+/// Whether a piped command leaves the picker up.
+fn keeps_open(cmd: &PluginCommand) -> bool {
     matches!(
         cmd,
         PluginCommand::Toggle | PluginCommand::SelectNext | PluginCommand::SelectPrev
-    ) || (*cmd == PluginCommand::Jump && armed)
-}
-
-/// An agent that can be moved here is armed by a first activation and
-/// moved by a second one on the same agent within [`ARM_SECS`].
-fn activation(adoptable: bool, armed: Option<(&str, u64)>, id: &str, now: u64) -> Activation {
-    match armed {
-        _ if !adoptable => Activation::Jump,
-        Some((a, at)) if a == id && now.saturating_sub(at) < ARM_SECS => Activation::Adopt,
-        _ => Activation::Arm,
-    }
+    )
 }
 
 /// `select-next`, `select-prev` and `jump` reach every rail of a session;
@@ -811,11 +763,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_jump_that_arms_keeps_the_picker_up() {
-        assert!(keeps_open(&PluginCommand::Jump, true));
-        assert!(!keeps_open(&PluginCommand::Jump, false));
-        assert!(keeps_open(&PluginCommand::SelectNext, false));
-        assert!(!keeps_open(&PluginCommand::AttentionNext, true));
+    fn only_cursor_and_toggle_commands_keep_the_picker_up() {
+        assert!(!keeps_open(&PluginCommand::Jump));
+        assert!(keeps_open(&PluginCommand::SelectNext));
+        assert!(!keeps_open(&PluginCommand::AttentionNext));
     }
 
     fn pane(id: u32, is_plugin: bool) -> PaneInfo {
@@ -847,21 +798,6 @@ mod tests {
         assert_eq!(own_tab(&manifest, 7), Some(1));
         assert_eq!(own_tab(&manifest, 1), Some(0));
         assert_eq!(own_tab(&manifest, 9), None);
-    }
-
-    #[test]
-    fn a_second_click_in_time_on_the_same_agent_adopts_it() {
-        use Activation::*;
-        assert_eq!(activation(false, None, "a", 100), Jump);
-        assert_eq!(activation(false, Some(("a", 99)), "a", 100), Jump);
-        assert_eq!(activation(true, None, "a", 100), Arm);
-        assert_eq!(activation(true, Some(("a", 96)), "a", 100), Adopt);
-        assert_eq!(
-            activation(true, Some(("a", 100 - ARM_SECS)), "a", 100),
-            Arm,
-            "too late: arms again"
-        );
-        assert_eq!(activation(true, Some(("b", 99)), "a", 100), Arm);
     }
 
     #[test]

@@ -79,6 +79,10 @@ pub fn find_agents(procs: &[RawProc], self_pid: u32, sampled_at: u64) -> Vec<Pro
         .iter()
         .filter(|p| p.pid != self_pid)
         .filter_map(|p| agents::identify(&p.name, p.exe.as_deref(), &p.argv).map(|s| (p.pid, s)))
+        .filter(|(pid, spec)| {
+            let p = by_pid[pid];
+            !agents::is_machinery(spec, &p.argv, p.cwd.as_deref())
+        })
         .collect();
 
     let ancestors = |pid: u32| {
@@ -103,10 +107,13 @@ pub fn find_agents(procs: &[RawProc], self_pid: u32, sampled_at: u64) -> Vec<Pro
         })
         .map(|(&pid, &spec)| {
             let p = by_pid[&pid];
-            let pane = p
-                .pane
-                .clone()
-                .or_else(|| ancestors(pid).find_map(|a| by_pid.get(&a)?.pane.clone()));
+            let pane = if agents::is_detached(spec, &p.argv) {
+                None
+            } else {
+                p.pane
+                    .clone()
+                    .or_else(|| ancestors(pid).find_map(|a| by_pid.get(&a)?.pane.clone()))
+            };
             ProcInfo {
                 pid,
                 spec,
@@ -273,6 +280,45 @@ mod tests {
         assert_eq!(found[0].cpu, 41.0);
         assert_eq!(found[1].spec.kind, "aider");
         assert_eq!(found[1].pane, None);
+    }
+
+    #[test]
+    fn skips_claude_daemon_machinery_and_detaches_its_sessions() {
+        let claude = "/opt/claude/2.1.3/claude";
+        let mut shell = proc(10, 1, &["/bin/zsh"]);
+        shell.pane = pane("work", 0);
+        let mut daemon = proc(11, 10, &[claude, "daemon", "run"]);
+        daemon.pane = pane("work", 0);
+        let host = proc(
+            12,
+            11,
+            &["claude bg-pty-host", "--bg-pty-host", "/t/spare/a.sock"],
+        );
+        let mut spare = proc(
+            13,
+            12,
+            &["claude bg-spare", "--bg-spare", "/t/spare/a.claim.sock"],
+        );
+        spare.cwd = Some(PathBuf::from("/tmp/cc-daemon-501/ee1a/spare"));
+        let mut claimed = proc(
+            14,
+            12,
+            &["claude bg-spare", "--bg-spare", "/t/spare/b.claim.sock"],
+        );
+        claimed.cwd = Some(PathBuf::from("/w/proj"));
+        claimed.pane = pane("work", 0);
+        let mut interactive = proc(15, 10, &["claude"]);
+        interactive.cwd = Some(PathBuf::from("/w/proj"));
+
+        // The kernel still names them `claude`; only argv was retitled.
+        let mut procs = [shell, daemon, host, spare, claimed, interactive];
+        for p in procs.iter_mut().skip(2).take(3) {
+            p.name = "claude".into();
+        }
+        let found = find_agents(&procs, 999, 100);
+        let pids: Vec<(u32, Option<Pane>)> =
+            found.iter().map(|p| (p.pid, p.pane.clone())).collect();
+        assert_eq!(pids, [(14, None), (15, pane("work", 0))]);
     }
 
     #[test]

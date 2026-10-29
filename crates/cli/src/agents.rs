@@ -1,5 +1,7 @@
 //! The table of known agent CLIs. Supporting a new agent is one line here.
 
+use std::path::Path;
+
 /// How to recognise an agent process and how to resume one of its sessions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AgentSpec {
@@ -130,6 +132,39 @@ pub fn identify(name: &str, exe: Option<&str>, argv: &[String]) -> Option<&'stat
         return by_name(script);
     }
     None
+}
+
+/// Claude Code's own background machinery, never a session of its own:
+/// `claude daemon run` and the pty hosts it keeps for background sessions.
+const CLAUDE_MACHINERY: &[&str] = &["daemon", "bg-pty-host"];
+/// A worker the Claude Code daemon starts ahead of time. It waits in the
+/// daemon's `spare` directory until claimed, and is a background session after.
+const CLAUDE_SPARE: &str = "bg-spare";
+
+/// The word after the program name. The daemon's workers retitle
+/// themselves, so it may share `argv[0]` with it (`"claude bg-spare"`).
+fn claude_subcommand<'a>(spec: &AgentSpec, argv: &'a [String]) -> Option<&'a str> {
+    (spec.kind == "claude")
+        .then(|| argv.iter().flat_map(|a| a.split_whitespace()).nth(1))
+        .flatten()
+}
+
+/// Whether an agent-looking process is machinery rather than a session: the
+/// Claude Code daemon, its pty hosts, and spare workers nobody claimed yet
+/// (they still sit in the daemon's `spare` directory).
+pub fn is_machinery(spec: &AgentSpec, argv: &[String], cwd: Option<&Path>) -> bool {
+    match claude_subcommand(spec, argv) {
+        Some(sub) if CLAUDE_MACHINERY.contains(&sub) => true,
+        Some(CLAUDE_SPARE) => cwd.is_none_or(|c| c.ends_with("spare")),
+        _ => false,
+    }
+}
+
+/// Whether the agent is a background session of the Claude Code daemon. It
+/// runs in no pane, whatever Zellij variables it inherited from the pane that
+/// started the daemon.
+pub fn is_detached(spec: &AgentSpec, argv: &[String]) -> bool {
+    claude_subcommand(spec, argv) == Some(CLAUDE_SPARE)
 }
 
 /// Agent session ids are uuids or similar. Anything else (in particular a

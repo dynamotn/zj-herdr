@@ -21,7 +21,11 @@ restore.
 `opencode`, `gemini`, `copilot`, `cursor-agent`, `pi`, `aider`; the table is
 `crates/cli/src/agents.rs`), reads `ZELLIJ_SESSION_NAME` and `ZELLIJ_PANE_ID`
 from the process environment (or its nearest ancestor's) to find the pane,
-and derives a state:
+and derives a state. Claude Code's own background machinery is skipped:
+`claude daemon`, its `bg-pty-host` processes, and `bg-spare` workers still
+waiting in the daemon's `spare` directory. A claimed `bg-spare` is a
+background session and is listed outside Zellij, whatever pane variables it
+inherited from the daemon.
 
 | State | Rule |
 |---|---|

@@ -1,0 +1,40 @@
+name: ci
+
+# Every push and pull request: format, lints, the plugin's wasm build, and
+# every test, end to end ones included (the CLI against its daemon on a
+# real socket, the plugin in a real headless Zellij), under coverage with a
+# floor of 95% of lines. `crates/plugin/src/main.rs` is left out of the
+# figure: it only hands Zellij's API to `app.rs`, runs inside Zellij's wasm
+# runtime where coverage cannot reach, and the Zellij end-to-end test runs it.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  ZELLIJ_VERSION: 0.45.1
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup component add rustfmt clippy llvm-tools-preview
+      - run: rustup target add wasm32-wasip1
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Install Zellij
+        run: |
+          curl -fsSL "https://github.com/zellij-org/zellij/releases/download/v${ZELLIJ_VERSION}/zellij-x86_64-unknown-linux-musl.tar.gz" \
+            | sudo tar -xz -C /usr/local/bin zellij
+          zellij --version
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo build -p zj-herdr-plugin --target wasm32-wasip1 --release
+      - name: Tests under coverage
+        env:
+          ZJ_HERDR_E2E_ZELLIJ: "1"
+        run: >
+          cargo llvm-cov --workspace
+          --ignore-filename-regex 'plugin/src/main\.rs'
+          --fail-under-lines 95

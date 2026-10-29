@@ -89,6 +89,12 @@ enum Command {
         #[arg(long, short)]
         session: String,
     },
+    /// Mark an idle agent seen: it no longer counts as needing you, until it
+    /// changes state.
+    Ack {
+        /// Agent id (`machine/pid`), pid, or `session:pane_id`.
+        agent: String,
+    },
     /// Reopen recorded agent sessions in their Zellij sessions with their
     /// resume command (`claude --resume <id>`, `codex resume <id>`).
     Restore {
@@ -294,6 +300,12 @@ fn run(cli: Cli) -> Result<(), String> {
                     output::clean(&agent.id),
                     output::clean(&session)
                 );
+            }
+        }
+        Command::Ack { agent } => {
+            let resp = client::request(&socket, &Request::Ack { agent })?;
+            if let Some(agent) = resp.agent {
+                println!("marked {} seen", output::clean(&agent.id));
             }
         }
         Command::Restore {

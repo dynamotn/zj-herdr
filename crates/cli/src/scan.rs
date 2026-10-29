@@ -22,14 +22,18 @@ pub fn local_machine_name() -> String {
         .unwrap_or_else(|| "local".to_string())
 }
 
-/// Build the agent record for a detected process.
-pub fn to_agent(machine: &str, detectors: &[Box<dyn Detector>], proc: &ProcInfo) -> Agent {
+/// Build the agent record for a detected process; `None` for a spare
+/// Claude Code started ahead of time, which is nobody's session yet.
+pub fn to_agent(machine: &str, detectors: &[Box<dyn Detector>], proc: &ProcInfo) -> Option<Agent> {
     let status = detect::detect(detectors, proc);
+    if status.spare {
+        return None;
+    }
     let since = match status.state {
         AgentState::Working => proc.sampled_at,
         _ => status.last_activity.unwrap_or(proc.start_time),
     };
-    Agent {
+    Some(Agent {
         id: Agent::make_id(machine, proc.pid),
         machine: machine.to_string(),
         kind: proc.spec.kind.to_string(),
@@ -42,7 +46,14 @@ pub fn to_agent(machine: &str, detectors: &[Box<dyn Detector>], proc: &ProcInfo)
         waiting: status.waiting,
         started: proc.start_time,
         tokens: status.tokens,
-    }
+        error: status.error,
+        acked: false,
+        tasks: status.tasks,
+        model: status.model,
+        context: status.context,
+        background: status.background,
+        title: status.title,
+    })
 }
 
 /// Scans the local machine; keeps CPU history between calls.
@@ -103,7 +114,7 @@ impl Scanner {
             error: None,
             agents: found
                 .iter()
-                .map(|p| to_agent(&self.machine, &self.detectors, p))
+                .filter_map(|p| to_agent(&self.machine, &self.detectors, p))
                 .collect(),
         }
     }

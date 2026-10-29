@@ -8,6 +8,7 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 
 mod cmd;
+pub mod command;
 pub mod view;
 pub use cmd::{prompt_reply, PluginCommand, CMD_SCHEMA, PROMPT_ACK, PROMPT_NACK};
 
@@ -153,10 +154,66 @@ pub struct Agent {
     /// the agent's transcript is not read or records no usage.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tokens: Option<Tokens>,
+    /// The last turn ended on an API error (Claude only).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub error: bool,
+    /// Marked seen with `zj-herdr ack` while `idle`; cleared once the agent
+    /// changes state.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub acked: bool,
+    /// Work the agent started in the background (Claude only), oldest
+    /// first: running tasks and those that ended a short while ago.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tasks: Vec<Task>,
+    /// Model of the last reply, as the transcript names it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Percent of the context window the last reply's prompt filled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<u8>,
+    /// A background session of the Claude Code daemon: a client in some
+    /// pane shows it, so it is never stopped to be moved.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub background: bool,
+    /// The session's name, which Claude also gives its terminal as title
+    /// (`✳ <name>`): how a background session is matched to its pane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
 }
 
 fn is_zero(n: &u64) -> bool {
     *n == 0
+}
+
+fn is_false(b: &bool) -> bool {
+    !b
+}
+
+/// Where a background task stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TaskState {
+    Running,
+    Completed,
+    Failed,
+    Killed,
+}
+
+/// A background shell command or subagent of an agent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Task {
+    /// `shell` or `agent`.
+    pub kind: String,
+    /// The shell command, or the subagent's description, on one line of at
+    /// most [`WAITING_MAX_CHARS`].
+    pub label: String,
+    pub state: TaskState,
+    /// Unix seconds it started; `0` when unknown.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub started: u64,
+    /// Unix seconds it ended; `0` while running or when unknown.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub ended: u64,
 }
 
 /// Token counts summed over a session's replies.
@@ -184,6 +241,15 @@ pub const WAITING_MAX_CHARS: usize = 60;
 impl Agent {
     pub fn make_id(machine: &str, pid: u32) -> String {
         format!("{machine}/{pid}")
+    }
+
+    /// Blocked, or idle and not marked seen.
+    pub fn needs_you(&self) -> bool {
+        match self.state {
+            AgentState::Blocked => true,
+            AgentState::Idle => !self.acked,
+            _ => false,
+        }
     }
 
     /// Whether `selector` names this agent: its id, its pid, or
@@ -419,6 +485,19 @@ mod tests {
                             cache_read: 3,
                             cache_write: 4,
                         }),
+                        error: true,
+                        acked: false,
+                        tasks: vec![Task {
+                            kind: "shell".into(),
+                            label: "npm run dev".into(),
+                            state: TaskState::Running,
+                            started: 1_699_999_000,
+                            ended: 0,
+                        }],
+                        model: Some("claude-opus-5-5".into()),
+                        context: Some(62),
+                        background: true,
+                        title: Some("api work".into()),
                     }],
                 },
                 Machine {

@@ -242,6 +242,13 @@ pub fn respond(ctx: &Context, req: Request) -> Response {
         Request::Subscribe => {
             Response::error("subscribe streams events; send it on its own connection")
         }
+        Request::Ack { agent } => match ctx.registry.ack(&agent, &ctx.machine) {
+            Ok(agent) => Response {
+                agent: Some(agent),
+                ..Response::ok()
+            },
+            Err(e) => Response::error(e),
+        },
         Request::Adopt { agent, session } => match adopt_agent(ctx, &agent, &session) {
             Ok(agent) => Response {
                 agent: Some(agent),
@@ -270,6 +277,12 @@ fn adopt_agent(ctx: &Context, selector: &str, session: &str) -> Result<Agent, St
         return Err(format!(
             "{} is on {}; only local agents can be adopted",
             agent.id, agent.machine
+        ));
+    }
+    if agent.background {
+        return Err(format!(
+            "{} is a background session of the Claude Code daemon; a client shows it, so it is not stopped",
+            agent.id
         ));
     }
     let lock = || ctx.adopting.lock().unwrap_or_else(|e| e.into_inner());

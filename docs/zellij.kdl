@@ -52,6 +52,21 @@ keybinds {
                 floating true
             }
         }
+        // Switch to the next / previous Zellij session, by name.
+        bind "Alt }" {
+            MessagePlugin "zj_herdr" {
+                name "zj_herdr.cmd.v1"
+                payload "session-next"
+                floating true
+            }
+        }
+        bind "Alt {" {
+            MessagePlugin "zj_herdr" {
+                name "zj_herdr.cmd.v1"
+                payload "session-prev"
+                floating true
+            }
+        }
 
         // Drive the pinned rail of the layout below, which is unselectable
         // and so never gets keys of its own. Zellij delivers a pipe to the

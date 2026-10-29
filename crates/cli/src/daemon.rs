@@ -263,6 +263,13 @@ mod tests {
             waiting: None,
             started: 0,
             tokens: None,
+            error: false,
+            acked: false,
+            tasks: vec![],
+            model: None,
+            context: None,
+            background: false,
+            title: None,
         }
     }
 

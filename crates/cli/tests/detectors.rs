@@ -586,3 +586,101 @@ fn scanner_keeps_session_file_transcripts_out_of_the_shared_pool() {
     assert_eq!(id(101), Some("s1"));
     assert_eq!(id(102), Some("s2"));
 }
+
+/// A Claude transcript whose turn ended after launching `command` in the
+/// background at Unix second `at`, as `<projects>/<slug>/s1.jsonl`.
+fn claude_background(projects: &Path, command: &str, at: &str) {
+    let dir = projects.join(claude_slug(Path::new("/work/proj")));
+    fs::create_dir_all(&dir).unwrap();
+    let lines = [
+        format!(
+            r#"{{"type":"assistant","timestamp":"{at}","message":{{"content":[{{"type":"tool_use","id":"t1","name":"Bash","input":{{"command":"{command}","run_in_background":true}}}}]}}}}"#
+        ),
+        format!(
+            r#"{{"type":"user","timestamp":"{at}","message":{{"content":[{{"type":"tool_result","tool_use_id":"t1"}}]}},"toolUseResult":{{"backgroundTaskId":"b1"}}}}"#
+        ),
+        r#"{"type":"assistant","message":{"content":[{"type":"text","text":"started"}]}}"#.into(),
+    ];
+    let path = dir.join("s1.jsonl");
+    fs::write(&path, lines.join("\n") + "\n").unwrap();
+    set_mtime(&path, T0);
+}
+
+#[test]
+fn claude_waiting_on_background_work_is_working_but_not_on_a_server() {
+    let status = |command: &str| {
+        let tmp = tempfile::tempdir().unwrap();
+        claude_background(tmp.path(), command, "2025-06-15T15:06:40Z");
+        let detector = ClaudeDetector::new(tmp.path().to_path_buf());
+        detector
+            .detect(&proc("claude", "/work/proj", T0 + 60, 0.0))
+            .unwrap()
+    };
+    let make = status("make");
+    assert_eq!(make.state, AgentState::Working, "its turn waits on make");
+    assert_eq!(make.tasks.len(), 1);
+    assert_eq!(make.tasks[0].label, "make");
+    let server = status("npm run dev");
+    assert_eq!(server.state, AgentState::Idle, "a dev server never ends");
+    assert_eq!(server.tasks[0].label, "npm run dev");
+}
+
+#[test]
+fn claude_session_file_says_background_spare_and_name() {
+    let (_tmp, projects, sessions) = claude_config();
+    install_claude(&projects, "/work/proj", "turn-ended", "s1", T0);
+    let p = proc("claude", "/work/proj", T0 + 30, 0.0);
+    let write = |extra: serde_json::Value| {
+        let mut body = serde_json::json!({
+            "pid": p.pid,
+            "sessionId": "s1",
+            "cwd": "/work/proj",
+            "startedAt": p.start_time * 1000,
+        });
+        body.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        fs::create_dir_all(&sessions).unwrap();
+        fs::write(sessions.join(format!("{}.json", p.pid)), body.to_string()).unwrap();
+    };
+    let detector = claude_with_sessions(&projects, &sessions);
+    write(serde_json::json!({"kind": "bg", "name": "api\nwork"}));
+    let status = detector.detect(&p).unwrap();
+    assert!(status.background && !status.spare);
+    assert_eq!(status.title.as_deref(), Some("api work"), "one line");
+    write(serde_json::json!({"kind": "interactive"}));
+    let status = detector.detect(&p).unwrap();
+    assert!(!status.background && status.title.is_none());
+    write(serde_json::json!({"kind": "bg", "spare": true}));
+    assert!(detector.detect(&p).unwrap().spare);
+}
+
+#[test]
+fn scanner_drops_spare_claude_sessions() {
+    let (_tmp, projects, sessions) = claude_config();
+    let mut raw = RawProc {
+        pid: 4242,
+        ppid: Some(1),
+        name: "claude".into(),
+        argv: vec!["claude".into()],
+        cwd: Some(PathBuf::from("/work/proj")),
+        start_time: T0,
+        ..RawProc::default()
+    };
+    let detectors: Vec<Box<dyn Detector>> =
+        vec![Box::new(claude_with_sessions(&projects, &sessions))];
+    let mut scanner = Scanner::with_detectors("box".into(), detectors);
+    let body = |spare: bool| {
+        serde_json::json!({"pid": 4242, "sessionId": "s1", "cwd": "/work/proj",
+            "startedAt": T0 * 1000, "kind": "bg", "spare": spare})
+        .to_string()
+    };
+    fs::create_dir_all(&sessions).unwrap();
+    fs::write(sessions.join("4242.json"), body(true)).unwrap();
+    assert!(scanner.scan_from(&[raw.clone()], T0 + 5).agents.is_empty());
+    fs::write(sessions.join("4242.json"), body(false)).unwrap();
+    raw.cpu = 0.0;
+    let agents = scanner.scan_from(&[raw], T0 + 6).agents;
+    assert_eq!(agents.len(), 1);
+    assert!(agents[0].background);
+}

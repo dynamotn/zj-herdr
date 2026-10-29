@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use zj_herdr_core::{Agent, Machine, MachineStatus, Pane, PaneTab, StateV1};
+use zj_herdr_core::{Agent, Machine, MachineStatus, Pane, PaneTab, StateV1, Task};
 
 use crate::config::Remote;
 use crate::exec;
@@ -62,6 +62,19 @@ pub fn merge_remote(remote: &Remote, stdout: &str) -> Result<Machine, String> {
             session_id: a.session_id.as_deref().map(clean),
             waiting: a.waiting.as_deref().map(clean),
             started: a.started,
+            tasks: a
+                .tasks
+                .into_iter()
+                .map(|t| Task {
+                    kind: clean(&t.kind),
+                    label: clean(&t.label),
+                    ..t
+                })
+                .collect(),
+            model: a.model.as_deref().map(clean),
+            title: a.title.as_deref().map(clean),
+            // Seen marks are this daemon's own.
+            acked: false,
             ..a
         })
         .collect();
@@ -145,6 +158,13 @@ mod tests {
                     waiting: None,
                     started: 0,
                     tokens: None,
+                    error: false,
+                    acked: false,
+                    tasks: vec![],
+                    model: None,
+                    context: None,
+                    background: false,
+                    title: None,
                 }],
             }],
         );

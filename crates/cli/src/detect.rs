@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use zj_herdr_core::{AgentState, Tokens};
+use zj_herdr_core::{command, AgentState, Task, TaskState, Tokens};
 
 use crate::procs::ProcInfo;
 use crate::transcript::{self, FileTimes, LastTurn, Transcript, UsageCursor};
@@ -33,7 +33,23 @@ pub struct AgentStatus {
     pub waiting: Option<String>,
     /// Token totals of the session, where the transcript records them.
     pub tokens: Option<Tokens>,
+    /// The last turn ended on an API error.
+    pub error: bool,
+    /// Background work: running, or ended within [`TASK_LINGER_SECS`].
+    pub tasks: Vec<Task>,
+    pub model: Option<String>,
+    /// Percent of the context window in use.
+    pub context: Option<u8>,
+    /// A background session of the Claude Code daemon.
+    pub background: bool,
+    /// Started ahead of time and not claimed: not an agent at all.
+    pub spare: bool,
+    /// The session's name, also its terminal title.
+    pub title: Option<String>,
 }
+
+/// How long an ended background task stays listed.
+pub const TASK_LINGER_SECS: u64 = 300;
 
 pub trait Detector: Send + Sync {
     /// The `AgentSpec::kind` this detector handles.
@@ -75,17 +91,46 @@ pub fn signals_only(proc: &ProcInfo) -> AgentStatus {
         last_activity: None,
         waiting: None,
         tokens: None,
+        error: false,
+        tasks: vec![],
+        model: None,
+        context: None,
+        background: false,
+        spare: false,
+        title: None,
     }
 }
 
 fn status(proc: &ProcInfo, transcript: Transcript) -> AgentStatus {
-    let state = classify(proc, Some(&transcript));
+    let mut state = classify(proc, Some(&transcript));
+    let now = proc.sampled_at;
+    let tasks: Vec<Task> = transcript
+        .tasks
+        .into_iter()
+        .filter(|t| t.state == TaskState::Running || now.saturating_sub(t.ended) < TASK_LINGER_SECS)
+        .collect();
+    // A turn that ended while bounded work it started still runs is not
+    // over: each finished task wakes the agent again. Services never hold.
+    let holding = tasks.iter().any(|t| {
+        t.state == TaskState::Running
+            && !(t.kind == "shell" && command::classify(&t.label).is_steady())
+    });
+    if state == AgentState::Idle && holding {
+        state = AgentState::Working;
+    }
     AgentStatus {
         state,
         last_activity: Some(transcript.modified),
         session_id: Some(transcript.session_id),
         waiting: transcript.pending.filter(|_| state == AgentState::Blocked),
         tokens: None,
+        error: transcript.error && state == AgentState::Idle,
+        tasks,
+        model: None,
+        context: None,
+        background: false,
+        spare: false,
+        title: None,
     }
 }
 
@@ -228,11 +273,12 @@ impl ClaudeDetector {
 
     /// Token totals of the transcript at `path`, reading only what was
     /// appended since the last scan.
-    fn tokens(&self, path: &Path) -> Option<Tokens> {
+    /// Token totals, model and context use of the transcript at `path`.
+    fn usage(&self, path: &Path) -> Option<UsageCursor> {
         let mut usage = self.usage.lock().unwrap_or_else(|e| e.into_inner());
         let cursor = usage.entry(path.to_path_buf()).or_default();
         transcript::claude_usage(path, cursor).ok()?;
-        Some(cursor.tokens).filter(|t| t.total() > 0)
+        Some(cursor.clone())
     }
 
     /// The transcript named by the process's session file, if any.
@@ -339,12 +385,39 @@ impl Detector for ClaudeDetector {
     }
 
     fn detect(&self, proc: &ProcInfo) -> Option<AgentStatus> {
+        let status = self.detect_transcript(proc);
+        let Some(meta) = self
+            .sessions
+            .as_deref()
+            .and_then(|s| transcript::claude_session_meta(s, proc.pid, proc.start_time))
+        else {
+            return status;
+        };
+        Some(AgentStatus {
+            background: meta.background,
+            spare: meta.spare,
+            title: meta.name,
+            ..status.unwrap_or_else(|| signals_only(proc))
+        })
+    }
+}
+
+impl ClaudeDetector {
+    fn detect_transcript(&self, proc: &ProcInfo) -> Option<AgentStatus> {
         let (path, from_session_file) = self.transcript_path(proc)?;
         match transcript::read_claude(&path) {
-            Some(transcript) => Some(AgentStatus {
-                tokens: self.tokens(&path),
-                ..status(proc, transcript)
-            }),
+            Some(transcript) => {
+                let usage = self.usage(&path);
+                let usage = usage.as_ref();
+                Some(AgentStatus {
+                    tokens: usage.map(|u| u.tokens).filter(|t| t.total() > 0),
+                    model: usage.and_then(|u| u.model.clone()),
+                    context: usage
+                        .and_then(|u| u.context)
+                        .map(transcript::context_percent),
+                    ..status(proc, transcript)
+                })
+            }
             // Named by Claude itself, so the id holds before the first write.
             None if from_session_file => Some(AgentStatus {
                 session_id: path.file_stem().map(|s| s.to_string_lossy().into_owned()),

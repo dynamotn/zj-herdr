@@ -11,7 +11,7 @@ use std::time::UNIX_EPOCH;
 
 use serde::Deserialize;
 use serde_json::Value;
-use zj_herdr_core::{Tokens, WAITING_MAX_CHARS};
+use zj_herdr_core::{Task, TaskState, Tokens, WAITING_MAX_CHARS};
 
 /// Enough of a transcript tail to see where the last turn stands.
 const TAIL_BYTES: u64 = 256 * 1024;
@@ -39,6 +39,10 @@ pub struct Transcript {
     /// For [`LastTurn::PendingTool`], the most recent unanswered call, from
     /// [`describe_call`].
     pub pending: Option<String>,
+    /// The last reply was an API error.
+    pub error: bool,
+    /// Background work started in the tail read, oldest first.
+    pub tasks: Vec<Task>,
 }
 
 /// Where the conversation stands, and the call it waits on if any.
@@ -46,6 +50,8 @@ pub struct Transcript {
 pub struct Turn {
     pub last: LastTurn,
     pub pending: Option<String>,
+    pub error: bool,
+    pub tasks: Vec<Task>,
 }
 
 /// Tool calls asked for and not answered yet, oldest first, each with its
@@ -255,6 +261,26 @@ struct SessionFile {
     session_id: String,
     cwd: PathBuf,
     started_at: u64,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    spare: bool,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+/// What Claude Code records about a running process in its session file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionMeta {
+    pub session_id: String,
+    pub cwd: PathBuf,
+    /// A session the Claude Code daemon runs in the background (`kind`
+    /// `bg`); a client process in some pane shows it.
+    pub background: bool,
+    /// Started ahead of time and not claimed yet: no session of anyone's.
+    pub spare: bool,
+    /// Its name, which is also its terminal title after a glyph.
+    pub name: Option<String>,
 }
 
 /// Larger than any real session file; a bigger one is not parsed.
@@ -271,11 +297,23 @@ pub fn claude_session_file(
     pid: u32,
     start_time: u64,
 ) -> Option<(String, PathBuf)> {
+    claude_session_meta(sessions, pid, start_time).map(|m| (m.session_id, m.cwd))
+}
+
+/// [`claude_session_file`] with the rest of what the file says.
+pub fn claude_session_meta(sessions: &Path, pid: u32, start_time: u64) -> Option<SessionMeta> {
     let file = File::open(sessions.join(format!("{pid}.json"))).ok()?;
     let rec: SessionFile = serde_json::from_reader(file.take(SESSION_FILE_MAX)).ok()?;
     let fresh = rec.started_at / 1000 + SESSION_FILE_SLACK_SECS >= start_time;
-    (rec.pid == pid && fresh && crate::agents::is_valid_session_id(&rec.session_id))
-        .then_some((rec.session_id, rec.cwd))
+    (rec.pid == pid && fresh && crate::agents::is_valid_session_id(&rec.session_id)).then(|| {
+        SessionMeta {
+            session_id: rec.session_id,
+            cwd: rec.cwd,
+            background: rec.kind.as_deref() == Some("bg"),
+            spare: rec.spare,
+            name: rec.name.map(|n| one_line(&n)).filter(|n| !n.is_empty()),
+        }
+    })
 }
 
 /// The transcript of session `id` started in `cwd`:
@@ -306,6 +344,8 @@ pub fn read_claude(path: &Path) -> Option<Transcript> {
         modified: modified_secs(path)?,
         last: turn.last,
         pending: turn.pending,
+        error: turn.error,
+        tasks: turn.tasks,
     })
 }
 
@@ -321,6 +361,7 @@ struct UsageLine {
 #[derive(Deserialize)]
 struct UsageMessage {
     id: Option<String>,
+    model: Option<String>,
     usage: Option<Usage>,
 }
 
@@ -347,6 +388,23 @@ pub struct UsageCursor {
     /// line per content block of a reply, each with the reply's whole usage.
     last: Option<(String, Tokens)>,
     pub tokens: Tokens,
+    /// Model of the last real reply.
+    pub model: Option<String>,
+    /// Prompt tokens of the last real reply: what the context holds.
+    pub context: Option<u64>,
+}
+
+/// Context windows Claude models come in; a prompt past the smaller one
+/// can only be in the larger.
+const CONTEXT_WINDOWS: [u64; 2] = [200_000, 1_000_000];
+
+/// Percent of the context window `used` prompt tokens fill.
+pub fn context_percent(used: u64) -> u8 {
+    let window = CONTEXT_WINDOWS
+        .into_iter()
+        .find(|w| used <= *w)
+        .unwrap_or(CONTEXT_WINDOWS[1]);
+    (used.saturating_mul(100) / window).min(100) as u8
 }
 
 fn add(a: &Tokens, b: &Tokens) -> Tokens {
@@ -394,7 +452,12 @@ pub fn claude_usage(path: &Path, cursor: &mut UsageCursor) -> std::io::Result<()
         cursor.offset += n as u64;
         let Ok(UsageLine {
             kind: Some(kind),
-            message: Some(UsageMessage { id, usage: Some(u) }),
+            message:
+                Some(UsageMessage {
+                    id,
+                    model,
+                    usage: Some(u),
+                }),
         }) = serde_json::from_slice(&line)
         else {
             continue;
@@ -415,6 +478,15 @@ pub fn claude_usage(path: &Path, cursor: &mut UsageCursor) -> std::io::Result<()
             }
         }
         cursor.tokens = add(&cursor.tokens, &reply);
+        // An API error is a `<synthetic>` reply with zero usage.
+        if model.as_deref().is_some_and(|m| !m.starts_with('<')) {
+            cursor.model = model;
+            cursor.context = Some(
+                u.input_tokens
+                    .saturating_add(u.cache_read_input_tokens)
+                    .saturating_add(u.cache_creation_input_tokens),
+            );
+        }
         cursor.last = id.map(|id| (id, reply));
     }
 }
@@ -429,13 +501,143 @@ pub fn claude_last_turn(entries: impl Iterator<Item = Value>) -> LastTurn {
     claude_turn(entries).last
 }
 
+/// One line of at most [`WAITING_MAX_CHARS`], control characters as spaces.
+fn one_line(text: &str) -> String {
+    let line: String = text
+        .trim()
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    if line.chars().count() <= WAITING_MAX_CHARS {
+        return line;
+    }
+    let mut out: String = line.chars().take(WAITING_MAX_CHARS - 1).collect();
+    out.push('…');
+    out
+}
+
+/// Unix seconds of an RFC 3339 UTC timestamp (`2026-10-28T17:16:49.939Z`).
+fn iso_secs(text: &str) -> Option<u64> {
+    let (date, time) = text.split_once('T')?;
+    let mut d = date.splitn(3, '-').map(str::parse::<i64>);
+    let (y, m, day) = (d.next()?.ok()?, d.next()?.ok()?, d.next()?.ok()?);
+    let mut t = time.get(..8)?.splitn(3, ':').map(str::parse::<i64>);
+    let (h, min, s) = (t.next()?.ok()?, t.next()?.ok()?, t.next()?.ok()?);
+    // Days from 1970-01-01 (Howard Hinnant's days_from_civil).
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    u64::try_from(days * 86_400 + h * 3600 + min * 60 + s).ok()
+}
+
+/// The text between `<tag>` and `</tag>`.
+fn tag<'a>(text: &'a str, name: &str) -> Option<&'a str> {
+    let start = text.find(&format!("<{name}>"))? + name.len() + 2;
+    let len = text[start..].find(&format!("</{name}>"))?;
+    Some(&text[start..start + len])
+}
+
+/// Background work as Claude Code records it: a launch answers a `Bash`
+/// call with `toolUseResult.backgroundTaskId`, or an `Agent` call with
+/// `isAsync` and an `agentId`; a `<task-notification>` (a prompt, a queued
+/// command or a queue operation) reports each outcome by that id.
+#[derive(Default)]
+struct BackgroundTasks {
+    /// Calls that may launch a task: tool use id to kind and label.
+    calls: Vec<(String, &'static str, String)>,
+    /// Task id and task, in launch order.
+    tasks: Vec<(String, Task)>,
+}
+
+impl BackgroundTasks {
+    fn call(&mut self, item: &Value) {
+        let (Some(id), Some(name)) = (item["id"].as_str(), item["name"].as_str()) else {
+            return;
+        };
+        let input = &item["input"];
+        let (kind, label) = match name {
+            "Bash" if input["run_in_background"] == true => ("shell", input["command"].as_str()),
+            "Agent" | "Task" => ("agent", input["description"].as_str()),
+            _ => return,
+        };
+        let label = one_line(label.unwrap_or(name));
+        self.calls.push((id.to_string(), kind, label));
+    }
+
+    fn launched(&mut self, entry: &Value, call_id: &str, at: u64) {
+        let result = &entry["toolUseResult"];
+        let task_id = result["backgroundTaskId"].as_str().or_else(|| {
+            result["agentId"]
+                .as_str()
+                .filter(|_| result["isAsync"] == true)
+        });
+        let (Some(task_id), Some(i)) = (task_id, self.calls.iter().position(|c| c.0 == call_id))
+        else {
+            return;
+        };
+        let (_, kind, label) = self.calls.remove(i);
+        self.tasks.push((
+            task_id.to_string(),
+            Task {
+                kind: kind.into(),
+                label,
+                state: TaskState::Running,
+                started: at,
+                ended: 0,
+            },
+        ));
+    }
+
+    fn notified(&mut self, text: &str, at: u64) {
+        for note in text.split("<task-notification>").skip(1) {
+            let (Some(id), Some(status)) = (tag(note, "task-id"), tag(note, "status")) else {
+                continue;
+            };
+            let Some((_, task)) = self.tasks.iter_mut().find(|(t, _)| t == id) else {
+                continue;
+            };
+            if task.state != TaskState::Running {
+                continue;
+            }
+            task.state = match status {
+                "failed" | "error" => TaskState::Failed,
+                "killed" | "stopped" | "cancelled" => TaskState::Killed,
+                _ => TaskState::Completed,
+            };
+            task.ended = at;
+        }
+    }
+}
+
+/// The notification text an entry may carry: a prompt's content, a queued
+/// command's prompt, or a queue operation's content.
+fn notification_text(entry: &Value) -> Option<&str> {
+    [
+        &entry["message"]["content"],
+        &entry["attachment"]["prompt"],
+        &entry["content"],
+    ]
+    .into_iter()
+    .filter_map(Value::as_str)
+    .find(|t| t.contains("<task-notification>"))
+}
+
 pub fn claude_turn(entries: impl Iterator<Item = Value>) -> Turn {
     let mut open = OpenCalls::default();
     let mut last = LastTurn::Unknown;
+    let mut error = false;
+    let mut background = BackgroundTasks::default();
     for entry in entries {
         // Subagent (Task tool) traffic does not end or block the main turn.
         if entry["isSidechain"].as_bool() == Some(true) {
             continue;
+        }
+        let at = entry["timestamp"].as_str().and_then(iso_secs).unwrap_or(0);
+        if let Some(text) = notification_text(&entry) {
+            background.notified(text, at);
         }
         match entry["type"].as_str() {
             Some("assistant") => {
@@ -445,12 +647,20 @@ pub fn claude_turn(entries: impl Iterator<Item = Value>) -> Turn {
                             let name = item["name"].as_str().unwrap_or("tool");
                             let command = item["input"]["command"].as_str();
                             open.open(id, describe_call(name, command));
+                            background.call(item);
                         }
                     }
                 }
+                error = entry["isApiErrorMessage"] == true;
                 last = LastTurn::TurnEnded;
             }
             Some("user") => {
+                error = false;
+                for item in content_items(&entry) {
+                    if let Some(id) = item["tool_use_id"].as_str() {
+                        background.launched(&entry, id, at);
+                    }
+                }
                 let items = content_items(&entry);
                 let results: Vec<&str> = items
                     .iter()
@@ -479,15 +689,22 @@ pub fn claude_turn(entries: impl Iterator<Item = Value>) -> Turn {
             _ => {}
         }
     }
+    // shortcut: only the tail is read, so a task launched before it is not
+    // seen; read the whole file if long-running tasks go missing.
+    let tasks = background.tasks.into_iter().map(|(_, t)| t).collect();
     if open.is_empty() {
         Turn {
             last,
             pending: None,
+            error,
+            tasks,
         }
     } else {
         Turn {
             last: LastTurn::PendingTool,
             pending: open.latest(),
+            error,
+            tasks,
         }
     }
 }
@@ -561,6 +778,8 @@ pub fn read_codex(path: &Path, session_id: String) -> Option<Transcript> {
         modified: modified_secs(path)?,
         last: turn.last,
         pending: turn.pending,
+        error: turn.error,
+        tasks: turn.tasks,
     })
 }
 
@@ -634,11 +853,15 @@ pub fn codex_turn(entries: impl Iterator<Item = Value>) -> Turn {
         Turn {
             last: LastTurn::PendingTool,
             pending: open.latest().or(approval),
+            error: false,
+            tasks: vec![],
         }
     } else {
         Turn {
             last,
             pending: None,
+            error: false,
+            tasks: vec![],
         }
     }
 }
@@ -860,6 +1083,109 @@ mod tests {
             json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"a"}]}}),
         );
         assert_eq!(claude_turn(done.into_iter()).pending, None);
+    }
+
+    #[test]
+    fn claude_background_tasks_run_until_notified() {
+        let at = |s: &str| format!("2026-10-28T17:{s}.000Z");
+        let notify = |id: &str, status: &str| {
+            format!(
+                "<task-notification>\n<task-id>{id}</task-id>\n<status>{status}</status>\n</task-notification>"
+            )
+        };
+        let entries = vec![
+            json!({"type":"assistant","timestamp":at("00:00"),"message":{"content":[
+                {"type":"tool_use","id":"t1","name":"Bash","input":{"command":"npm run dev","run_in_background":true}},
+                {"type":"tool_use","id":"t2","name":"Agent","input":{"description":"Review diff"}},
+                {"type":"tool_use","id":"t3","name":"Bash","input":{"command":"ls"}},
+                {"type":"tool_use","id":"t4","name":"Bash","input":{"command":"make","run_in_background":true}}]}}),
+            json!({"type":"user","timestamp":at("00:01"),
+                "message":{"content":[{"type":"tool_result","tool_use_id":"t1"}]},
+                "toolUseResult":{"backgroundTaskId":"b1"}}),
+            json!({"type":"user","timestamp":at("00:02"),
+                "message":{"content":[{"type":"tool_result","tool_use_id":"t2"}]},
+                "toolUseResult":{"isAsync":true,"status":"async_launched","agentId":"a2"}}),
+            json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t3"}]},
+                "toolUseResult":{"stdout":""}}),
+            json!({"type":"user","timestamp":at("00:03"),
+                "message":{"content":[{"type":"tool_result","tool_use_id":"t4"}]},
+                "toolUseResult":{"backgroundTaskId":"b4"}}),
+            // Queued first, then delivered: the outcome counts once.
+            json!({"type":"queue-operation","timestamp":at("01:00"),"content":notify("a2","completed")}),
+            json!({"type":"user","timestamp":at("02:00"),"message":{"content":notify("a2","failed")}}),
+            json!({"type":"attachment","timestamp":at("01:30"),
+                "attachment":{"type":"queued_command","prompt":notify("b4","failed")}}),
+            json!({"type":"user","message":{"content":notify("nope","completed")}}),
+        ];
+        let tasks = claude_turn(entries.into_iter()).tasks;
+        let start = iso_secs(&at("00:00")).unwrap();
+        let brief: Vec<_> = tasks
+            .iter()
+            .map(|t| {
+                (
+                    t.kind.as_str(),
+                    t.label.as_str(),
+                    t.state,
+                    t.started - start,
+                    t.ended.saturating_sub(start),
+                )
+            })
+            .collect();
+        assert_eq!(
+            brief,
+            [
+                ("shell", "npm run dev", TaskState::Running, 1, 0),
+                ("agent", "Review diff", TaskState::Completed, 2, 60),
+                ("shell", "make", TaskState::Failed, 3, 90),
+            ]
+        );
+    }
+
+    #[test]
+    fn claude_api_error_ends_a_turn_until_the_next_prompt() {
+        let error = json!({"type":"assistant","isApiErrorMessage":true,
+            "message":{"model":"<synthetic>","content":[{"type":"text","text":"API Error"}]}});
+        let turn = claude_turn(vec![error.clone()].into_iter());
+        assert!(turn.error);
+        assert_eq!(turn.last, LastTurn::TurnEnded);
+        let prompt = json!({"type":"user","message":{"content":"try again"}});
+        assert!(!claude_turn(vec![error, prompt].into_iter()).error);
+    }
+
+    #[test]
+    fn reads_timestamps_and_context_use() {
+        assert_eq!(iso_secs("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(iso_secs("2026-10-28T17:16:49.939Z"), Some(1_793_207_809));
+        assert_eq!(iso_secs("2024-02-29T12:00:00Z"), Some(1_709_208_000));
+        assert_eq!(iso_secs("garbage"), None);
+        assert_eq!(context_percent(0), 0);
+        assert_eq!(context_percent(150_000), 75);
+        assert_eq!(context_percent(200_000), 100);
+        assert_eq!(context_percent(500_000), 50, "past 200k: the 1M window");
+        assert_eq!(context_percent(2_000_000), 100);
+    }
+
+    #[test]
+    fn claude_usage_keeps_the_last_real_reply_s_model_and_context() {
+        let dir = std::env::temp_dir().join(format!("zj-herdr-ctx-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s.jsonl");
+        let reply = |id: &str, model: &str, input: u64| {
+            json!({"type":"assistant","message":{"id":id,"model":model,
+                "usage":{"input_tokens":input,"cache_read_input_tokens":1000}}})
+            .to_string()
+        };
+        let text = [
+            reply("r1", "claude-opus-5-5", 10),
+            reply("r2", "<synthetic>", 0),
+        ]
+        .join("\n");
+        fs::write(&path, text + "\n").unwrap();
+        let mut cursor = UsageCursor::default();
+        claude_usage(&path, &mut cursor).unwrap();
+        assert_eq!(cursor.model.as_deref(), Some("claude-opus-5-5"));
+        assert_eq!(cursor.context, Some(1010));
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

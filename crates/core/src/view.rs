@@ -304,7 +304,7 @@ pub fn attention_order(state: &StateV1) -> Vec<&Agent> {
         .iter()
         .filter(|m| is_local(m) && m.status == MachineStatus::Ok)
         .flat_map(|m| &m.agents)
-        .filter(|a| a.pane.is_some() && matches!(a.state, AgentState::Blocked | AgentState::Idle))
+        .filter(|a| a.pane.is_some() && a.needs_you())
         .collect();
     out.sort_by_key(|a| agent_key(a));
     out
@@ -351,6 +351,13 @@ mod tests {
             waiting: None,
             started: 0,
             tokens: None,
+            error: false,
+            acked: false,
+            tasks: vec![],
+            model: None,
+            context: None,
+            background: false,
+            title: None,
         }
     }
 

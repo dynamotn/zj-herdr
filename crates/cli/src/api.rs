@@ -7,6 +7,7 @@
 //! {"op":"spawn","session":"dev","cwd":"/w","command":["claude"]}
 //! {"op":"subscribe"}
 //! {"op":"adopt","agent":"box/123","session":"dev"}
+//! {"op":"ack","agent":"box/123"}
 //! ```
 //!
 //! Every request gets one [`Response`] line, except `subscribe`, which gets
@@ -67,6 +68,9 @@ pub enum Request {
     /// Stop a local agent running outside Zellij and resume its session in
     /// a new pane of Zellij session `session`.
     Adopt { agent: String, session: String },
+    /// Mark an idle agent seen: it stops counting as needing you until it
+    /// changes state.
+    Ack { agent: String },
 }
 
 pub fn parse_request(line: &str) -> Result<Request, String> {

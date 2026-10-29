@@ -255,6 +255,13 @@ mod tests {
             waiting: None,
             started: 1000,
             tokens: None,
+            error: false,
+            acked: false,
+            tasks: vec![],
+            model: None,
+            context: None,
+            background: false,
+            title: None,
         }
     }
 
@@ -428,5 +435,28 @@ mod tests {
         assert!(!may_signal(std::process::id()));
         assert!(!may_signal(u32::MAX), "would be -1: every process");
         assert!(may_signal(4242));
+    }
+
+    #[test]
+    fn system_processes_see_and_stop_a_real_process() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let sys = SystemProcesses;
+        let agent = Agent {
+            pid,
+            started: 0,
+            ..outside()
+        };
+        assert!(!sys.is_agent(&agent), "`sleep` is no claude");
+        assert!(sys.helpers(&agent).is_empty());
+        assert!(sys.alive(pid));
+        sys.terminate(pid).unwrap();
+        child.wait().unwrap();
+        assert!(!sys.alive(pid));
+        assert!(sys.terminate(1).unwrap_err().contains("refusing"));
+        assert!(!sys.alive(u32::MAX));
     }
 }

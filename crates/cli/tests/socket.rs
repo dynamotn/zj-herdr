@@ -74,6 +74,13 @@ fn agent(machine: &str, pid: u32, state: AgentState, pane: Option<Pane>) -> Agen
         waiting: None,
         started: 0,
         tokens: None,
+        error: false,
+        acked: false,
+        tasks: vec![],
+        model: None,
+        context: None,
+        background: false,
+        title: None,
     }
 }
 
@@ -423,6 +430,15 @@ fn adopt_moves_an_outside_agent_into_the_session() {
     assert!(err.contains("only local agents"), "{err}");
     let err = d.request(adopt("box/99")).unwrap_err();
     assert!(err.contains("no running agent"), "{err}");
+    // A background session: a client in some pane shows it.
+    let mut bg = agent("box", 13, AgentState::Idle, None);
+    bg.session_id = Some("jkl".into());
+    bg.background = true;
+    let mut box_agents = d.registry.snapshot().machines[0].agents.clone();
+    box_agents.push(bg);
+    d.registry.publish(machine("box", box_agents), 2);
+    let err = d.request(adopt("box/13")).unwrap_err();
+    assert!(err.contains("background session"), "{err}");
     assert_eq!(d.fake.calls.lock().unwrap().len(), calls, "nothing spawned");
 }
 

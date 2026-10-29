@@ -94,7 +94,25 @@ struct Inner {
     generated_at: u64,
     /// Bumped when an agent state or a machine status changes.
     changes: u64,
+    /// Agents marked seen, with the `since` of the idle spell they saw.
+    acks: BTreeMap<String, u64>,
     subscribers: Vec<Sender<String>>,
+}
+
+/// Mark `machine`'s agents seen per `acks`, forgetting the marks of its
+/// agents that left the idle spell they were made in.
+fn apply_acks(acks: &mut BTreeMap<String, u64>, machine: &mut Machine) {
+    let prefix = format!("{}/", machine.name);
+    acks.retain(|id, since| {
+        !id.starts_with(&prefix)
+            || machine
+                .agents
+                .iter()
+                .any(|a| &a.id == id && a.since == *since && a.state == AgentState::Idle)
+    });
+    for a in &mut machine.agents {
+        a.acked = acks.get(&a.id) == Some(&a.since);
+    }
 }
 
 fn machine_line(m: &Machine) -> String {
@@ -133,6 +151,7 @@ impl Registry {
         let changes = tracker.update(std::mem::take(&mut machine.agents), now);
         let expired = tracker.take_expired();
         machine.agents = tracker.agents();
+        apply_acks(&mut inner.acks, &mut machine);
         let mut recovered = false;
         let mut lines = Vec::new();
         match inner.machines.iter_mut().find(|m| m.name == machine.name) {
@@ -274,6 +293,44 @@ impl Registry {
         }
     }
 
+    /// Mark the idle agent `selector` names as seen, until it next changes
+    /// state. Pane selectors mean this machine's agent.
+    pub fn ack(&self, selector: &str, local: &str) -> Result<Agent, String> {
+        let mut inner = self.lock();
+        let matches: Vec<(usize, usize)> = inner
+            .machines
+            .iter()
+            .enumerate()
+            .flat_map(|(m, machine)| {
+                machine
+                    .agents
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, a)| a.matches(selector))
+                    .map(move |(i, a)| (m, i, a.machine == local))
+            })
+            .map(|(m, i, _)| (m, i))
+            .collect();
+        let local_first = matches
+            .iter()
+            .find(|(m, _)| inner.machines[*m].name == local)
+            .or(matches.first())
+            .copied();
+        let Some((m, i)) = local_first else {
+            return Err(format!("no agent matches {selector:?}"));
+        };
+        let agent = &mut inner.machines[m].agents[i];
+        if agent.state != AgentState::Idle {
+            return Err(format!("{} is {}, not idle", agent.id, agent.state));
+        }
+        agent.acked = true;
+        let agent = agent.clone();
+        inner.acks.insert(agent.id.clone(), agent.since);
+        inner.changes += 1;
+        self.changed.notify_all();
+        Ok(agent)
+    }
+
     pub fn find_all(&self, selector: &str) -> Vec<Agent> {
         let inner = self.lock();
         inner
@@ -305,6 +362,13 @@ mod tests {
             waiting: None,
             started: 0,
             tokens: None,
+            error: false,
+            acked: false,
+            tasks: vec![],
+            model: None,
+            context: None,
+            background: false,
+            title: None,
         }
     }
 
@@ -316,6 +380,37 @@ mod tests {
             error: None,
             agents,
         }
+    }
+
+    #[test]
+    fn ack_marks_an_idle_agent_seen_until_it_changes_state() {
+        let reg = Registry::default();
+        reg.publish(
+            machine(vec![
+                agent(1, AgentState::Idle, 10),
+                agent(2, AgentState::Working, 10),
+            ]),
+            100,
+        );
+        let before = reg.change_count();
+        assert!(reg.ack("m/2", "m").unwrap_err().contains("not idle"));
+        assert!(reg.ack("m/9", "m").is_err());
+        assert!(reg.ack("m/1", "m").unwrap().acked);
+        assert!(reg.change_count() > before, "the plugin is pushed the mark");
+        let acked = |reg: &Registry| {
+            reg.snapshot()
+                .agents()
+                .find(|a| a.id == "m/1")
+                .unwrap()
+                .acked
+        };
+        // Still idle in the next scan: still seen.
+        reg.publish(machine(vec![agent(1, AgentState::Idle, 10)]), 101);
+        assert!(acked(&reg));
+        // Working, then idle again: a new idle spell needs you again.
+        reg.publish(machine(vec![agent(1, AgentState::Working, 10)]), 102);
+        reg.publish(machine(vec![agent(1, AgentState::Idle, 10)]), 103);
+        assert!(!acked(&reg));
     }
 
     #[test]

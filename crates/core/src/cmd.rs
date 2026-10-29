@@ -45,6 +45,10 @@ pub enum PluginCommand {
     SelectPrev,
     /// Jump to the agent under the cursor.
     Jump,
+    /// Switch to the next Zellij session, by name.
+    SessionNext,
+    /// Switch to the previous Zellij session, by name.
+    SessionPrev,
     /// Type `text` into a terminal pane of this session.
     Prompt { pane_id: u32, text: String },
 }
@@ -67,6 +71,8 @@ impl PluginCommand {
             "select-next" => Ok(PluginCommand::SelectNext),
             "select-prev" => Ok(PluginCommand::SelectPrev),
             "jump" => Ok(PluginCommand::Jump),
+            "session-next" => Ok(PluginCommand::SessionNext),
+            "session-prev" => Ok(PluginCommand::SessionPrev),
             other => Err(format!("unknown {CMD_SCHEMA} command {other:?}")),
         }
     }
@@ -97,6 +103,8 @@ mod tests {
             ("select-next", PluginCommand::SelectNext),
             ("select-prev", PluginCommand::SelectPrev),
             ("jump", PluginCommand::Jump),
+            ("session-next", PluginCommand::SessionNext),
+            ("session-prev", PluginCommand::SessionPrev),
         ] {
             assert_eq!(PluginCommand::parse(&format!("{word}\n")), Ok(cmd.clone()));
             assert_eq!(cmd.to_json(), format!(r#"{{"cmd":"{word}"}}"#));

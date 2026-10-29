@@ -10,8 +10,9 @@ use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::Duration;
 
-use zj_herdr_core::{prompt_reply, AgentState, PluginCommand, CMD_SCHEMA};
+use zj_herdr_core::{prompt_reply, Agent, AgentState, PluginCommand, CMD_SCHEMA};
 
+use crate::adopt::{self, Processes};
 use crate::api::{self, Request, Response};
 use crate::paths;
 use crate::registry::Registry;
@@ -24,6 +25,10 @@ pub struct Context {
     pub machine: String,
     /// Zellij plugin URL or alias that types prompts.
     pub plugin: String,
+    /// What `adopt` uses to check and stop agent processes.
+    pub procs: Arc<dyn Processes>,
+    /// How long `adopt` waits for an agent to exit.
+    pub adopt_timeout: Duration,
 }
 
 /// Bind the socket with mode 0600 in a directory others cannot tamper
@@ -233,7 +238,44 @@ pub fn respond(ctx: &Context, req: Request) -> Response {
         Request::Subscribe => {
             Response::error("subscribe streams events; send it on its own connection")
         }
+        Request::Adopt { agent, session } => match adopt_agent(ctx, &agent, &session) {
+            Ok(agent) => Response {
+                agent: Some(agent),
+                ..Response::ok()
+            },
+            Err(e) => Response::error(e),
+        },
     }
+}
+
+/// [`adopt::adopt`] the running local agent `selector` names.
+fn adopt_agent(ctx: &Context, selector: &str, session: &str) -> Result<Agent, String> {
+    let matches: Vec<Agent> = ctx
+        .registry
+        .find_all(selector)
+        .into_iter()
+        .filter(|a| a.state != AgentState::Done)
+        .collect();
+    let agent = matches
+        .iter()
+        .find(|a| a.machine == ctx.machine)
+        .or(matches.first())
+        .cloned()
+        .ok_or_else(|| format!("no running agent matches {selector:?}"))?;
+    if agent.machine != ctx.machine {
+        return Err(format!(
+            "{} is on {}; only local agents can be adopted",
+            agent.id, agent.machine
+        ));
+    }
+    adopt::adopt(
+        &agent,
+        session,
+        ctx.zellij.as_ref(),
+        ctx.procs.as_ref(),
+        ctx.adopt_timeout,
+    )?;
+    Ok(agent)
 }
 
 fn prompt(ctx: &Context, selector: &str, mut text: String, submit: bool) -> Result<(), String> {

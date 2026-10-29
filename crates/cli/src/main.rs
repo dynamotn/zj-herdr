@@ -80,6 +80,15 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Move an agent running outside Zellij into a Zellij session: stop it
+    /// (SIGTERM, up to 5 s) and resume its session in a new pane there.
+    Adopt {
+        /// Agent id (`machine/pid`) or pid.
+        agent: String,
+        /// Zellij session to open it in.
+        #[arg(long, short)]
+        session: String,
+    },
     /// Reopen recorded agent sessions in their Zellij sessions with their
     /// resume command (`claude --resume <id>`, `codex resume <id>`).
     Restore {
@@ -259,6 +268,22 @@ fn run(cli: Cli) -> Result<(), String> {
             }
             true
         })?,
+        Command::Adopt { agent, session } => {
+            let resp = client::request(
+                &socket,
+                &Request::Adopt {
+                    agent,
+                    session: session.clone(),
+                },
+            )?;
+            if let Some(agent) = resp.agent {
+                println!(
+                    "moved {} into {}",
+                    output::clean(&agent.id),
+                    output::clean(&session)
+                );
+            }
+        }
         Command::Restore { session, dry_run } => restore(&socket, session.as_deref(), dry_run)?,
     }
     Ok(())

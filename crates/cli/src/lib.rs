@@ -1,5 +1,6 @@
 //! zj-herdr: hook-free agent detection, daemon, socket API and CLI.
 
+pub mod adopt;
 pub mod agents;
 pub mod api;
 pub mod client;

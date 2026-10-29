@@ -92,7 +92,11 @@ CLI, and the daemon serves only connections from its own uid.
   that have agents. When the list leaves at least two lines free, the
   counts move from the header to a footer on the last line,
   `3 working · 2 need you` (blocked plus idle; the second part only when
-  some agent needs you). Agents outside Zellij and remote machines stay grouped by host
+  some agent needs you).
+- Clicking (or `jump` on) an agent that runs outside Zellij arms it: its
+  row reads `click again to move here` for 5 s, and a second click within
+  that time runs `zj-herdr adopt <id> --session <this session>`, which
+  moves it into a new pane here. Any other click disarms it. Agents outside Zellij and remote machines stay grouped by host
   and session. Click an agent, tab or session row to jump to it.
   Zellij does not always describe other sessions to a plugin, so the
   daemon also records each agent's tab: every 5 s at most, it runs
@@ -106,8 +110,9 @@ CLI, and the daemon serves only connections from its own uid.
   blocked ones first, then idle ones.
 
 The plugin asks for permission to read and change application state, write
-to panes (for `prompt`), read CLI pipes, and run commands (once, to fetch the
-first snapshot with `zj-herdr list --json`). Plugin options:
+to panes (for `prompt`), read CLI pipes, and run commands (to fetch the
+first snapshot with `zj-herdr list --json`, and for `zj-herdr adopt`).
+Plugin options:
 
 | Option | Default | Meaning |
 |---|---|---|
@@ -166,7 +171,15 @@ zj-herdr prompt <agent> <text...> [--no-enter]
 zj-herdr spawn --session S [--cwd DIR] -- <command...>
 zj-herdr watch [--json]                # stream state changes
 zj-herdr restore [--session S] [--dry-run]
+zj-herdr adopt <agent> --session S      # move an agent from outside Zellij into S
 ```
+
+`adopt` works on a local agent running outside Zellij whose session id is
+known and whose kind has a resume command (`claude`, `codex`). The daemon
+checks that the pid still runs that agent, sends it SIGTERM, waits up to
+5 s for it to exit (and fails without opening anything if it does not),
+then opens `claude --resume <id>` or `codex resume <id>` in a new pane of
+session S, in the agent's cwd.
 
 `<agent>` is an id (`machine/pid`), a pid, or `session:pane_id`. `wait`
 exits 1 on timeout, so an agent can wait for another to need attention:
@@ -185,6 +198,7 @@ Newline-delimited JSON on the socket; one response line per request:
 {"op":"prompt","agent":"dev:3","text":"continue","submit":true}
 {"op":"spawn","session":"dev","cwd":"/work","command":["claude"]}
 {"op":"subscribe"}
+{"op":"adopt","agent":"box/123","session":"dev"}
 ```
 
 Responses look like `{"ok":true,"state":{...}}` or

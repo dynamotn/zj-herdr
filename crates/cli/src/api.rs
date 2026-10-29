@@ -6,6 +6,7 @@
 //! {"op":"prompt","agent":"dev:3","text":"continue"}
 //! {"op":"spawn","session":"dev","cwd":"/w","command":["claude"]}
 //! {"op":"subscribe"}
+//! {"op":"adopt","agent":"box/123","session":"dev"}
 //! ```
 //!
 //! Every request gets one [`Response`] line, except `subscribe`, which gets
@@ -63,6 +64,9 @@ pub enum Request {
     },
     /// Stream a snapshot, then every state change.
     Subscribe,
+    /// Stop a local agent running outside Zellij and resume its session in
+    /// a new pane of Zellij session `session`.
+    Adopt { agent: String, session: String },
 }
 
 pub fn parse_request(line: &str) -> Result<Request, String> {
@@ -201,6 +205,14 @@ mod tests {
         assert!(
             matches!(spawn, Request::Spawn { command: CommandLine::Argv(ref a), .. } if a == &["codex"])
         );
+        assert_eq!(
+            parse_request(r#"{"op":"adopt","agent":"box/7","session":"dev"}"#),
+            Ok(Request::Adopt {
+                agent: "box/7".into(),
+                session: "dev".into()
+            })
+        );
+        assert!(parse_request(r#"{"op":"adopt","agent":"box/7"}"#).is_err());
     }
 
     #[test]

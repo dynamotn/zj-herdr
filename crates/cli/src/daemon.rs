@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use zj_herdr_core::{Agent, PaneTab, STATE_SCHEMA};
 
+use crate::adopt::{SystemProcesses, ADOPT_TIMEOUT};
 use crate::config::Remote;
 use crate::detect::Roots;
 use crate::registry::Registry;
@@ -99,6 +100,8 @@ pub fn run(opts: Options) -> Result<(), String> {
         zellij: Arc::clone(&zellij),
         machine: opts.machine.clone(),
         plugin: opts.plugin.clone(),
+        procs: Arc::new(SystemProcesses),
+        adopt_timeout: ADOPT_TIMEOUT,
     });
     eprintln!("zj-herdr: listening on {}", opts.socket.display());
 

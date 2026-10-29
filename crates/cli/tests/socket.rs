@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+use zj_herdr::adopt::Processes;
 use zj_herdr::api::{CommandLine, Event, Request};
 use zj_herdr::client;
 use zj_herdr::registry::Registry;
@@ -88,6 +89,26 @@ fn dev_pane() -> Option<Pane> {
     Some(Pane::new("dev", 3))
 }
 
+/// Every process is the agent it claims to be and exits on SIGTERM; no
+/// real process is ever signalled.
+#[derive(Default)]
+struct FakeProcs {
+    stopped: Mutex<Vec<u32>>,
+}
+
+impl Processes for FakeProcs {
+    fn is_agent(&self, _: &Agent) -> bool {
+        true
+    }
+    fn terminate(&self, pid: u32) -> Result<(), String> {
+        self.stopped.lock().unwrap().push(pid);
+        Ok(())
+    }
+    fn alive(&self, pid: u32) -> bool {
+        !self.stopped.lock().unwrap().contains(&pid)
+    }
+}
+
 struct Daemon {
     registry: Arc<Registry>,
     fake: Arc<FakeZellij>,
@@ -103,6 +124,8 @@ impl Daemon {
             zellij: fake.clone(),
             machine: "box".into(),
             plugin: "zj_herdr".into(),
+            procs: Arc::new(FakeProcs::default()),
+            adopt_timeout: Duration::from_millis(200),
         });
         Daemon {
             registry,
@@ -360,6 +383,36 @@ fn spawn_runs_in_the_session() {
     };
     d.request(spawn).unwrap();
     assert_eq!(d.last_call(), "run dev Some(\"/w\") claude");
+}
+
+#[test]
+fn adopt_moves_an_outside_agent_into_the_session() {
+    let d = Daemon::new();
+    let mut outside = agent("box", 10, AgentState::Idle, None);
+    outside.session_id = Some("abc".into());
+    let mut inside = agent("box", 11, AgentState::Idle, dev_pane());
+    inside.session_id = Some("def".into());
+    d.registry.publish(machine("box", vec![outside, inside]), 1);
+    let mut far = agent("far", 12, AgentState::Idle, None);
+    far.session_id = Some("ghi".into());
+    d.registry.publish(machine("far", vec![far]), 1);
+
+    let adopt = |agent: &str| Request::Adopt {
+        agent: agent.into(),
+        session: "dev".into(),
+    };
+    let resp = d.request(adopt("box/10")).unwrap();
+    assert_eq!(resp.agent.unwrap().id, "box/10");
+    assert_eq!(d.last_call(), "run dev Some(\"/w\") claude --resume abc");
+
+    let calls = d.fake.calls.lock().unwrap().len();
+    let err = d.request(adopt("box/11")).unwrap_err();
+    assert!(err.contains("already runs in Zellij"), "{err}");
+    let err = d.request(adopt("far/12")).unwrap_err();
+    assert!(err.contains("only local agents"), "{err}");
+    let err = d.request(adopt("box/99")).unwrap_err();
+    assert!(err.contains("no running agent"), "{err}");
+    assert_eq!(d.fake.calls.lock().unwrap().len(), calls, "nothing spawned");
 }
 
 #[test]

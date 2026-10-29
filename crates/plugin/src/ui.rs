@@ -75,20 +75,38 @@ fn tally(state: &StateV1) -> String {
     }
 }
 
+/// What [`render`] draws besides the tree.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Frame<'a> {
+    pub state: Option<&'a StateV1>,
+    /// The session this instance runs in.
+    pub current: Option<&'a str>,
+    /// Id of the agent under the cursor.
+    pub selected: Option<&'a str>,
+    pub error: Option<&'a str>,
+    /// Id of the agent waiting for a second click to move here.
+    pub armed: Option<&'a str>,
+    /// Unix seconds.
+    pub now: u64,
+}
+
 /// The picker as lines, each with what a click on it does: a summary,
 /// then `tree` (from [`view::tree`]), scrolled so the selected agent stays
-/// visible within `rows`. `current` is the session this instance runs in.
-/// When the tree leaves two lines spare, the counts move from the header to
-/// a footer on the last line.
+/// visible within `rows`. When the tree leaves two lines spare, the counts
+/// move from the header to a footer on the last line.
 pub fn render(
-    state: Option<&StateV1>,
+    frame: Frame,
     tree: &[Row],
-    current: Option<&str>,
-    selected: Option<&str>,
-    error: Option<&str>,
-    now: u64,
     (rows, cols): (usize, usize),
 ) -> (Vec<String>, Vec<Option<Target>>) {
+    let Frame {
+        state,
+        current,
+        selected,
+        error,
+        armed,
+        now,
+    } = frame;
     let mut head = Vec::new();
     let mut body: Vec<(String, bool, Option<Target>)> = Vec::new();
     match state {
@@ -169,10 +187,12 @@ pub fn render(
                             (true, false) => "  └ ",
                         };
                         let ssh = ssh_of(&agent.machine);
-                        let text = truncate(
-                            &agent_text(agent, branch, *local, ssh.as_deref(), now),
-                            cols,
-                        );
+                        let text = if armed == Some(agent.id.as_str()) {
+                            format!("{branch}{} click again to move here", agent.state.glyph())
+                        } else {
+                            agent_text(agent, branch, *local, ssh.as_deref(), now)
+                        };
+                        let text = truncate(&text, cols);
                         let is_sel = selected == Some(agent.id.as_str());
                         let styled = if is_sel {
                             format!("{INVERSE}{text:<cols$}{RESET}")
@@ -311,7 +331,40 @@ mod tests {
         size: (usize, usize),
     ) -> Vec<String> {
         let tree = view::tree(st, None, &[]);
-        plain(&render(Some(st), &tree, None, selected, error, now, size).0)
+        let frame = Frame {
+            state: Some(st),
+            selected,
+            error,
+            now,
+            ..Frame::default()
+        };
+        plain(&render(frame, &tree, size).0)
+    }
+
+    /// The frame of an instance in session `dev`.
+    fn dev_frame(st: &StateV1) -> Frame<'_> {
+        Frame {
+            state: Some(st),
+            current: Some("dev"),
+            now: 160,
+            ..Frame::default()
+        }
+    }
+
+    #[test]
+    fn an_armed_agent_asks_for_a_second_click() {
+        let mut st = state(2);
+        st.machines[0].agents[1].pane = None;
+        let tree = view::tree(&st, None, &[]);
+        let frame = Frame {
+            armed: Some("box/2"),
+            ..dev_frame(&st)
+        };
+        let (lines, targets) = render(frame, &tree, (6, 80));
+        let lines = plain(&lines);
+        assert_eq!(lines[3], "    ! blocked  claude  1m     #1 proj1");
+        assert_eq!(lines[5], "    ● click again to move here");
+        assert_eq!(targets[5], Some(Target::Agent("box/2".into())));
     }
 
     #[test]
@@ -384,7 +437,7 @@ mod tests {
             ],
         }];
         let tree = view::tree(&st, Some("dev"), &layouts);
-        let (lines, targets) = render(Some(&st), &tree, Some("dev"), None, None, 160, (20, 80));
+        let (lines, targets) = render(dev_frame(&st), &tree, (20, 80));
         let lines = plain(&lines);
         assert_eq!(lines[2], "  dev");
         assert_eq!(lines[3], "  ▌! 1 code");
@@ -425,7 +478,7 @@ mod tests {
             }],
         }];
         let tree = view::tree(&st, Some("dev"), &layouts);
-        let (lines, targets) = render(Some(&st), &tree, Some("dev"), None, None, 160, (20, 80));
+        let (lines, targets) = render(dev_frame(&st), &tree, (20, 80));
         let lines = plain(&lines);
         assert_eq!(lines[4], "  ├ ! blocked  claude  1m     #1 proj1");
         assert_eq!(lines[5], "  │ ↳ Bash: make 1");
@@ -439,7 +492,7 @@ mod tests {
         // The last agent of a tab, and one outside any tab.
         st.machines[0].agents[2].state = AgentState::Blocked;
         let tree = view::tree(&st, Some("dev"), &layouts);
-        let lines = plain(&render(Some(&st), &tree, Some("dev"), None, None, 160, (20, 80)).0);
+        let lines = plain(&render(dev_frame(&st), &tree, (20, 80)).0);
         assert_eq!(lines[9], "    ↳ Bash: make 3");
         let lines = draw(&st, None, None, 160, (20, 80));
         assert_eq!(lines[4], "    ↳ Bash: make 1");

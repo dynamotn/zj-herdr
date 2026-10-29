@@ -181,27 +181,44 @@ impl ProcessTable {
             .processes()
             .values()
             .filter(|p| p.thread_kind().is_none())
-            .map(|p| RawProc {
-                pid: p.pid().as_u32(),
-                ppid: p.parent().map(|pp| pp.as_u32()),
-                name: p.name().to_string_lossy().into_owned(),
-                exe: p.exe().map(|e| e.to_string_lossy().into_owned()),
-                argv: p
-                    .cmd()
-                    .iter()
-                    .map(|a| a.to_string_lossy().into_owned())
-                    .collect(),
-                cwd: p.cwd().map(PathBuf::from),
-                pane: pane_from_env(
-                    p.environ()
-                        .iter()
-                        .filter_map(|kv| kv.to_str()?.split_once('=')),
-                ),
-                cpu: p.cpu_usage(),
-                start_time: p.start_time(),
-            })
+            .map(raw_proc)
             .collect()
     }
+}
+
+fn raw_proc(p: &sysinfo::Process) -> RawProc {
+    RawProc {
+        pid: p.pid().as_u32(),
+        ppid: p.parent().map(|pp| pp.as_u32()),
+        name: p.name().to_string_lossy().into_owned(),
+        exe: p.exe().map(|e| e.to_string_lossy().into_owned()),
+        argv: p
+            .cmd()
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect(),
+        cwd: p.cwd().map(PathBuf::from),
+        pane: pane_from_env(
+            p.environ()
+                .iter()
+                .filter_map(|kv| kv.to_str()?.split_once('=')),
+        ),
+        cpu: p.cpu_usage(),
+        start_time: p.start_time(),
+    }
+}
+
+/// One process as it is now, without CPU figures; `None` once it is gone.
+pub fn snapshot(pid: u32) -> Option<RawProc> {
+    let mut sys = System::new();
+    let kind = ProcessRefreshKind::nothing()
+        .with_cmd(UpdateKind::Always)
+        .with_exe(UpdateKind::Always)
+        .with_environ(UpdateKind::Always)
+        .with_cwd(UpdateKind::Always);
+    let pid = sysinfo::Pid::from_u32(pid);
+    sys.refresh_processes_specifics(ProcessesToUpdate::Some(&[pid]), true, kind);
+    sys.process(pid).map(raw_proc)
 }
 
 #[cfg(test)]

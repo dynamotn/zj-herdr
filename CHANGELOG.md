@@ -6,6 +6,8 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-10-30
+
 ### Added
 
 - The mouse wheel over the rail moves its cursor, scrolling a list longer
@@ -125,7 +127,8 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `start_daemon` to launch the daemon from Zellij.
 - Release archives of the CLI for Linux and macOS, and the plugin wasm.
 
-[Unreleased]: https://github.com/dynamotn/zj-herdr/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/dynamotn/zj-herdr/compare/v0.3.2...HEAD
+[0.3.2]: https://github.com/dynamotn/zj-herdr/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/dynamotn/zj-herdr/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/dynamotn/zj-herdr/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/dynamotn/zj-herdr/compare/v0.2.0...v0.2.1

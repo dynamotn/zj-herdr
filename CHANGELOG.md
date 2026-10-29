@@ -6,6 +6,12 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- The daemon no longer keeps Zellij busy: it pushes state at most every two
+  seconds and only to sessions someone is attached to, cutting Zellij's CPU
+  use from about two cores to under one with ten sessions open.
+
 ## [0.3.1] - 2026-10-29
 
 ### Fixed

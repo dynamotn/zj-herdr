@@ -10,8 +10,10 @@ zj-herdr daemon
 
 It rescans every second, serves `$XDG_RUNTIME_DIR/zj-herdr.sock` (falling
 back to `$TMPDIR/zj-herdr-$UID.sock`; override with `--socket` or
-`$ZJ_HERDR_SOCKET`), and pushes state to every running Zellij session with
-`zellij pipe --name zj_herdr.state.v1`. The socket is mode 0600, in a
+`$ZJ_HERDR_SOCKET`), and pushes state with
+`zellij pipe --name zj_herdr.state.v1` at most every two seconds, only to
+sessions with a client attached; a session catches up when one attaches.
+The socket is mode 0600, in a
 directory that is either private or shared with the sticky bit (`/tmp`).
 A socket path owned by another user is refused by both the daemon and the
 CLI, and the daemon serves only connections from its own uid.

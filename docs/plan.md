@@ -64,8 +64,8 @@ mode 0600). Newline-delimited JSON requests:
 - `subscribe`: stream state changes.
 
 CLI subcommands map one to one: `zj-herdr list|wait|prompt|spawn|watch`.
-When the state of an agent changes, the daemon pushes it to every Zellij
-session that has the plugin loaded:
+When the state of an agent changes, the daemon pushes it, at most every two
+seconds, to every Zellij session with a client attached:
 `zellij --session S pipe --name zj_herdr.state.v1 -- <json>`.
 Use `tokio` only if plain threads get awkward; prefer fewer dependencies.
 

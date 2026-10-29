@@ -19,6 +19,11 @@ const DELIVER_CONFIG: &str = "deliver_prompts=true";
 pub trait Zellij: Send + Sync {
     /// Names of the running sessions.
     fn sessions(&self) -> Result<Vec<String>, String>;
+    /// Whether a client is attached to the session, from `zellij --session S
+    /// action list-clients`. Fakes default to attached.
+    fn attached(&self, _session: &str) -> Result<bool, String> {
+        Ok(true)
+    }
     /// `zellij --session S pipe --name NAME -- PAYLOAD`: to every plugin
     /// already loaded in the session.
     fn pipe(&self, session: &str, name: &str, payload: &str) -> Result<(), String>;
@@ -93,6 +98,11 @@ pub fn parse_sessions(stdout: &str) -> Vec<String> {
         .collect()
 }
 
+/// Whether `list-clients` names any client: a header line, then one row each.
+pub fn parse_attached(stdout: &str) -> bool {
+    stdout.lines().skip(1).any(|l| !l.trim().is_empty())
+}
+
 /// Terminal panes and their tabs from `list-panes --json --tab`: an array
 /// of objects with `id`, `is_plugin`, `tab_position` and `tab_name` (a
 /// `{"panes": [...]}` wrapper is accepted too). Plugin panes and entries
@@ -130,6 +140,12 @@ impl Zellij for ZellijCli {
             Err(e) if e.contains("No active zellij sessions") => Ok(vec![]),
             Err(e) => Err(e),
         }
+    }
+
+    fn attached(&self, session: &str) -> Result<bool, String> {
+        let mut cmd = Command::new("zellij");
+        cmd.args(["--session", session, "action", "list-clients"]);
+        exec::run(cmd, ZELLIJ_TIMEOUT).map(|out| parse_attached(&out.stdout))
     }
 
     fn pipe(&self, session: &str, name: &str, payload: &str) -> Result<(), String> {
@@ -182,6 +198,17 @@ mod tests {
         let out =
             "main\nwork [Created 2h ago]\nold [Created 1d ago] (EXITED - attach to resurrect)\n\n";
         assert_eq!(parse_sessions(out), vec!["main", "work"]);
+    }
+
+    #[test]
+    fn parses_attached_clients() {
+        assert!(!parse_attached(
+            "CLIENT_ID ZELLIJ_PANE_ID RUNNING_COMMAND\n"
+        ));
+        assert!(!parse_attached(""));
+        assert!(parse_attached(
+            "CLIENT_ID ZELLIJ_PANE_ID RUNNING_COMMAND\n1         terminal_0     claude\n"
+        ));
     }
 
     #[test]

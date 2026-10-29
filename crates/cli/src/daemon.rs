@@ -20,8 +20,9 @@ use crate::zellij::{Zellij, ZellijCli};
 
 /// The plan's cadence: fast enough to feel live, cheap enough to leave on.
 pub const SCAN_INTERVAL: Duration = Duration::from_secs(1);
-/// How often the pusher looks for changes to deliver.
-const PUSH_POLL: Duration = Duration::from_millis(250);
+/// How often the pusher looks for changes to deliver. Every delivery makes
+/// each zj_herdr instance parse the whole state, so faster burns CPU.
+const PUSH_POLL: Duration = Duration::from_secs(2);
 /// Re-push unchanged state this often so a plugin loaded after the last
 /// change, or a new session, fills in within a few seconds.
 const PUSH_HEARTBEAT: Duration = Duration::from_secs(5);
@@ -177,23 +178,46 @@ pub fn run(opts: Options) -> Result<(), String> {
     }
 }
 
-/// Deliver `zj_herdr.state.v1` to every running session on change, and on a
+/// Which sessions get the state this round: every attached one on a change
+/// or heartbeat, otherwise only those attached since the last round.
+/// Detached sessions get nothing; they catch up when a client attaches.
+pub fn push_targets(attached: &[String], before: &[String], due: bool) -> Vec<String> {
+    attached
+        .iter()
+        .filter(|s| due || !before.contains(s))
+        .cloned()
+        .collect()
+}
+
+/// Deliver `zj_herdr.state.v1` to every attached session on change, and on a
 /// heartbeat. Sessions without the plugin simply ignore the pipe.
 fn push_loop(registry: &Registry, zellij: &dyn Zellij) {
     let mut pushed: Option<u64> = None;
     let mut last = Instant::now();
+    let mut before: Vec<String> = Vec::new();
     let mut last_error = String::new();
     loop {
         thread::sleep(PUSH_POLL);
         let count = registry.change_count();
-        if pushed == Some(count) && last.elapsed() < PUSH_HEARTBEAT {
-            continue;
-        }
-        pushed = Some(count);
-        last = Instant::now();
-        let json = registry.snapshot().to_json();
+        let due = pushed != Some(count) || last.elapsed() >= PUSH_HEARTBEAT;
         let result = zellij.sessions().and_then(|sessions| {
-            let failed: Vec<String> = sessions
+            // An unanswered `list-clients` counts as attached: better a
+            // wasted pipe than a rail left stale.
+            let attached: Vec<String> = sessions
+                .into_iter()
+                .filter(|s| zellij.attached(s).unwrap_or(true))
+                .collect();
+            let targets = push_targets(&attached, &before, due);
+            before = attached;
+            if due {
+                pushed = Some(count);
+                last = Instant::now();
+            }
+            if targets.is_empty() {
+                return Ok(());
+            }
+            let json = registry.snapshot().to_json();
+            let failed: Vec<String> = targets
                 .iter()
                 .filter_map(|s| {
                     zellij
@@ -224,6 +248,17 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
     use zj_herdr_core::{AgentState, Pane};
+
+    #[test]
+    fn pushes_to_attached_sessions_only() {
+        let v = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let attached = v(&["a", "b"]);
+        assert_eq!(push_targets(&attached, &v(&["a"]), true), attached);
+        // Nothing new: only a session attached since the last round.
+        assert_eq!(push_targets(&attached, &v(&["a"]), false), v(&["b"]));
+        assert!(push_targets(&attached, &attached, false).is_empty());
+        assert!(push_targets(&[], &attached, true).is_empty());
+    }
 
     /// Answers `panes` for `dev` only, and counts the questions.
     #[derive(Default)]

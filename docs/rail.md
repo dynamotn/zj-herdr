@@ -96,7 +96,8 @@ Pipe commands (`zellij pipe --name zj_herdr.cmd.v1 -- <payload>`):
 `select-prev`, `jump`, `session-next`, `session-prev` (switch to the next
 or previous Zellij session by name), and `{"cmd":"prompt","pane_id":N,"text":"..."}`.
 
-A pinned rail is unselectable, so it never gets keys; `select-next`,
+A pinned rail is unselectable, so it never gets keys; the mouse wheel over
+it moves the cursor, and `select-next`,
 `select-prev` (move the cursor) and `jump` (go to the agent under it) drive
 it from keybinds instead. Every rail of the session receives them, and only
 the one whose own tab is active acts. Zellij delivers a keybind's message

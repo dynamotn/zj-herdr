@@ -6,6 +6,19 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- The mouse wheel over the rail moves its cursor, scrolling a list longer
+  than the pane; a pinned rail never gets keys, so it could not scroll before.
+
+### Fixed
+
+- A pinned rail turns unselectable again when its permissions were granted
+  in an earlier session. Before, it could take focus, and closing the last
+  pane left the session hanging instead of exiting.
+- Closing the last terminal pane of a tab with a pinned rail closes the tab,
+  instead of the rail turning selectable and keeping it open.
+
 ### Changed
 
 - The daemon no longer keeps Zellij busy: it pushes state at most every two

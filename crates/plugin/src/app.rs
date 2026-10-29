@@ -169,6 +169,12 @@ impl<H: Host> App<H> {
                 self.track_panes(&manifest);
                 self.panes = Some(manifest);
                 self.refresh_view();
+                // Zellij sends no `PermissionRequestResult` for a grant it
+                // has cached; this event needs ReadApplicationState, so it
+                // proves the grant.
+                if !self.permitted {
+                    self.granted();
+                }
                 self.sync_selectable();
                 self.name_tabs_after_agents();
                 self.visible
@@ -189,6 +195,10 @@ impl<H: Host> App<H> {
                     .and_then(|l| ui::hit(self.targets.get(l)?, col).cloned());
                 target.is_some_and(|t| self.on_click(t))
             }
+            // A pinned rail never gets keys: the wheel moves its cursor, and
+            // the view follows the cursor.
+            Event::Mouse(Mouse::ScrollDown(_)) => self.move_cursor(1),
+            Event::Mouse(Mouse::ScrollUp(_)) => self.move_cursor(-1),
             Event::Visible(visible) => {
                 self.visible = visible;
                 if visible {
@@ -206,24 +216,8 @@ impl<H: Host> App<H> {
                 self.visible
             }
             Event::PermissionRequestResult(PermissionStatus::Granted) => {
-                self.permitted = true;
-                self.sync_selectable();
-                self.name_tabs_after_agents();
-                if self.start_daemon {
-                    // Detached, so it outlives Zellij and is never a zombie of
-                    // its server; a second daemon exits at once (socket in use).
-                    self.host.run_command(
-                        &["sh", "-c", START_DAEMON, "sh", self.bin.as_str()],
-                        BTreeMap::new(),
-                    );
-                }
-                // Do not wait up to a heartbeat for the first push.
-                let context = BTreeMap::from([(FETCH_CONTEXT.to_string(), String::new())]);
-                self.host
-                    .run_command(&[self.bin.as_str(), "list", "--json"], context);
-                self.check_restore();
-                for (pipe, pane_id, text) in std::mem::take(&mut self.queued_prompts) {
-                    self.prompt(pipe, pane_id, text);
+                if !self.permitted {
+                    self.granted();
                 }
                 true
             }
@@ -281,6 +275,28 @@ impl<H: Host> App<H> {
             }
             Event::Key(key) => self.on_key(key),
             _ => false,
+        }
+    }
+
+    fn granted(&mut self) {
+        self.permitted = true;
+        self.sync_selectable();
+        self.name_tabs_after_agents();
+        if self.start_daemon {
+            // Detached, so it outlives Zellij and is never a zombie of
+            // its server; a second daemon exits at once (socket in use).
+            self.host.run_command(
+                &["sh", "-c", START_DAEMON, "sh", self.bin.as_str()],
+                BTreeMap::new(),
+            );
+        }
+        // Do not wait up to a heartbeat for the first push.
+        let context = BTreeMap::from([(FETCH_CONTEXT.to_string(), String::new())]);
+        self.host
+            .run_command(&[self.bin.as_str(), "list", "--json"], context);
+        self.check_restore();
+        for (pipe, pane_id, text) in std::mem::take(&mut self.queued_prompts) {
+            self.prompt(pipe, pane_id, text);
         }
     }
 
@@ -576,9 +592,10 @@ impl<H: Host> App<H> {
     /// only when no selectable pane is left, so a selectable rail would
     /// keep it open after its last terminal pane exits. It stays
     /// selectable until its tab has a terminal, so the tab is never
-    /// closed while the layout is still opening.
+    /// closed while the layout is still opening, and never after: the last
+    /// terminal's exit must leave nothing selectable for Zellij to close it.
     fn sync_selectable(&mut self) {
-        if !self.pinned {
+        if !self.pinned || self.selectable == Some(false) {
             return;
         }
         let tab_has_terminal = self.panes.as_ref().is_some_and(|m| {
@@ -1562,6 +1579,24 @@ mod app_tests {
     }
 
     #[test]
+    fn mouse_wheel_moves_the_cursor() {
+        let mut app = ready(&[]);
+        layout_events(&mut app);
+        send_state(
+            &mut app,
+            &state(vec![
+                agent(1, AgentState::Idle, Some(Pane::new("dev", 1))),
+                agent(2, AgentState::Blocked, Some(Pane::new("dev", 2))),
+            ]),
+        );
+        let before = app.selected.clone();
+        assert!(app.update(Event::Mouse(Mouse::ScrollDown(3))));
+        assert_ne!(app.selected, before);
+        assert!(app.update(Event::Mouse(Mouse::ScrollUp(3))));
+        assert_eq!(app.selected, before);
+    }
+
+    #[test]
     fn command_results_report_failures_and_restore_counts() {
         let mut app = ready(&[]);
         let result = |code: i32, out: &str, err: &str, key: &str, value: &str| {
@@ -1661,14 +1696,29 @@ mod app_tests {
         assert!(calls(&mut app).contains(&"selectable true".to_string()));
         layout_events(&mut app);
         assert!(calls(&mut app).contains(&"selectable false".to_string()));
+        // The last terminal exits: still unselectable, so Zellij closes the tab.
         app.update(Event::PaneUpdate(PaneManifest {
             panes: [(0, vec![pane_info(50, true)])].into(),
         }));
-        assert_eq!(calls(&mut app), ["selectable true"]);
+        assert!(calls(&mut app).is_empty());
         // Not pinned: never touched.
         let mut app = ready(&[]);
         layout_events(&mut app);
         assert!(!calls(&mut app).iter().any(|c| c.starts_with("selectable")));
+    }
+
+    #[test]
+    fn a_cached_grant_shows_as_pane_updates_alone() {
+        // Zellij sends no `PermissionRequestResult` when the grant is cached.
+        let mut app = app(&[("pinned", "true")]);
+        layout_events(&mut app);
+        assert!(app.permitted);
+        let got = calls(&mut app);
+        assert!(got.contains(&"selectable false".to_string()), "{got:?}");
+        assert!(got.iter().any(|c| c.contains("list --json")), "{got:?}");
+        // A late result changes nothing.
+        app.update(Event::PermissionRequestResult(PermissionStatus::Granted));
+        assert!(calls(&mut app).is_empty());
     }
 
     #[test]

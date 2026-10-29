@@ -6,6 +6,8 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-29
+
 ### Added
 
 - The rail shows the background shells and subagents an agent started, under
@@ -97,7 +99,8 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `start_daemon` to launch the daemon from Zellij.
 - Release archives of the CLI for Linux and macOS, and the plugin wasm.
 
-[Unreleased]: https://github.com/dynamotn/zj-herdr/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/dynamotn/zj-herdr/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/dynamotn/zj-herdr/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/dynamotn/zj-herdr/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/dynamotn/zj-herdr/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/dynamotn/zj-herdr/releases/tag/v0.1.0

@@ -19,8 +19,16 @@ plugins {
         // does not include it.
         // zj_herdr_bin "zj-herdr"
 
-        // Start the daemon from Zellij instead of a service manager.
+        // Start the daemon from Zellij instead of a service manager. It logs
+        // to $XDG_STATE_HOME/zj-herdr/daemon.log and outlives Zellij.
         // start_daemon "true"
+
+        // "cards" (default), "comfortable" or "compact".
+        // density "cards"
+
+        // Name each tab after the directory of its first agent, unless you
+        // renamed it. "false" turns it off.
+        // rename_tabs "true"
     }
 }
 

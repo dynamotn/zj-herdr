@@ -191,8 +191,8 @@ trees).
 | [`docs/cli.md`](docs/cli.md) | The daemon, every CLI command, the socket API, remote machines, session restore. |
 | [`docs/detection.md`](docs/detection.md) | How each state is derived, which transcripts are read, token counting, known limits. |
 | [`docs/development.md`](docs/development.md) | Lints, tests, the end-to-end suites and the coverage gate. |
-| [`docs/plan.md`](docs/plan.md) | The original design. |
-| [`docs/plan-rail.md`](docs/plan-rail.md) | The design of the rail's features. |
+| [`docs/architecture.md`](docs/architecture.md) | How the crates, the daemon, the socket, remotes and session restore fit together. |
+| [`docs/rail-internals.md`](docs/rail-internals.md) | How the plugin builds the rail: the tab tree, tab names, folding, pinned-rail keys, adopt and restore. |
 | [`CHANGELOG.md`](CHANGELOG.md) | What changed in each release. |
 
 ## Development

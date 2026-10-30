@@ -21,6 +21,8 @@
   <img alt="Codex" src="https://img.shields.io/badge/Codex-full-black">
   <img alt="Opencode" src="https://img.shields.io/badge/Opencode-cpu%20only-4B8BBE">
   <img alt="Gemini" src="https://img.shields.io/badge/Gemini-cpu%20only-1A73E8">
+  <img alt="Copilot" src="https://img.shields.io/badge/Copilot-cpu%20only-24292F">
+  <img alt="Cursor Agent" src="https://img.shields.io/badge/Cursor%20Agent-cpu%20only-5A5A5A">
   <img alt="pi" src="https://img.shields.io/badge/pi-cpu%20only-6E56CF">
   <img alt="aider" src="https://img.shields.io/badge/aider-cpu%20only-14B014">
 </p>
@@ -59,8 +61,10 @@
 ```
 
 <p align="center">
-  <code>◆ blocked</code> · <code>⠋ working</code> · <code>○ idle</code> ·
-  <code>✗ API error</code> · <code>✓ exited</code>
+  <code>◆ blocked</code> · <code>⠋ working</code> · <code>○ idle</code>
+  (dimmed once seen) · <code>✗ API error</code> · <code>✓ exited</code><br>
+  On the right of a row: <code>✓</code> marks an idle agent seen,
+  <code>⇲</code> pulls one in from outside Zellij.
 </p>
 
 Agents work for minutes, then stop on a permission prompt or finish without a
@@ -112,15 +116,18 @@ building from source is in [`docs/development.md`](docs/development.md).
   the transcripts agents already write, so a new agent version never needs a
   new hook.
 - **Who needs you, and for what.** A blocked agent shows the tool it waits on
-  (`↳ Bash: cargo test`); `Alt ]` jumps to it, across sessions.
+  (`↳ Bash: cargo test`); `Alt ]` jumps to it, across sessions. An idle agent
+  you have looked at can be marked seen (`✓`, or `zj-herdr ack`) so it stops
+  counting as needing you until it changes state.
 - **The numbers at a glance.** Model, session token total, how full the
   context window is, and the background shells and subagents it left running.
 - **Your panes too.** Builds, tests and dev servers in your panes get their own
   rows; editors and pagers stay quiet.
-- **Pull agents in.** `⇲` moves an agent running outside Zellij into a new pane
-  here, resumed where it was.
+- **Pull agents in.** `⇲` moves a Claude Code or Codex session running outside
+  Zellij into a new pane here, resumed where it was.
 - **Survive a restart.** After Zellij resurrects a session, the rail offers
-  `↻ restore N agents` and reopens each one with its resume command.
+  `↻ restore N agents` and reopens each Claude Code or Codex session with its
+  resume command.
 
 ## How it works
 
@@ -185,6 +192,7 @@ trees).
 | [`docs/detection.md`](docs/detection.md) | How each state is derived, which transcripts are read, token counting, known limits. |
 | [`docs/development.md`](docs/development.md) | Lints, tests, the end-to-end suites and the coverage gate. |
 | [`docs/plan.md`](docs/plan.md) | The original design. |
+| [`docs/plan-rail.md`](docs/plan-rail.md) | The design of the rail's features. |
 | [`CHANGELOG.md`](CHANGELOG.md) | What changed in each release. |
 
 ## Development

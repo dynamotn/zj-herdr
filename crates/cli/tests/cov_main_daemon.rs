@@ -167,16 +167,20 @@ exit 1
     )
     .unwrap();
 
-    // A stand-in agent: `sleep` under the name `claude`, with the session
-    // file and transcript Claude Code would leave.
+    // A stand-in agent: a shell under the name `claude`, blocked reading the
+    // stdin this test holds, with the session file and transcript Claude Code
+    // would leave. Not `sleep`: a multicall coreutils (uutils, as on Ubuntu
+    // 26.04) picks the tool from argv[0] and exits when it is `claude`.
     std::fs::create_dir_all(w.path("agent")).unwrap();
-    std::fs::copy("/bin/sleep", w.path("agent").join("claude")).unwrap();
+    std::fs::copy("/bin/sh", w.path("agent").join("claude")).unwrap();
     let cwd = w.path("work").canonicalize().unwrap();
     let mut agent = Command::new(w.path("agent").join("claude"))
-        .arg("300")
+        .args(["-c", "read line"])
+        .stdin(Stdio::piped())
         .current_dir(&cwd)
         .spawn()
         .unwrap();
+    let _hold_stdin = agent.stdin.take();
     let pid = agent.id();
     w.agent = Some(pid);
     // Reaped as soon as it dies, as init would: `adopt` waits for the pid to go.

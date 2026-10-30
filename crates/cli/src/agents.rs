@@ -119,6 +119,14 @@ pub fn is_script_launcher(name: &str, argv: &[String]) -> bool {
 
 /// Identify an agent from a process name, executable path and argv.
 pub fn identify(name: &str, exe: Option<&str>, argv: &[String]) -> Option<&'static AgentSpec> {
+    // A binary exec'd from a descriptor (`/proc/self/fd/3`), as Claude Code's
+    // sandbox runs each shell command: its exe says nothing of what it is.
+    if argv
+        .first()
+        .is_some_and(|a| a.starts_with("/proc/self/fd/"))
+    {
+        return None;
+    }
     if let Some(spec) = by_name(name).or_else(|| exe.and_then(by_name)) {
         return Some(spec);
     }
@@ -256,6 +264,15 @@ mod tests {
             identify("codex", Some("/usr/bin/codex"), &[]).unwrap().kind,
             "codex"
         );
+    }
+
+    #[test]
+    fn ignores_programs_executed_through_a_descriptor() {
+        // Claude Code's sandbox runs each shell command as its own binary,
+        // exec'd from fd 3: a command, not an agent.
+        let exe = "/home/u/.local/share/mise/installs/claude/2.1.312/claude";
+        let cmd = argv(&["/proc/self/fd/3", "/bin/bash", "-c", "sleep 5"]);
+        assert!(identify("3", Some(exe), &cmd).is_none());
     }
 
     #[test]

@@ -6,6 +6,12 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- Shell commands that Claude Code runs in its sandbox no longer show up as
+  idle `claude` agents outside Zellij, one pair per command, named after the
+  directory they ran in.
+
 ## [0.3.2] - 2026-10-30
 
 ### Added

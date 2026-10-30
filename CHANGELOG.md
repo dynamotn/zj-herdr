@@ -6,6 +6,8 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-10-30
+
 ### Fixed
 
 - Shell commands that Claude Code runs in its sandbox no longer show up as
@@ -133,7 +135,8 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `start_daemon` to launch the daemon from Zellij.
 - Release archives of the CLI for Linux and macOS, and the plugin wasm.
 
-[Unreleased]: https://github.com/dynamotn/zj-herdr/compare/v0.3.2...HEAD
+[Unreleased]: https://github.com/dynamotn/zj-herdr/compare/v0.3.3...HEAD
+[0.3.3]: https://github.com/dynamotn/zj-herdr/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/dynamotn/zj-herdr/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/dynamotn/zj-herdr/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/dynamotn/zj-herdr/compare/v0.2.1...v0.3.0

@@ -13,7 +13,7 @@
   <a href="https://github.com/dynamotn/zj-herdr/releases/latest">
     <img alt="Release" src="https://img.shields.io/github/v/release/dynamotn/zj-herdr?label=release">
   </a>
-  <img alt="Coverage gate" src="https://img.shields.io/badge/coverage-%E2%89%A595%25-brightgreen">
+  <img alt="Coverage gate" src="https://img.shields.io/badge/coverage-100%25-brightgreen">
   <img alt="Zellij plugin" src="https://img.shields.io/badge/zellij-0.45%20plugin-8A2BE2">
   <img alt="Hook-free" src="https://img.shields.io/badge/hooks-none-informational">
   <br>
@@ -203,4 +203,4 @@ cargo build -p zj-herdr-plugin --target wasm32-wasip1 --release
 ```
 
 CI holds formatting, `clippy -D warnings`, a real headless Zellij end-to-end
-run and 95% line coverage; see [`docs/development.md`](docs/development.md).
+run and 100% line coverage; see [`docs/development.md`](docs/development.md).

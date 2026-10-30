@@ -629,11 +629,11 @@ impl<H: Host> App<H> {
         let layout = layout(session, &self.tabs, self.panes.as_ref());
         let given = given_by_position(&self.tabs, &self.given_names);
         for (position, name) in view::tab_renames(state, &layout, &given) {
-            let Some(tab) = self.tabs.iter().find(|t| t.position == position) else {
-                continue;
-            };
-            self.host.rename_tab(tab.tab_id as u64, &name);
-            self.given_names.insert(tab.tab_id, name);
+            // The layout is built from `tabs`, so exactly one tab matches.
+            for tab in self.tabs.iter().filter(|t| t.position == position) {
+                self.host.rename_tab(tab.tab_id as u64, &name);
+                self.given_names.insert(tab.tab_id, name.clone());
+            }
         }
     }
 
@@ -685,11 +685,13 @@ impl<H: Host> App<H> {
             return;
         };
         self.selected = Some(id.clone());
-        if !(adopt && self.adoptable(&agent)) {
+        // `adoptable` holds only with a session, so the filter keeps it.
+        let Some(session) = self
+            .session
+            .clone()
+            .filter(|_| adopt && self.adoptable(&agent))
+        else {
             return self.jump(&agent);
-        }
-        let Some(session) = self.session.clone() else {
-            return;
         };
         let context = BTreeMap::from([(ADOPT_CONTEXT.to_string(), id.clone())]);
         // Ids and names come from pipes: never let one read as a flag.
@@ -1254,10 +1256,8 @@ mod app_tests {
 
     fn click_line(app: &mut App<Fake>, needle: &str, col: usize) -> bool {
         let screen = plain(&app.render(40, 40));
-        let line = screen
-            .lines()
-            .position(|l| l.contains(needle))
-            .unwrap_or_else(|| panic!("{needle:?} not in {screen}"));
+        assert!(screen.contains(needle), "{needle:?} not in {screen}");
+        let line = screen.lines().position(|l| l.contains(needle)).unwrap();
         app.update(Event::Mouse(Mouse::LeftClick(line as isize, col)))
     }
 
@@ -1507,6 +1507,25 @@ mod app_tests {
     }
 
     #[test]
+    fn dismissed_machines_return_when_back_or_gone() {
+        let mut app = ready(&[]);
+        let st = state(vec![]);
+        send_state(&mut app, &st);
+        app.dismissed.insert("far".into());
+        send_state(&mut app, &st);
+        assert!(app.dismissed.contains("far"), "still unreachable");
+        send_state(&mut app, &StateV1::new(NOW, vec![]));
+        assert!(app.dismissed.is_empty(), "gone: shown again later");
+    }
+
+    #[test]
+    fn restore_needs_a_session() {
+        let mut app = app(&[]);
+        app.restore();
+        assert!(calls(&mut app).is_empty());
+    }
+
+    #[test]
     fn other_sessions_and_their_tabs_are_switched_to() {
         let mut app = ready(&[("pinned", "true")]);
         app.update(Event::SessionUpdate(
@@ -1690,6 +1709,19 @@ mod app_tests {
     }
 
     #[test]
+    fn a_closed_pane_ends_its_command() {
+        let mut app = ready(&[]);
+        layout_events(&mut app);
+        app.activity.command(1, &["make".into()], NOW - 10);
+        app.activity.command(3, &["make".into()], NOW - 10);
+        app.update(Event::PaneUpdate(PaneManifest {
+            panes: [(0, vec![pane_info(50, true), pane_info(1, false)])].into(),
+        }));
+        // Only pane 3 closed, so only its command is listed as finished.
+        assert_eq!(app.activity.ledger.len(), 1);
+    }
+
+    #[test]
     fn a_rail_with_no_terminal_yet_stays_selectable() {
         let mut app = app(&[("pinned", "true")]);
         app.update(Event::PermissionRequestResult(PermissionStatus::Granted));
@@ -1704,7 +1736,7 @@ mod app_tests {
         // Not pinned: never touched.
         let mut app = ready(&[]);
         layout_events(&mut app);
-        assert!(!calls(&mut app).iter().any(|c| c.starts_with("selectable")));
+        assert!(!calls(&mut app).concat().contains("selectable"));
     }
 
     #[test]

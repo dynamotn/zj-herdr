@@ -9,8 +9,8 @@ fn env(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|v| !v.is_empty())
 }
 
-fn home() -> PathBuf {
-    env("HOME").map_or_else(|| PathBuf::from("/"), PathBuf::from)
+fn home(get: &impl Fn(&str) -> Option<String>) -> PathBuf {
+    get("HOME").map_or_else(|| PathBuf::from("/"), PathBuf::from)
 }
 
 pub fn uid() -> u32 {
@@ -114,15 +114,23 @@ pub fn socket_path() -> PathBuf {
 
 /// `$XDG_STATE_HOME/zj-herdr`, else `~/.local/state/zj-herdr`.
 pub fn state_dir() -> PathBuf {
-    env("XDG_STATE_HOME")
-        .map_or_else(|| home().join(".local/state"), PathBuf::from)
+    state_dir_from(env)
+}
+
+fn state_dir_from(get: impl Fn(&str) -> Option<String>) -> PathBuf {
+    get("XDG_STATE_HOME")
+        .map_or_else(|| home(&get).join(".local/state"), PathBuf::from)
         .join("zj-herdr")
 }
 
 /// `$XDG_CONFIG_HOME/zj-herdr/config.toml`, else `~/.config/zj-herdr/config.toml`.
 pub fn config_path() -> PathBuf {
-    env("XDG_CONFIG_HOME")
-        .map_or_else(|| home().join(".config"), PathBuf::from)
+    config_path_from(env)
+}
+
+fn config_path_from(get: impl Fn(&str) -> Option<String>) -> PathBuf {
+    get("XDG_CONFIG_HOME")
+        .map_or_else(|| home(&get).join(".config"), PathBuf::from)
         .join("zj-herdr/config.toml")
 }
 
@@ -162,6 +170,48 @@ mod tests {
     }
 
     #[test]
+    fn state_and_config_follow_xdg_then_home() {
+        let vars = |pairs: &'static [(&'static str, &'static str)]| {
+            move |k: &str| {
+                pairs
+                    .iter()
+                    .find(|(key, _)| *key == k)
+                    .map(|(_, v)| v.to_string())
+            }
+        };
+        assert_eq!(
+            state_dir_from(vars(&[("XDG_STATE_HOME", "/x"), ("HOME", "/h")])),
+            PathBuf::from("/x/zj-herdr")
+        );
+        assert_eq!(
+            state_dir_from(vars(&[("HOME", "/h")])),
+            PathBuf::from("/h/.local/state/zj-herdr")
+        );
+        assert_eq!(
+            config_path_from(vars(&[("XDG_CONFIG_HOME", "/c")])),
+            PathBuf::from("/c/zj-herdr/config.toml")
+        );
+        assert_eq!(
+            config_path_from(vars(&[])),
+            PathBuf::from("/.config/zj-herdr/config.toml")
+        );
+        // The real-environment wrappers agree on the fixed suffixes.
+        assert!(state_dir().ends_with("zj-herdr"));
+        assert!(config_path().ends_with("zj-herdr/config.toml"));
+        assert!(socket_path().to_string_lossy().contains("zj-herdr"));
+    }
+
+    #[test]
+    fn ensure_socket_dir_reports_a_missing_parent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("no/such/parent");
+        assert_eq!(
+            ensure_socket_dir(&dir, uid()).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
     fn private_dir_is_created_0700_and_checked() {
         use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
@@ -195,26 +245,5 @@ mod tests {
         fs::create_dir(&sticky).unwrap();
         fs::set_permissions(&sticky, fs::Permissions::from_mode(0o1777)).unwrap();
         check_socket_dir(&sticky, uid()).unwrap();
-    }
-
-    #[test]
-    fn socket_owner_must_be_us() {
-        let tmp = tempfile::tempdir().unwrap();
-        let sock = tmp.path().join("s.sock");
-        let plain = tmp.path().join("plain");
-        fs::write(&plain, "").unwrap();
-        assert!(
-            check_socket_owner(&plain, uid()).is_err(),
-            "regular file accepted"
-        );
-        let _listener = match std::os::unix::net::UnixListener::bind(&sock) {
-            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
-                eprintln!("skipped: this environment forbids binding Unix sockets ({e})");
-                return;
-            }
-            other => other.unwrap(),
-        };
-        check_socket_owner(&sock, uid()).unwrap();
-        assert!(check_socket_owner(&sock, uid().wrapping_add(1)).is_err());
     }
 }

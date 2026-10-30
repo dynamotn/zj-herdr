@@ -232,6 +232,37 @@ mod tests {
         assert_eq!(panes[&3].position, 1);
         assert_eq!(parse_panes(r#"{"panes":[]}"#), Ok(HashMap::new()));
         assert!(parse_panes("There is no active session!").is_err());
+        assert!(parse_panes(r#"{"panes":3}"#).is_err());
+        assert!(parse_panes("3").is_err());
+    }
+
+    #[test]
+    fn a_fake_is_attached_by_default() {
+        struct Fake;
+        impl Zellij for Fake {
+            fn sessions(&self) -> Result<Vec<String>, String> {
+                Ok(vec![])
+            }
+            fn pipe(&self, _: &str, _: &str, _: &str) -> Result<(), String> {
+                Ok(())
+            }
+            fn deliver(&self, _: &str, _: &str, _: &str, _: &str) -> Result<String, String> {
+                Ok(String::new())
+            }
+            fn run(&self, _: &str, _: Option<&str>, _: &[String]) -> Result<(), String> {
+                Ok(())
+            }
+            fn panes(&self, _: &str) -> Result<HashMap<u32, PaneTab>, String> {
+                Ok(HashMap::new())
+            }
+        }
+        assert_eq!(Fake.attached("dev"), Ok(true));
+        // The rest only has to exist.
+        assert_eq!(Fake.sessions(), Ok(vec![]));
+        assert_eq!(Fake.pipe("dev", "n", "p"), Ok(()));
+        assert_eq!(Fake.deliver("dev", "p", "n", "x"), Ok(String::new()));
+        assert_eq!(Fake.run("dev", None, &[]), Ok(()));
+        assert_eq!(Fake.panes("dev"), Ok(HashMap::new()));
     }
 
     #[test]

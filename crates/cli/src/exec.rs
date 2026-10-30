@@ -97,6 +97,19 @@ pub fn run(mut cmd: Command, timeout: Duration) -> Result<Output, String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_missing_program_is_reported() {
+        let err = run(
+            Command::new("/nonexistent/zj-herdr-test"),
+            Duration::from_secs(1),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("cannot run /nonexistent/zj-herdr-test"),
+            "{err}"
+        );
+    }
+
     fn sh(script: &str) -> Command {
         let mut c = Command::new("/bin/sh");
         c.args(["-c", script]);

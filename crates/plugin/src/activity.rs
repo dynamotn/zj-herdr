@@ -295,6 +295,7 @@ mod tests {
     fn commands_show_once_promoted_and_finish_into_the_ledger() {
         let mut a = Activity::default();
         a.command(3, &argv("cargo test"), 100);
+        a.command(3, &argv("cargo test"), 101);
         assert!(a.labels("dev", 101).is_empty(), "not promoted yet");
         assert_eq!(a.labels("dev", 102)["cmd:dev:3"], "cargo test");
         // The pane is back at its shell: done.

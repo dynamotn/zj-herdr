@@ -53,7 +53,14 @@ pub fn is_same_agent(agent: &Agent, proc: &RawProc) -> bool {
 /// Never init, this process, or a pid that `kill(2)` would read as a
 /// process group (0, or negative once cast).
 pub fn may_signal(pid: u32) -> bool {
-    pid > 1 && pid != std::process::id() && libc::pid_t::try_from(pid).is_ok()
+    signal_target(pid).is_some()
+}
+
+/// `pid` as `kill(2)` takes it, when we may signal it: never init, ourselves,
+/// or a value that would turn negative and name a process group.
+fn signal_target(pid: u32) -> Option<libc::pid_t> {
+    let target = libc::pid_t::try_from(pid).ok()?;
+    (pid > 1 && pid != std::process::id()).then_some(target)
 }
 
 /// Children of `agent.pid` of the agent's kind.
@@ -76,12 +83,11 @@ impl Processes for SystemProcesses {
     }
 
     fn terminate(&self, pid: u32) -> Result<(), String> {
-        if !may_signal(pid) {
+        let Some(target) = signal_target(pid) else {
             return Err(format!("refusing to stop pid {pid}"));
-        }
-        let pid = libc::pid_t::try_from(pid).map_err(|_| format!("bad pid {pid}"))?;
+        };
         // SAFETY: kill(2) takes plain integers.
-        if unsafe { libc::kill(pid, libc::SIGTERM) } == 0 {
+        if unsafe { libc::kill(target, libc::SIGTERM) } == 0 {
             Ok(())
         } else {
             Err(format!(
@@ -173,6 +179,8 @@ mod tests {
     #[derive(Default)]
     struct FakeZellij {
         runs: Mutex<Vec<String>>,
+        /// `run` fails with this.
+        run_error: Option<String>,
     }
 
     impl Zellij for FakeZellij {
@@ -188,7 +196,7 @@ mod tests {
         fn run(&self, session: &str, cwd: Option<&str>, command: &[String]) -> Result<(), String> {
             let call = format!("{session} {cwd:?} {}", command.join(" "));
             self.runs.lock().unwrap().push(call);
-            Ok(())
+            self.run_error.clone().map_or(Ok(()), Err)
         }
         fn panes(&self, _: &str) -> Result<HashMap<u32, PaneTab>, String> {
             Ok(HashMap::new())
@@ -278,6 +286,23 @@ mod tests {
             *zellij.runs.lock().unwrap(),
             ["dev Some(\"/w/proj\") claude --resume abc"]
         );
+    }
+
+    #[test]
+    fn tells_how_to_resume_by_hand_when_the_pane_cannot_open() {
+        let zellij = FakeZellij {
+            run_error: Some("session gone".into()),
+            ..FakeZellij::default()
+        };
+        let procs = FakeProcs::new(true, Some(0));
+        let err = adopt(&outside(), "dev", &zellij, &procs, SHORT).unwrap_err();
+        assert!(err.contains("stopped, but reopening it failed"), "{err}");
+        assert!(err.contains("session gone"), "{err}");
+        assert!(err.contains("`claude --resume abc` in /w/proj"), "{err}");
+        // The rest of the fake is only used by other callers of the trait.
+        assert!(zellij.pipe("dev", "n", "p").is_ok());
+        assert_eq!(zellij.deliver("dev", "p", "n", "x"), Ok(String::new()));
+        assert!(zellij.panes("dev").unwrap().is_empty());
     }
 
     #[test]
@@ -457,6 +482,11 @@ mod tests {
         child.wait().unwrap();
         assert!(!sys.alive(pid));
         assert!(sys.terminate(1).unwrap_err().contains("refusing"));
+        // No such process: the signal fails and the error says why.
+        assert!(sys
+            .terminate(2_000_000_000)
+            .unwrap_err()
+            .contains("cannot stop pid"));
         assert!(!sys.alive(u32::MAX));
     }
 }

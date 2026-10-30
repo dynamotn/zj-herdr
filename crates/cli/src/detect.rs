@@ -8,6 +8,7 @@ use std::sync::Mutex;
 use zj_herdr_core::{command, AgentState, Task, TaskState, Tokens};
 
 use crate::procs::ProcInfo;
+use crate::sync::lock;
 use crate::transcript::{self, FileTimes, LastTurn, Transcript, UsageCursor};
 
 /// A TUI redrawing a spinner or streaming a reply stays above this share of
@@ -275,7 +276,7 @@ impl ClaudeDetector {
     /// appended since the last scan.
     /// Token totals, model and context use of the transcript at `path`.
     fn usage(&self, path: &Path) -> Option<UsageCursor> {
-        let mut usage = self.usage.lock().unwrap_or_else(|e| e.into_inner());
+        let mut usage = lock(&self.usage);
         let cursor = usage.entry(path.to_path_buf()).or_default();
         transcript::claude_usage(path, cursor).ok()?;
         Some(cursor.clone())
@@ -290,7 +291,7 @@ impl ClaudeDetector {
             return Some(home);
         }
         let now = crate::scan::now_secs();
-        let mut found = self.found.lock().unwrap_or_else(|e| e.into_inner());
+        let mut found = lock(&self.found);
         if let Some((path, at)) = found.get(&id) {
             if path.is_file() || now.saturating_sub(*at) < SEARCH_AGAIN_SECS {
                 return Some(path.clone());
@@ -355,7 +356,7 @@ impl ClaudeDetector {
     }
 
     fn transcript_path(&self, proc: &ProcInfo) -> Option<Assigned> {
-        let mut assigned = self.assigned.lock().unwrap_or_else(|e| e.into_inner());
+        let mut assigned = lock(&self.assigned);
         if !assigned.contains_key(&proc.pid) {
             // Not seen by `prepare` (a one-off call): judge it on its own.
             let alone = self.assign(&[proc]);
@@ -373,15 +374,9 @@ impl Detector for ClaudeDetector {
     fn prepare(&self, procs: &[&ProcInfo]) {
         let fresh = self.assign(procs);
         let in_use = |path: &Path| fresh.values().flatten().any(|(p, _)| p == path);
-        self.usage
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .retain(|path, _| in_use(path));
-        self.found
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .retain(|_, (path, _)| in_use(path));
-        *self.assigned.lock().unwrap_or_else(|e| e.into_inner()) = fresh;
+        lock(&self.usage).retain(|path, _| in_use(path));
+        lock(&self.found).retain(|_, (path, _)| in_use(path));
+        *lock(&self.assigned) = fresh;
     }
 
     fn detect(&self, proc: &ProcInfo) -> Option<AgentStatus> {
@@ -452,7 +447,7 @@ impl CodexDetector {
     }
 
     fn meta(&self, path: &Path) -> Option<RolloutMeta> {
-        let mut cache = self.meta.lock().unwrap_or_else(|e| e.into_inner());
+        let mut cache = lock(&self.meta);
         if let Some(meta) = cache.get(path) {
             return Some(meta.clone());
         }
@@ -525,7 +520,7 @@ impl CodexDetector {
     }
 
     fn rollout_path(&self, proc: &ProcInfo) -> Option<PathBuf> {
-        let mut assigned = self.assigned.lock().unwrap_or_else(|e| e.into_inner());
+        let mut assigned = lock(&self.assigned);
         if !assigned.contains_key(&proc.pid) {
             // Not seen by `prepare` (a one-off call): judge it on its own.
             let alone = self.assign(&[proc]);
@@ -542,7 +537,7 @@ impl Detector for CodexDetector {
 
     fn prepare(&self, procs: &[&ProcInfo]) {
         let fresh = self.assign(procs);
-        *self.assigned.lock().unwrap_or_else(|e| e.into_inner()) = fresh;
+        *lock(&self.assigned) = fresh;
     }
 
     fn detect(&self, proc: &ProcInfo) -> Option<AgentStatus> {
@@ -748,6 +743,108 @@ mod tests {
         let map = assign_transcripts(&[claimant(1, 100), claimant(2, 298)], &files);
         assert_eq!(owner(&map, 1), Some("a1"));
         assert_eq!(owner(&map, 2), Some("a2"));
+    }
+
+    fn claude_proc(cwd: Option<&str>) -> ProcInfo {
+        ProcInfo {
+            pid: 77,
+            spec: crate::agents::spec("claude").unwrap(),
+            argv: vec!["claude".into()],
+            cwd: cwd.map(PathBuf::from),
+            pane: None,
+            cpu: 0.0,
+            start_time: 1000,
+            sampled_at: 2000,
+            cpu_quiet_for: None,
+        }
+    }
+
+    #[test]
+    fn a_stale_search_result_is_searched_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions = tmp.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(
+            sessions.join("77.json"),
+            r#"{"pid":77,"sessionId":"s1","cwd":"/work/proj","startedAt":1000000}"#,
+        )
+        .unwrap();
+        let mut det = ClaudeDetector::new(tmp.path().join("projects"));
+        det.sessions = Some(sessions);
+        // An earlier miss, long enough ago that the directories are read again.
+        let old = tmp.path().join("old/s1.jsonl");
+        det.found.lock().unwrap().insert("s1".into(), (old, 0));
+        let got = det.session_file_transcript(&claude_proc(None)).unwrap();
+        assert_eq!(got.file_name().unwrap(), "s1.jsonl");
+        assert!(got.starts_with(tmp.path().join("projects")));
+    }
+
+    #[test]
+    fn the_session_file_transcript_is_found_remembered_and_then_written() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions = tmp.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(
+            sessions.join("77.json"),
+            r#"{"pid":77,"sessionId":"s1","cwd":"/work/proj","startedAt":1000000}"#,
+        )
+        .unwrap();
+        let mut det = ClaudeDetector::new(tmp.path().join("projects"));
+        det.sessions = Some(sessions);
+        let proc = claude_proc(None);
+        // Not written yet: the expected path, remembered for the next scan.
+        let expected = det.session_file_transcript(&proc).unwrap();
+        assert!(!expected.is_file());
+        assert_eq!(det.session_file_transcript(&proc), Some(expected.clone()));
+        // Once it exists in its project directory, that one is used.
+        let home = crate::transcript::claude_project_dir(&det.projects, Path::new("/work/proj"))
+            .join("s1.jsonl");
+        std::fs::create_dir_all(home.parent().unwrap()).unwrap();
+        std::fs::write(&home, "").unwrap();
+        assert_eq!(det.session_file_transcript(&proc), Some(home));
+    }
+
+    #[test]
+    fn an_assigned_transcript_that_vanished_gives_no_status() {
+        let tmp = tempfile::tempdir().unwrap();
+        let det = ClaudeDetector::new(tmp.path().to_path_buf());
+        let proc = claude_proc(Some("/work/proj"));
+        det.assigned
+            .lock()
+            .unwrap()
+            .insert(proc.pid, Some((tmp.path().join("gone.jsonl"), false)));
+        assert!(det.detect_transcript(&proc).is_none());
+    }
+
+    #[test]
+    fn session_metadata_still_reports_an_agent_whose_transcript_vanished() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions = tmp.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(
+            sessions.join("77.json"),
+            r#"{"pid":77,"sessionId":"s1","cwd":"/work/proj","startedAt":1000000,"kind":"bg","name":"fix it"}"#,
+        )
+        .unwrap();
+        let mut det = ClaudeDetector::new(tmp.path().to_path_buf());
+        det.sessions = Some(sessions);
+        let proc = claude_proc(Some("/work/proj"));
+        det.assigned
+            .lock()
+            .unwrap()
+            .insert(proc.pid, Some((tmp.path().join("gone.jsonl"), false)));
+        let got = det.detect(&proc).unwrap();
+        assert!(got.background);
+        assert_eq!(got.title.as_deref(), Some("fix it"));
+    }
+
+    #[test]
+    fn a_codex_without_a_cwd_is_given_no_rollout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let det = CodexDetector::new(tmp.path().to_path_buf());
+        let mut proc = claude_proc(None);
+        proc.spec = crate::agents::spec("codex").unwrap();
+        assert_eq!(det.assign(&[&proc]), HashMap::from([(77, None)]));
     }
 
     #[test]

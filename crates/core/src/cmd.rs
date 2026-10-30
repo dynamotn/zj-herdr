@@ -132,5 +132,10 @@ mod tests {
             Err("permission denied".into())
         );
         assert!(prompt_reply("").is_err(), "silence is not delivery");
+        assert_eq!(
+            prompt_reply(&format!("noise\n{PROMPT_ACK}\n")),
+            Ok(()),
+            "unrelated lines are skipped"
+        );
     }
 }

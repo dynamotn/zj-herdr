@@ -494,6 +494,22 @@ mod tests {
     }
 
     #[test]
+    fn agents_in_one_tab_share_its_layout_slot() {
+        let mut st = state();
+        for pid in [2, 5] {
+            let a = st.machines[1].agents.iter_mut().find(|a| a.pid == pid);
+            a.unwrap().pane.as_mut().unwrap().tab = Some(crate::PaneTab {
+                position: 0,
+                name: "api".into(),
+            });
+        }
+        let layouts = with_agent_tabs(&st, vec![]);
+        let b = layouts.iter().find(|l| l.name == "b").unwrap();
+        assert_eq!(b.tabs.len(), 1);
+        assert_eq!(b.tabs[0].panes, [2, 5]);
+    }
+
+    #[test]
     fn sessions_zellij_left_out_get_tabs_from_the_daemon() {
         let mut st = state();
         let set_tab = |st: &mut StateV1, machine: usize, pid: u32, position, name: &str| {

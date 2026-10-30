@@ -336,6 +336,49 @@ mod tests {
     }
 
     #[test]
+    fn unusable_stores_are_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A directory in place of the file cannot be read.
+        assert!(Store::load(tmp.path()).is_err());
+        assert!(Store::load_or_set_aside(tmp.path()).is_err());
+
+        let path = tmp.path().join("sessions.json");
+        fs::write(&path, r#"{"schema":"zj_herdr.sessions.v0","panes":{}}"#).unwrap();
+        let err = Store::load(&path).unwrap_err();
+        assert!(err.contains("unsupported schema"), "{err}");
+
+        // Every name to move a bad file aside to is taken.
+        fs::write(&path, "{ not json").unwrap();
+        fs::write(path.with_extension("json.unreadable"), "").unwrap();
+        for n in 1..1000 {
+            fs::write(path.with_extension(format!("json.unreadable.{n}")), "").unwrap();
+        }
+        let err = Store::load_or_set_aside(&path).unwrap_err();
+        assert!(err.contains("no free name"), "{err}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "{ not json");
+    }
+
+    #[test]
+    fn save_fails_when_the_directory_cannot_be_made() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("file");
+        fs::write(&file, "").unwrap();
+        assert!(Store::default().save(&file.join("sessions.json")).is_err());
+        // No parent to create, and nowhere to write the temporary file.
+        assert!(Store::default().save(Path::new("")).is_err());
+    }
+
+    #[test]
+    fn agents_without_a_pane_or_a_valid_session_id_are_not_recorded() {
+        let mut store = Store::default();
+        let mut no_pane = agent(1, "claude", "dev", 1, Some("c1"), AgentState::Idle);
+        no_pane.pane = None;
+        let bad_id = agent(2, "claude", "dev", 2, Some("../evil"), AgentState::Idle);
+        assert!(!store.record(&[no_pane, bad_id], 1));
+        assert!(store.panes.is_empty());
+    }
+
+    #[test]
     fn store_that_cannot_be_moved_aside_is_an_error() {
         use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();

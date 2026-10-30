@@ -200,12 +200,7 @@ fn run(cli: Cli) -> Result<(), String> {
             })?;
         }
         Command::List { json } => match client::request(&socket, &Request::List) {
-            Ok(resp) => print_state(
-                &resp
-                    .state
-                    .unwrap_or_else(|| StateV1::new(now_secs(), vec![])),
-                json,
-            ),
+            Ok(resp) => print_state(&resp.state_or_empty(), json),
             Err(e) => {
                 eprintln!("zj-herdr: {e}\nzj-herdr: falling back to a local scan");
                 let machine = Scanner::scan_once(local_machine_name(), &Roots::from_env());

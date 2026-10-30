@@ -625,7 +625,12 @@ fn notification_text(entry: &Value) -> Option<&str> {
     .find(|t| t.contains("<task-notification>"))
 }
 
-pub fn claude_turn(entries: impl Iterator<Item = Value>) -> Turn {
+pub fn claude_turn(mut entries: impl Iterator<Item = Value>) -> Turn {
+    claude_turn_dyn(&mut entries)
+}
+
+// Not generic, so that coverage sees a single copy of the loop.
+fn claude_turn_dyn(entries: &mut dyn Iterator<Item = Value>) -> Turn {
     let mut open = OpenCalls::default();
     let mut last = LastTurn::Unknown;
     let mut error = false;
@@ -720,11 +725,11 @@ pub fn codex_rollouts(root: &Path) -> Vec<FileTimes> {
         let Ok(entries) = fs::read_dir(&dir) else {
             continue;
         };
-        for entry in entries.filter_map(Result::ok) {
-            let path = entry.path();
-            let Ok(kind) = entry.file_type() else {
-                continue;
-            };
+        // An entry whose type cannot be read is skipped.
+        let typed = entries
+            .filter_map(Result::ok)
+            .filter_map(|e| Some((e.path(), e.file_type().ok()?)));
+        for (path, kind) in typed {
             if kind.is_dir() && depth < 4 {
                 dirs.push((path, depth + 1));
             } else if kind.is_file()
@@ -798,7 +803,11 @@ fn codex_call(payload: &Value) -> String {
     describe_call(name, command.as_deref())
 }
 
-pub fn codex_turn(entries: impl Iterator<Item = Value>) -> Turn {
+pub fn codex_turn(mut entries: impl Iterator<Item = Value>) -> Turn {
+    codex_turn_dyn(&mut entries)
+}
+
+fn codex_turn_dyn(entries: &mut dyn Iterator<Item = Value>) -> Turn {
     let mut open = OpenCalls::default();
     let mut last = LastTurn::Unknown;
     // An approval request, with what it asks to run.
@@ -1038,6 +1047,90 @@ mod tests {
         claude_usage(&path, &mut cursor).unwrap();
         assert_eq!(cursor.tokens.input, 30);
         drop(keep);
+    }
+
+    #[test]
+    fn one_line_cuts_long_text_with_an_ellipsis() {
+        let out = one_line(&format!("a\n{}", "y".repeat(100)));
+        assert_eq!(out.chars().count(), WAITING_MAX_CHARS);
+        assert!(out.starts_with("a yyy") && out.ends_with('…'));
+    }
+
+    #[test]
+    fn tail_lines_drop_the_line_cut_by_the_seek() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("big.jsonl");
+        let line = format!("{}\n", "x".repeat(99));
+        let count = (TAIL_BYTES as usize / line.len()) + 10;
+        append(&path, &line.repeat(count));
+        let lines = tail_lines(&path).unwrap();
+        assert!(lines.len() < count);
+        assert!(lines.iter().all(|l| l.len() == 99), "a cut line survived");
+    }
+
+    #[test]
+    fn session_transcript_prefers_its_own_project_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = Path::new("/work/proj");
+        let own = claude_project_dir(tmp.path(), cwd).join("s1.jsonl");
+        fs::create_dir_all(own.parent().unwrap()).unwrap();
+        fs::write(&own, "").unwrap();
+        assert_eq!(claude_session_transcript(tmp.path(), cwd, "s1"), own);
+    }
+
+    #[test]
+    fn notifications_missing_an_id_or_status_are_ignored() {
+        let entries = vec![json!({"type":"user","message":{"content":
+            "<task-notification>garbage</task-notification>"}})];
+        assert!(claude_turn(entries.into_iter()).tasks.is_empty());
+    }
+
+    #[test]
+    fn codex_rollouts_of_a_missing_tree_is_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(codex_rollouts(&tmp.path().join("nope")).is_empty());
+    }
+
+    #[test]
+    fn codex_meta_accepts_a_bare_first_line_and_short_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("rollout-short.jsonl");
+        fs::write(&path, "{\"cwd\":\"/w\"}\n").unwrap();
+        assert_eq!(
+            codex_meta(&path),
+            Some(("rollout-short".into(), Some("/w".into())))
+        );
+    }
+
+    #[test]
+    fn codex_turn_handles_patch_approvals_and_unknown_entries() {
+        let entries = vec![
+            json!({"type":"response_item","payload":{"type":"web_search_call"}}),
+            json!({"type":"event_msg","payload":{"type":"token_count"}}),
+            json!({"type":"turn_context","payload":{}}),
+            json!({"type":"event_msg","payload":{"type":"apply_patch_approval_request"}}),
+        ];
+        let turn = codex_turn(entries.into_iter());
+        assert_eq!(turn.last, LastTurn::PendingTool);
+        assert_eq!(turn.pending.as_deref(), Some("apply_patch"));
+    }
+
+    #[test]
+    fn codex_turn_follows_prompts_and_completed_turns() {
+        let msg = |kind: &str| json!({"type":"event_msg","payload":{"type": kind}});
+        let turn = codex_turn([msg("user_message")].into_iter());
+        assert_eq!(turn.last, LastTurn::AwaitingReply);
+        let turn = codex_turn([msg("user_message"), msg("task_complete")].into_iter());
+        assert_eq!(turn.last, LastTurn::TurnEnded);
+    }
+
+    #[test]
+    fn a_text_block_prompt_can_be_an_interruption() {
+        let prompt = |text: &str| json!({"type":"user","message":{"content":[{"type":"text","text": text}]}});
+        let turn = claude_turn([prompt("[Request interrupted by user]")].into_iter());
+        assert_eq!(turn.last, LastTurn::TurnEnded);
+        let turn = claude_turn([prompt("go on")].into_iter());
+        assert_eq!(turn.last, LastTurn::AwaitingReply);
     }
 
     #[test]

@@ -84,14 +84,14 @@ pub fn merge_remote(remote: &Remote, stdout: &str) -> Result<Machine, String> {
     })
 }
 
-/// Poll one remote forever.
-pub fn poll_loop(remote: Remote, registry: Arc<Registry>) {
+/// Poll one remote forever, running `command` (normally [`ssh_command`]) for each scan.
+pub fn poll_loop(remote: Remote, registry: Arc<Registry>, command: impl Fn(&Remote) -> Command) {
     let interval = Duration::from_secs(remote.interval_secs);
     let timeout = Duration::from_secs(remote.timeout_secs);
     loop {
         let started = Instant::now();
-        let result = exec::run(ssh_command(&remote), timeout)
-            .and_then(|out| merge_remote(&remote, &out.stdout));
+        let result =
+            exec::run(command(&remote), timeout).and_then(|out| merge_remote(&remote, &out.stdout));
         match result {
             Ok(machine) => {
                 registry.publish(machine, now_secs());
@@ -105,7 +105,7 @@ pub fn poll_loop(remote: Remote, registry: Arc<Registry>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zj_herdr_core::{AgentState, Pane};
+    use zj_herdr_core::{AgentState, Pane, PaneTab, TaskState};
 
     fn remote() -> Remote {
         crate::config::Config::parse("[[remote]]\nname = \"far\"\nssh = \"far-alias\"")
@@ -153,18 +153,30 @@ mod tests {
                     cwd: Some("/srv/app\x1b[2J".into()),
                     state: AgentState::Blocked,
                     since: 3,
-                    pane: Some(Pane::new("ops", 2)),
+                    pane: Some(Pane {
+                        tab: Some(PaneTab {
+                            position: 1,
+                            name: "t\x1b[0m".into(),
+                        }),
+                        ..Pane::new("ops", 2)
+                    }),
                     session_id: Some("r1".into()),
                     waiting: None,
                     started: 0,
                     tokens: None,
                     error: false,
                     acked: false,
-                    tasks: vec![],
-                    model: None,
+                    tasks: vec![Task {
+                        kind: "shell\x07".into(),
+                        label: "make\x1b[1m".into(),
+                        state: TaskState::Running,
+                        started: 1,
+                        ended: 0,
+                    }],
+                    model: Some("opus\x07".into()),
                     context: None,
                     background: false,
-                    title: None,
+                    title: Some("fix\x1b[2J".into()),
                 }],
             }],
         );
@@ -184,6 +196,46 @@ mod tests {
             Some("/srv/app?[2J"),
             "escape sequences are neutralised"
         );
+        let tab = a.pane.as_ref().unwrap().tab.as_ref().unwrap();
+        assert_eq!((tab.position, tab.name.as_str()), (1, "t?[0m"));
+        assert_eq!(a.tasks[0].kind, "shell?");
+        assert_eq!(a.tasks[0].label, "make?[1m");
+        assert_eq!(a.model.as_deref(), Some("opus?"));
+        assert_eq!(a.title.as_deref(), Some("fix?[2J"));
+    }
+
+    /// Run `poll_loop` on a detached thread (it never returns) against
+    /// `script` and wait for the machine to show up in the registry.
+    fn polled(script: &str) -> Machine {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("fake-ssh");
+        std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let reg = Arc::new(Registry::default());
+        let (r, g) = (remote(), reg.clone());
+        thread::spawn(move || poll_loop(r, g, |_| Command::new(&path)));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(m) = reg.snapshot().machines.into_iter().next() {
+                return m;
+            }
+            assert!(Instant::now() < deadline, "no machine published");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn poll_loop_publishes_what_the_remote_scans() {
+        let json = StateV1::new(1, vec![]).to_json();
+        let m = polled(&format!("echo '{json}'"));
+        assert_eq!((m.name.as_str(), m.status), ("far", MachineStatus::Ok));
+    }
+
+    #[test]
+    fn poll_loop_marks_a_failing_remote_unreachable() {
+        let m = polled("echo nope >&2; exit 255");
+        assert_eq!(m.status, MachineStatus::Unreachable);
     }
 
     #[test]

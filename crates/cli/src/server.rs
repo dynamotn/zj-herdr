@@ -67,20 +67,26 @@ pub fn bind(path: &Path) -> io::Result<UnixListener> {
     let staged = staging.join("s");
     let linked = UnixListener::bind(&staged).and_then(|listener| {
         fs::set_permissions(&staged, fs::Permissions::from_mode(0o600))?;
-        fs::hard_link(&staged, path).map_err(|e| {
-            if e.kind() == io::ErrorKind::AlreadyExists {
-                io::Error::new(
-                    io::ErrorKind::AddrInUse,
-                    format!("a daemon is already listening on {}", path.display()),
-                )
-            } else {
-                e
-            }
-        })?;
+        link_socket(&staged, path)?;
         Ok(listener)
     });
     let _ = fs::remove_dir_all(&staging);
     linked
+}
+
+/// Hard-link the staged socket to `path`, failing like a bind would if
+/// another daemon got there first.
+fn link_socket(staged: &Path, path: &Path) -> io::Result<()> {
+    fs::hard_link(staged, path).map_err(|e| {
+        if e.kind() == io::ErrorKind::AlreadyExists {
+            io::Error::new(
+                io::ErrorKind::AddrInUse,
+                format!("a daemon is already listening on {}", path.display()),
+            )
+        } else {
+            e
+        }
+    })
 }
 
 /// A new 0700 directory in `dir` with an unpredictable, short name (the
@@ -91,11 +97,19 @@ fn make_staging_dir(dir: &Path) -> io::Result<PathBuf> {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos() as u64)
         ^ (u64::from(std::process::id()) << 32);
+    make_staging_dir_seeded(dir, seed)
+}
+
+fn staging_candidate(dir: &Path, seed: u64, n: u64) -> PathBuf {
+    dir.join(format!(
+        ".zjh{:x}",
+        seed.wrapping_mul(n + 1) & 0xff_ffff_ffff
+    ))
+}
+
+fn make_staging_dir_seeded(dir: &Path, seed: u64) -> io::Result<PathBuf> {
     for n in 0..16u64 {
-        let candidate = dir.join(format!(
-            ".zjh{:x}",
-            seed.wrapping_mul(n + 1) & 0xff_ffff_ffff
-        ));
+        let candidate = staging_candidate(dir, seed, n);
         match fs::DirBuilder::new().mode(0o700).create(&candidate) {
             Ok(()) => return Ok(candidate),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
@@ -154,18 +168,29 @@ pub fn authorize(stream: &UnixStream, uid: u32) -> io::Result<()> {
 
 pub fn serve(listener: UnixListener, ctx: Arc<Context>) {
     for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
-                let ctx = Arc::clone(&ctx);
-                thread::spawn(move || {
-                    if let Err(e) = handle(stream, &ctx) {
-                        if e.kind() != io::ErrorKind::BrokenPipe {
-                            eprintln!("zj-herdr: client: {e}");
-                        }
+        accept(stream, &ctx);
+    }
+}
+
+/// Serve one accepted connection on its own thread, or report why none came.
+pub fn accept(
+    stream: io::Result<UnixStream>,
+    ctx: &Arc<Context>,
+) -> Option<thread::JoinHandle<()>> {
+    match stream {
+        Ok(stream) => {
+            let ctx = Arc::clone(ctx);
+            Some(thread::spawn(move || {
+                if let Err(e) = handle(stream, &ctx) {
+                    if e.kind() != io::ErrorKind::BrokenPipe {
+                        eprintln!("zj-herdr: client: {e}");
                     }
-                });
-            }
-            Err(e) => eprintln!("zj-herdr: accept: {e}"),
+                }
+            }))
+        }
+        Err(e) => {
+            eprintln!("zj-herdr: accept: {e}");
+            None
         }
     }
 }
@@ -285,7 +310,7 @@ fn adopt_agent(ctx: &Context, selector: &str, session: &str) -> Result<Agent, St
             agent.id
         ));
     }
-    let lock = || ctx.adopting.lock().unwrap_or_else(|e| e.into_inner());
+    let lock = || crate::sync::lock(&ctx.adopting);
     if !lock().insert(agent.pid) {
         return Err(format!("{} is already being moved", agent.id));
     }
@@ -343,4 +368,44 @@ fn prompt(ctx: &Context, selector: &str, mut text: String, submit: bool) -> Resu
             agent.id, pane.session
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_name_too_long_to_link_is_a_plain_error_and_a_taken_one_is_in_use() {
+        let tmp = tempfile::tempdir().unwrap();
+        let staged = tmp.path().join("staged");
+        fs::write(&staged, "").unwrap();
+        let taken = tmp.path().join("taken");
+        fs::write(&taken, "").unwrap();
+        let err = link_socket(&staged, &taken).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AddrInUse);
+        let long = tmp.path().join("x".repeat(300));
+        let err = link_socket(&staged, &long).unwrap_err();
+        assert_ne!(err.kind(), io::ErrorKind::AddrInUse);
+        link_socket(&staged, &tmp.path().join("free")).unwrap();
+    }
+
+    #[test]
+    fn staging_names_that_are_taken_are_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (dir, seed) = (tmp.path(), 7);
+        fs::create_dir(staging_candidate(dir, seed, 0)).unwrap();
+        let got = make_staging_dir_seeded(dir, seed).unwrap();
+        assert_eq!(got, staging_candidate(dir, seed, 1));
+        for n in 2..16 {
+            fs::create_dir(staging_candidate(dir, seed, n)).unwrap();
+        }
+        let err = make_staging_dir_seeded(dir, seed).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert!(
+            err.to_string().contains("no free staging directory"),
+            "{err}"
+        );
+        let missing = make_staging_dir_seeded(&dir.join("nope"), seed).unwrap_err();
+        assert_eq!(missing.kind(), io::ErrorKind::NotFound);
+    }
 }

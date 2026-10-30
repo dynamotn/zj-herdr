@@ -257,6 +257,13 @@ mod tests {
     }
 
     #[test]
+    fn the_default_table_sees_this_process() {
+        let mut table = ProcessTable::default();
+        let me = std::process::id();
+        assert!(table.sample().iter().any(|p| p.pid == me));
+    }
+
+    #[test]
     fn parses_zellij_env() {
         let vars = [
             ("HOME", "/h"),

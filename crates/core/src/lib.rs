@@ -432,6 +432,33 @@ mod tests {
     }
 
     #[test]
+    fn states_have_glyphs_and_names() {
+        let all = [
+            AgentState::Working,
+            AgentState::Blocked,
+            AgentState::Idle,
+            AgentState::Done,
+            AgentState::Unknown,
+        ];
+        assert_eq!(all.map(AgentState::glyph), ["●", "◆", "○", "✓", "?"]);
+        assert_eq!(all[0].to_string(), "working");
+    }
+
+    #[test]
+    fn wire_errors_read_plainly() {
+        let json = StateV1::from_json("{").unwrap_err();
+        assert!(json.to_string().starts_with("invalid JSON: "));
+        let schema = WireError::Schema {
+            expected: "a",
+            found: "b".into(),
+        };
+        assert_eq!(
+            schema.to_string(),
+            r#"unsupported schema "b", expected "a""#
+        );
+    }
+
+    #[test]
     fn token_total_adds_every_kind() {
         let t = Tokens {
             input: 1,

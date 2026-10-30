@@ -402,6 +402,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn every_class_has_a_mark() {
+        use Class::*;
+        let marks = [Build, Test, Deploy, Service, Remote, Interactive, Other].map(Class::mark);
+        assert_eq!(marks, ["⚙", "⚗", "⇡", "❯", "⇄", "$", "$"]);
+    }
+
+    #[test]
+    fn runner_flags_are_skipped_with_their_value() {
+        assert_eq!(classify("npx -p typescript tsc"), classify("tsc"));
+        assert_eq!(classify("npx --package foo vite build"), Class::Build);
+        assert_eq!(classify("npx -y vite build"), Class::Build);
+    }
+
+    #[test]
+    fn argv_is_classified_as_its_joined_command() {
+        let argv = ["cargo".to_string(), "test".to_string()];
+        assert_eq!(classify_argv(&argv), Class::Test);
+    }
+
+    #[test]
     fn classifies_commands_by_their_head() {
         use Class::*;
         let cases = [

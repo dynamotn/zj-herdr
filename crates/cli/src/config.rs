@@ -127,6 +127,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn load_reports_a_path_it_cannot_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = Config::load(tmp.path()).unwrap_err();
+        assert!(err.starts_with(&tmp.path().display().to_string()), "{err}");
+        let bad = tmp.path().join("c.toml");
+        std::fs::write(&bad, "plugin = ").unwrap();
+        let err = Config::load(&bad).unwrap_err();
+        assert!(err.starts_with(&bad.display().to_string()), "{err}");
+    }
+
+    #[test]
     fn parses_remotes_with_defaults() {
         let config = Config::parse(
             r#"
@@ -166,6 +177,14 @@ mod tests {
         ] {
             assert!(Config::parse(bad).is_err(), "accepted {bad:?}");
         }
+    }
+
+    #[test]
+    fn unreadable_file_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        // A directory exists but cannot be read as a file.
+        let err = Config::load(dir.path()).unwrap_err();
+        assert!(err.starts_with(&dir.path().display().to_string()), "{err}");
     }
 
     #[test]

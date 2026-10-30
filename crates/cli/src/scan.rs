@@ -16,8 +16,11 @@ pub fn now_secs() -> u64 {
 
 /// Short host name, used as the local machine name.
 pub fn local_machine_name() -> String {
-    sysinfo::System::host_name()
-        .and_then(|h| h.split('.').next().map(str::to_owned))
+    short_host(sysinfo::System::host_name())
+}
+
+fn short_host(host: Option<String>) -> String {
+    host.and_then(|h| h.split('.').next().map(str::to_owned))
         .filter(|h| !h.is_empty())
         .unwrap_or_else(|| "local".to_string())
 }
@@ -117,5 +120,18 @@ impl Scanner {
                 .filter_map(|p| to_agent(&self.machine, &self.detectors, p))
                 .collect(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_machine_name_is_the_short_host_name() {
+        assert_eq!(short_host(Some("box.example.org".into())), "box");
+        assert_eq!(short_host(Some(String::new())), "local");
+        assert_eq!(short_host(Some(".hidden".into())), "local");
+        assert_eq!(short_host(None), "local");
     }
 }

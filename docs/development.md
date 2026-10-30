@@ -48,12 +48,12 @@ The plugin's behaviour lives in `crates/plugin/src/app.rs`, which reaches
 Zellij only through a `Host` trait, so it is tested natively;
 `crates/plugin/src/main.rs` only implements that trait on Zellij's API and
 is left out of the coverage figure. CI (`.github/workflows/ci.yml`) holds
-the rest to 95% of lines (it needs `cargo-llvm-cov`):
+the rest to 100% of lines (it needs `cargo-llvm-cov`):
 
 ```sh
 cargo build -p zj-herdr-plugin --target wasm32-wasip1 --release
 ZJ_HERDR_E2E_ZELLIJ=1 cargo llvm-cov --workspace \
-  --ignore-filename-regex 'plugin/src/main\.rs' --fail-under-lines 95
+  --ignore-filename-regex 'plugin/src/main\.rs' --fail-under-lines 100
 ```
 
 ## Releases

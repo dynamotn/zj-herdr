@@ -3,7 +3,7 @@ name: ci
 # Every push and pull request: format, lints, the plugin's wasm build, and
 # every test, end to end ones included (the CLI against its daemon on a
 # real socket, the plugin in a real headless Zellij), under coverage with a
-# floor of 95% of lines. `crates/plugin/src/main.rs` is left out of the
+# floor of 100% of lines. `crates/plugin/src/main.rs` is left out of the
 # figure: it only hands Zellij's API to `app.rs`, runs inside Zellij's wasm
 # runtime where coverage cannot reach, and the Zellij end-to-end test runs it.
 
@@ -37,4 +37,4 @@ jobs:
         run: >
           cargo llvm-cov --workspace
           --ignore-filename-regex 'plugin/src/main\.rs'
-          --fail-under-lines 95
+          --fail-under-lines 100

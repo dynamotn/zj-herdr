@@ -126,6 +126,12 @@ impl Response {
         }
     }
 
+    /// The state this response carries, or an empty one.
+    pub fn state_or_empty(self) -> StateV1 {
+        self.state
+            .unwrap_or_else(|| StateV1::new(crate::scan::now_secs(), vec![]))
+    }
+
     pub fn into_result(self) -> Result<Self, String> {
         if self.ok {
             Ok(self)
@@ -170,6 +176,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_failed_response_without_a_message_still_has_one() {
+        let resp = Response {
+            ok: false,
+            ..Default::default()
+        };
+        assert_eq!(resp.into_result(), Err("request failed".into()));
+    }
+
+    #[test]
+    fn a_response_without_state_yields_an_empty_one() {
+        assert!(Response::ok().state_or_empty().machines.is_empty());
+    }
+
+    #[test]
     fn parses_every_op() {
         assert_eq!(parse_request(r#"{"op":"list"}"#), Ok(Request::List));
         assert_eq!(
@@ -195,16 +215,11 @@ mod tests {
         let spawn =
             parse_request(r#"{"op":"spawn","session":"dev","command":"claude --continue"}"#)
                 .unwrap();
-        let Request::Spawn {
-            session,
-            cwd,
-            command,
-        } = spawn
-        else {
-            panic!("not spawn")
-        };
-        assert_eq!((session.as_str(), cwd), ("dev", None));
-        assert_eq!(command.argv(), vec!["sh", "-c", "claude --continue"]);
+        assert!(matches!(
+            spawn,
+            Request::Spawn { ref session, cwd: None, ref command }
+                if session == "dev" && command.argv() == ["sh", "-c", "claude --continue"]
+        ));
         let spawn = parse_request(r#"{"op":"spawn","session":"s","cwd":"/w","command":["codex"]}"#)
             .unwrap();
         assert!(

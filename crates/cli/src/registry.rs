@@ -141,7 +141,7 @@ pub struct Registry {
 
 impl Registry {
     fn lock(&self) -> MutexGuard<'_, Inner> {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+        crate::sync::lock(&self.inner)
     }
 
     /// Replace one machine's scan. Returns the changes it caused.
@@ -625,6 +625,90 @@ mod tests {
         reg.publish(machine(vec![agent(1, AgentState::Idle, 0)]), 0);
         let got = reg.wait_for("m/1", AgentState::Idle, Some(Duration::MAX), "m");
         assert_eq!(got.unwrap().pid, 1);
+    }
+
+    #[test]
+    fn unreachable_unknown_machine_is_added() {
+        let reg = Registry::default();
+        reg.mark_unreachable(machine(vec![]), "no route".into());
+        let snap = reg.snapshot();
+        assert_eq!(snap.machines.len(), 1);
+        assert_eq!(snap.machines[0].status, MachineStatus::Unreachable);
+        assert_eq!(snap.machines[0].error.as_deref(), Some("no route"));
+    }
+
+    /// A registry whose mutex a panicking thread poisoned.
+    fn poisoned() -> std::sync::Arc<Registry> {
+        let reg = std::sync::Arc::new(Registry::default());
+        let r = reg.clone();
+        let _ = std::thread::spawn(move || {
+            let _held = r.lock();
+            panic!("poison the registry");
+        })
+        .join();
+        assert!(reg.inner.is_poisoned());
+        reg
+    }
+
+    #[test]
+    fn waiting_survives_a_poisoned_registry() {
+        let reg = poisoned();
+        let waiter = {
+            let reg = reg.clone();
+            std::thread::spawn(move || reg.wait_for("m/1", AgentState::Idle, None, "m"))
+        };
+        std::thread::sleep(Duration::from_millis(50));
+        reg.publish(machine(vec![agent(1, AgentState::Idle, 0)]), 0);
+        assert_eq!(waiter.join().unwrap().unwrap().pid, 1);
+        let err = reg
+            .wait_for(
+                "m/9",
+                AgentState::Idle,
+                Some(Duration::from_millis(30)),
+                "m",
+            )
+            .unwrap_err();
+        assert!(err.contains("timed out"), "{err}");
+    }
+
+    #[test]
+    fn wait_without_timeout_wakes_on_publish() {
+        let reg = std::sync::Arc::new(Registry::default());
+        let waiter = {
+            let reg = reg.clone();
+            std::thread::spawn(move || reg.wait_for("m/1", AgentState::Idle, None, "m"))
+        };
+        std::thread::sleep(Duration::from_millis(50));
+        reg.publish(machine(vec![agent(1, AgentState::Idle, 0)]), 0);
+        assert_eq!(waiter.join().unwrap().unwrap().pid, 1);
+    }
+
+    #[test]
+    fn wait_timeout_for_a_missing_agent_says_so() {
+        let reg = Registry::default();
+        let err = reg
+            .wait_for("m/9", AgentState::Idle, Some(Duration::ZERO), "m")
+            .unwrap_err();
+        assert!(err.contains("(it not found)"), "{err}");
+    }
+
+    #[test]
+    fn wait_timeout_says_what_the_agent_was_doing() {
+        let reg = Registry::default();
+        reg.publish(machine(vec![agent(1, AgentState::Working, 0)]), 0);
+        let none = Some(Duration::ZERO);
+        let err = reg
+            .wait_for("m/1", AgentState::Idle, none, "m")
+            .unwrap_err();
+        assert!(err.contains("(it is working)"), "{err}");
+        reg.mark_unreachable(machine(vec![]), "timeout".into());
+        let err = reg
+            .wait_for("m/1", AgentState::Idle, none, "m")
+            .unwrap_err();
+        assert!(
+            err.contains("was working when m became unreachable"),
+            "{err}"
+        );
     }
 
     #[test]

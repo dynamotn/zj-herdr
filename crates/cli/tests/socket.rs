@@ -253,6 +253,44 @@ fn bind_accepts_a_sticky_shared_directory_like_tmp() {
 }
 
 #[test]
+fn socket_owner_must_be_us() {
+    use zj_herdr::paths::{check_socket_owner, uid};
+    let tmp = tempfile::tempdir().unwrap();
+    let sock = tmp.path().join("s.sock");
+    let plain = tmp.path().join("plain");
+    std::fs::write(&plain, "").unwrap();
+    assert!(
+        check_socket_owner(&plain, uid()).is_err(),
+        "regular file accepted"
+    );
+    let _listener = match std::os::unix::net::UnixListener::bind(&sock) {
+        Err(e) if e.kind() == ErrorKind::PermissionDenied => {
+            eprintln!("skipped: this environment forbids binding Unix sockets ({e})");
+            return;
+        }
+        other => other.unwrap(),
+    };
+    check_socket_owner(&sock, uid()).unwrap();
+    assert!(check_socket_owner(&sock, uid().wrapping_add(1)).is_err());
+}
+
+#[test]
+fn bind_in_the_current_directory_for_a_bare_file_name() {
+    let name = format!(".cov-bind-{}.sock", std::process::id());
+    let path = std::path::Path::new(&name);
+    let listener = match server::bind(path) {
+        Err(e) if e.kind() == ErrorKind::PermissionDenied => {
+            eprintln!("skipped: this environment forbids binding Unix sockets ({e})");
+            return;
+        }
+        other => other.unwrap(),
+    };
+    assert!(std::fs::symlink_metadata(path).is_ok());
+    drop(listener);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn bound_socket_is_private_and_not_stolen() {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("s.sock");

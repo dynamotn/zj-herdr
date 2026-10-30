@@ -684,3 +684,25 @@ fn scanner_drops_spare_claude_sessions() {
     assert_eq!(agents.len(), 1);
     assert!(agents[0].background);
 }
+
+#[test]
+fn a_transcript_that_cannot_be_read_gives_no_status() {
+    let tmp = tempfile::tempdir().unwrap();
+    // A directory where the transcript should be: listed, but not readable.
+    let dir = tmp.path().join(claude_slug(Path::new("/work/proj")));
+    fs::create_dir_all(dir.join("s1.jsonl")).unwrap();
+    let detector = ClaudeDetector::new(tmp.path().to_path_buf());
+    assert!(detector
+        .detect(&proc("claude", "/work/proj", T0, 0.0))
+        .is_none());
+}
+
+#[test]
+fn a_codex_without_a_cwd_gets_no_rollout_and_a_missing_tree_has_none() {
+    let (_tmp, detector) = codex_tree();
+    let mut p = proc("codex", "/work/codex-proj", T0, 0.0);
+    p.cwd = None;
+    detector.prepare(&[&p]);
+    assert!(detector.detect(&p).is_none());
+    assert!(zj_herdr::transcript::codex_rollouts(Path::new("/nonexistent/zj-herdr")).is_empty());
+}

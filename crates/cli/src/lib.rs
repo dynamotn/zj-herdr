@@ -16,5 +16,6 @@ pub mod remote;
 pub mod scan;
 pub mod server;
 pub mod sessions;
+pub mod sync;
 pub mod transcript;
 pub mod zellij;

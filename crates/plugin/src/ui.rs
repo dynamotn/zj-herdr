@@ -894,10 +894,13 @@ pub fn render(
     let mut fold_at = None;
     for g in (0..groups.len()).rev() {
         // Once anything folds, the `+N idle` line needs a row too.
-        if body.len() + usize::from(folded > 0) <= room || groups[g].keep {
-            continue;
-        }
-        let Some(start) = body.iter().position(|l| l.group == Some(g)) else {
+        let fits = body.len() + usize::from(folded > 0) <= room || groups[g].keep;
+        // Every group owns its tab line, so a group to fold always has a start.
+        let Some(start) = body
+            .iter()
+            .position(|l| l.group == Some(g))
+            .filter(|_| !fits)
+        else {
             continue;
         };
         body.retain(|l| l.group != Some(g));
@@ -1612,6 +1615,74 @@ mod tests {
         assert_eq!(hit(&hits[2], 0), Some(&Target::Restore));
         assert_eq!(lines[3], "oops");
         assert_eq!(lines[4], "box");
+    }
+
+    #[test]
+    fn small_helpers_cover_every_variant() {
+        assert_eq!(mark("zzz"), "zzz", "an unknown kind stands for itself");
+        assert_eq!(tab_color(AgentState::Working), GREEN);
+        assert_eq!(tab_color(AgentState::Done), DIM);
+        assert_eq!(tab_color(AgentState::Unknown), DIM);
+        let theme = Theme::default();
+        assert_eq!(Surface::Busy.color(&theme), theme.busy);
+        let hits = vec![(2..5, Target::Restore), (0..usize::MAX, Target::Restore)];
+        let shifted = shift(hits, 3);
+        assert_eq!(shifted[0].0, 5..8);
+        assert_eq!(shifted[1].0, 3..usize::MAX);
+    }
+
+    #[test]
+    fn states_without_a_glyph_story_still_draw() {
+        let mut st = state(2);
+        st.machines.truncate(1);
+        st.machines[0].agents[0].state = AgentState::Unknown;
+        st.machines[0].agents[1].state = AgentState::Done;
+        let lines = draw(frame(&st), (20, 40));
+        let glyph = |p: &str| lines.iter().find(|l| l.contains(p)).unwrap().chars().nth(4);
+        assert_eq!(glyph("proj1"), Some('?'));
+        assert_eq!(glyph("proj2"), Some('✓'));
+        assert_eq!(tally(&st), "0 working");
+    }
+
+    #[test]
+    fn killed_tasks_are_dim_rings() {
+        let mut st = state(1);
+        st.machines[0].agents[0].tasks = vec![Task {
+            kind: "shell".into(),
+            label: "make".into(),
+            state: TaskState::Killed,
+            started: 40,
+            ended: 0,
+        }];
+        let layouts = code_tab(vec![1]);
+        let tree = view::tree(&st, Some("dev"), &layouts);
+        let lines = plain(&render(frame(&st), &tree, (20, 40)).0);
+        assert!(lines.iter().any(|l| l.contains("┊ ○ ⚙ make")), "{lines:?}");
+    }
+
+    #[test]
+    fn working_tabs_are_busy_and_the_last_card_has_no_trailing_gap() {
+        let mut st = state(1);
+        st.machines.truncate(1);
+        st.machines[0].agents[0].state = AgentState::Working;
+        let layouts = code_tab(vec![1]);
+        let tree = view::tree(&st, Some("other"), &layouts);
+        let f = Frame {
+            current: Some("other"),
+            density: Density::Cards,
+            ..frame(&st)
+        };
+        let (raw, _) = render(f, &tree, (20, 30));
+        let theme = Theme::default();
+        assert!(raw.iter().any(|l| l.starts_with(&theme::bg(theme.busy))));
+        assert!(!plain(&raw[..raw.len().min(6)]).last().unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_empty_state_says_there_are_no_agents() {
+        let st = StateV1::new(0, vec![]);
+        let lines = draw(frame(&st), (10, 30));
+        assert!(lines.iter().any(|l| l == "  no agents"), "{lines:?}");
     }
 
     #[test]

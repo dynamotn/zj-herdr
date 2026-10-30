@@ -1,7 +1,9 @@
 //! `zj-herdr daemon`: rescan, serve the socket, push state to Zellij.
 
 use std::collections::{BTreeSet, HashMap};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -16,6 +18,7 @@ use crate::remote;
 use crate::scan::{now_secs, Scanner};
 use crate::server::{self, Context};
 use crate::sessions::Store;
+use crate::sync::lock;
 use crate::zellij::{Zellij, ZellijCli};
 
 /// The plan's cadence: fast enough to feel live, cheap enough to leave on.
@@ -81,18 +84,18 @@ impl TabCache {
     }
 }
 
-fn lock(cache: &Mutex<TabCache>) -> std::sync::MutexGuard<'_, TabCache> {
-    cache.lock().unwrap_or_else(|e| e.into_inner())
+/// Ask stale sessions for their tabs, never holding the lock across a call.
+fn refresh_tabs(cache: &Mutex<TabCache>, zellij: &dyn Zellij) {
+    let stale = lock(cache).stale(now_secs());
+    for session in stale {
+        let tabs = zellij.panes(&session).ok();
+        lock(cache).store(session, now_secs(), tabs);
+    }
 }
 
-/// Ask stale sessions for their tabs, never holding the lock across a call.
 fn tab_loop(cache: &Mutex<TabCache>, zellij: &dyn Zellij) {
     loop {
-        let stale = lock(cache).stale(now_secs());
-        for session in stale {
-            let tabs = zellij.panes(&session).ok();
-            lock(cache).store(session, now_secs(), tabs);
-        }
+        refresh_tabs(cache, zellij);
         thread::sleep(SCAN_INTERVAL);
     }
 }
@@ -109,6 +112,22 @@ pub struct Options {
 }
 
 pub fn run(opts: Options) -> Result<(), String> {
+    run_with(
+        opts,
+        Arc::new(ZellijCli),
+        remote::ssh_command,
+        &AtomicBool::new(false),
+    )
+}
+
+/// [`run`] against any Zellij, returning `Ok` once `stop` is set (after the
+/// scan in progress); the real daemon never sets it.
+fn run_with(
+    opts: Options,
+    zellij: Arc<dyn Zellij>,
+    ssh: fn(&Remote) -> Command,
+    stop: &AtomicBool,
+) -> Result<(), String> {
     if let Some(r) = opts.remotes.iter().find(|r| r.name == opts.machine) {
         return Err(format!(
             "remote {:?} has the same name as this machine; rename it",
@@ -126,7 +145,6 @@ pub fn run(opts: Options) -> Result<(), String> {
     let listener =
         server::bind(&opts.socket).map_err(|e| format!("{}: {e}", opts.socket.display()))?;
     let registry = Arc::new(Registry::default());
-    let zellij: Arc<dyn Zellij> = Arc::new(ZellijCli);
     let ctx = Arc::new(Context {
         registry: Arc::clone(&registry),
         zellij: Arc::clone(&zellij),
@@ -145,7 +163,7 @@ pub fn run(opts: Options) -> Result<(), String> {
     }
     for r in opts.remotes {
         let registry = Arc::clone(&registry);
-        thread::spawn(move || remote::poll_loop(r, registry));
+        thread::spawn(move || remote::poll_loop(r, registry, ssh));
     }
 
     let tabs = Arc::new(Mutex::new(TabCache::default()));
@@ -158,11 +176,7 @@ pub fn run(opts: Options) -> Result<(), String> {
     let mut scan = || {
         let mut machine = scanner.scan();
         lock(&tabs).apply(&mut machine.agents);
-        if store.record(&machine.agents, now_secs()) {
-            if let Err(e) = store.save(&opts.sessions) {
-                eprintln!("zj-herdr: {}: {e}", opts.sessions.display());
-            }
-        }
+        record_sessions(&mut store, &machine.agents, &opts.sessions);
         registry.publish(machine, now_secs());
     };
 
@@ -171,10 +185,21 @@ pub fn run(opts: Options) -> Result<(), String> {
     let mut started = Instant::now();
     scan();
     thread::spawn(move || server::serve(listener, ctx));
-    loop {
+    while !stop.load(Ordering::Relaxed) {
         thread::sleep(SCAN_INTERVAL.saturating_sub(started.elapsed()));
         started = Instant::now();
         scan();
+    }
+    Ok(())
+}
+
+/// Remember the panes' agent sessions for `zj-herdr restore`, saving only
+/// on a change; a failed save is reported, never fatal.
+fn record_sessions(store: &mut Store, agents: &[Agent], path: &Path) {
+    if store.record(agents, now_secs()) {
+        if let Err(e) = store.save(path) {
+            eprintln!("zj-herdr: {}: {e}", path.display());
+        }
     }
 }
 
@@ -253,20 +278,31 @@ fn push_loop(registry: &Registry, zellij: &dyn Zellij) {
     let mut last_error = String::new();
     loop {
         thread::sleep(PUSH_POLL);
-        match pusher.round(registry, zellij, Instant::now()) {
-            Err(e) if e != last_error => {
-                eprintln!("zj-herdr: push: {e}");
-                last_error = e;
-            }
-            Err(_) => {}
-            Ok(()) => last_error.clear(),
+        report_push(
+            pusher.round(registry, zellij, Instant::now()),
+            &mut last_error,
+        );
+    }
+}
+
+/// Print a failed round once, however long it keeps failing.
+fn report_push(result: Result<(), String>, last_error: &mut String) {
+    match result {
+        Err(e) if e != *last_error => {
+            eprintln!("zj-herdr: push: {e}");
+            *last_error = e;
         }
+        Err(_) => {}
+        Ok(()) => last_error.clear(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::{CommandLine, Request};
+    use crate::client;
+    use crate::config::Config;
     use std::sync::Mutex;
     use zj_herdr_core::{AgentState, Machine, MachineStatus, Pane};
 
@@ -282,14 +318,18 @@ mod tests {
     }
 
     /// Sessions `a` (attached), `b` (detached) and `c` (unanswered, and its
-    /// pipe fails); records each pipe.
+    /// pipe fails unless `healthy`); records each pipe, run and `panes`
+    /// question. `panes` answers for `dev` only.
     #[derive(Default)]
-    struct PushZellij {
+    struct FakeZellij {
         down: bool,
+        healthy: bool,
         piped: Mutex<Vec<String>>,
+        asked: Mutex<Vec<String>>,
+        ran: Mutex<Vec<String>>,
     }
 
-    impl Zellij for PushZellij {
+    impl Zellij for FakeZellij {
         fn sessions(&self) -> Result<Vec<String>, String> {
             if self.down {
                 return Err("no server".into());
@@ -305,7 +345,7 @@ mod tests {
         fn pipe(&self, session: &str, name: &str, _: &str) -> Result<(), String> {
             assert_eq!(name, STATE_SCHEMA);
             self.piped.lock().unwrap().push(session.to_string());
-            if session == "c" {
+            if session == "c" && !self.healthy {
                 return Err("gone".into());
             }
             Ok(())
@@ -313,18 +353,28 @@ mod tests {
         fn deliver(&self, _: &str, _: &str, _: &str, _: &str) -> Result<String, String> {
             Ok(String::new())
         }
-        fn run(&self, _: &str, _: Option<&str>, _: &[String]) -> Result<(), String> {
+        fn run(&self, session: &str, _: Option<&str>, command: &[String]) -> Result<(), String> {
+            let call = format!("{session} {}", command.join(" "));
+            self.ran.lock().unwrap().push(call);
             Ok(())
         }
-        fn panes(&self, _: &str) -> Result<HashMap<u32, PaneTab>, String> {
-            Ok(HashMap::new())
+        fn panes(&self, session: &str) -> Result<HashMap<u32, PaneTab>, String> {
+            self.asked.lock().unwrap().push(session.to_string());
+            if session != "dev" {
+                return Err("There is no active session!".into());
+            }
+            let tab = PaneTab {
+                position: 1,
+                name: "api".into(),
+            };
+            Ok(HashMap::from([(3, tab)]))
         }
     }
 
     #[test]
     fn pusher_delivers_on_change_and_heartbeat_to_attached_sessions() {
         let registry = Registry::default();
-        let zellij = PushZellij::default();
+        let zellij = FakeZellij::default();
         let piped = || std::mem::take(&mut *zellij.piped.lock().unwrap());
         let mut pusher = Pusher::default();
         let t0 = Instant::now();
@@ -353,47 +403,159 @@ mod tests {
         assert!(pusher.round(&registry, &zellij, later).is_err());
         assert_eq!(piped(), ["a", "c"]);
         // No sessions to ask: the error, and nothing sent.
-        let down = PushZellij {
+        let down = FakeZellij {
             down: true,
-            ..PushZellij::default()
+            ..FakeZellij::default()
         };
         assert_eq!(
             pusher.round(&registry, &down, later),
             Err("no server".into())
         );
         assert!(down.piped.lock().unwrap().is_empty());
+        // Every pipe lands: the round is a success.
+        let healthy = FakeZellij {
+            healthy: true,
+            ..FakeZellij::default()
+        };
+        assert_eq!(Pusher::default().round(&registry, &healthy, later), Ok(()));
+        assert_eq!(*healthy.piped.lock().unwrap(), ["a", "c"]);
     }
 
-    /// Answers `panes` for `dev` only, and counts the questions.
-    #[derive(Default)]
-    struct FakeZellij {
-        asked: Mutex<Vec<String>>,
+    #[test]
+    fn a_failing_push_is_reported_once_until_it_recovers() {
+        let mut last = String::new();
+        report_push(Err("boom".into()), &mut last);
+        assert_eq!(last, "boom");
+        report_push(Err("boom".into()), &mut last);
+        assert_eq!(last, "boom");
+        report_push(Err("other".into()), &mut last);
+        assert_eq!(last, "other");
+        report_push(Ok(()), &mut last);
+        assert_eq!(last, "");
     }
 
-    impl Zellij for FakeZellij {
-        fn sessions(&self) -> Result<Vec<String>, String> {
-            Ok(vec![])
+    #[test]
+    fn sessions_are_saved_on_change_and_a_failed_save_is_not_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = agent(1, Some(Pane::new("dev", 3)));
+        a.session_id = Some("0f0e0d0c-0b0a-4908-8706-050403020100".into());
+        let (mut store, good) = (Store::default(), dir.path().join("sessions.json"));
+        record_sessions(&mut store, &[a.clone()], &good);
+        assert!(good.exists());
+        // Unchanged: nothing to save, so nothing is written again.
+        std::fs::remove_file(&good).unwrap();
+        record_sessions(&mut store, &[a.clone()], &good);
+        assert!(!good.exists());
+        // A path below a file cannot be saved to.
+        let mut store = Store::default();
+        let bad = good.join("below/sessions.json");
+        std::fs::write(&good, "").unwrap();
+        record_sessions(&mut store, &[a], &bad);
+        assert!(!bad.exists());
+    }
+
+    #[test]
+    fn refresh_tabs_asks_stale_sessions_and_keeps_the_answers() {
+        let fake = FakeZellij::default();
+        let cache = Mutex::new(TabCache::default());
+        let mut agents = [agent(1, Some(Pane::new("dev", 3)))];
+        lock(&cache).apply(&mut agents);
+        refresh_tabs(&cache, &fake);
+        lock(&cache).apply(&mut agents);
+        let tab = agents[0].pane.as_ref().unwrap().tab.as_ref();
+        assert_eq!(tab.unwrap().name, "api");
+        assert_eq!(*fake.asked.lock().unwrap(), ["dev"]);
+        // Fresh answers are not asked for again.
+        refresh_tabs(&cache, &fake);
+        assert_eq!(fake.asked.lock().unwrap().len(), 1);
+    }
+
+    fn options(dir: &std::path::Path) -> Options {
+        Options {
+            socket: dir.join("run/zj-herdr.sock"),
+            machine: "box".into(),
+            roots: Roots::default(),
+            remotes: vec![],
+            plugin: "zj_herdr".into(),
+            sessions: dir.join("sessions.json"),
         }
-        fn pipe(&self, _: &str, _: &str, _: &str) -> Result<(), String> {
-            Ok(())
-        }
-        fn deliver(&self, _: &str, _: &str, _: &str, _: &str) -> Result<String, String> {
-            Ok(String::new())
-        }
-        fn run(&self, _: &str, _: Option<&str>, _: &[String]) -> Result<(), String> {
-            Ok(())
-        }
-        fn panes(&self, session: &str) -> Result<HashMap<u32, PaneTab>, String> {
-            self.asked.lock().unwrap().push(session.to_string());
-            if session != "dev" {
-                return Err("There is no active session!".into());
+    }
+
+    /// Stands in for ssh: prints nothing, so the poll fails and no network is used.
+    fn no_ssh(_: &Remote) -> Command {
+        Command::new("true")
+    }
+
+    fn remote(name: &str) -> Remote {
+        let toml =
+            format!("[[remote]]\nname = \"{name}\"\nssh = \"far-alias\"\ninterval_secs = 3600");
+        Config::parse(&toml).unwrap().remote.remove(0)
+    }
+
+    #[test]
+    fn run_refuses_a_remote_named_like_this_machine() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = Options {
+            remotes: vec![remote("box")],
+            ..options(dir.path())
+        };
+        let err = run(opts).unwrap_err();
+        assert!(err.contains("same name as this machine"), "{err}");
+    }
+
+    #[test]
+    fn run_sets_an_unreadable_sessions_file_aside_and_reports_a_bad_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut opts = options(dir.path());
+        std::fs::write(&opts.sessions, "not json").unwrap();
+        // The socket's directory would sit below a file.
+        opts.socket = opts.sessions.join("run/zj-herdr.sock");
+        let stop = AtomicBool::new(true);
+        let err = run_with(opts, Arc::new(FakeZellij::default()), no_ssh, &stop).unwrap_err();
+        assert!(err.contains("sessions.json/run"), "{err}");
+        assert!(dir.path().join("sessions.json.unreadable").exists());
+    }
+
+    #[test]
+    fn the_daemon_scans_serves_and_pushes_until_stopped() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut opts = options(dir.path());
+        opts.remotes = vec![remote("far")];
+        let socket = opts.socket.clone();
+        let fake = Arc::new(FakeZellij::default());
+        let stop = Arc::new(AtomicBool::new(false));
+        let daemon = {
+            let (fake, stop) = (Arc::clone(&fake), Arc::clone(&stop));
+            thread::spawn(move || run_with(opts, fake, no_ssh, &stop))
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let state = loop {
+            assert!(!daemon.is_finished(), "the daemon exited");
+            match client::request(&socket, &Request::List) {
+                Ok(resp) => break resp.state.unwrap(),
+                Err(e) => assert!(Instant::now() < deadline, "no answer: {e}"),
             }
-            let tab = PaneTab {
-                position: 1,
-                name: "api".into(),
-            };
-            Ok(HashMap::from([(3, tab)]))
+            thread::sleep(Duration::from_millis(50));
+        };
+        assert!(state.machines.iter().any(|m| m.name == "box"));
+
+        let spawn = Request::Spawn {
+            session: "dev".into(),
+            cwd: None,
+            command: CommandLine::Argv(vec!["claude".into()]),
+        };
+        client::request(&socket, &spawn).unwrap();
+        assert_eq!(*fake.ran.lock().unwrap(), ["dev claude"]);
+        // Prompts only reach `deliver` for a pane the scan found.
+        assert_eq!(fake.deliver("", "", "", ""), Ok(String::new()));
+
+        // The pusher's first round comes after PUSH_POLL.
+        while fake.piped.lock().unwrap().is_empty() {
+            assert!(Instant::now() < deadline + PUSH_POLL, "nothing pushed");
+            thread::sleep(Duration::from_millis(50));
         }
+        stop.store(true, Ordering::Relaxed);
+        daemon.join().unwrap().unwrap();
     }
 
     fn agent(pid: u32, pane: Option<Pane>) -> Agent {

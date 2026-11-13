@@ -154,11 +154,15 @@ fn heat(percent: usize) -> &'static str {
     }
 }
 
+/// `text` cut to `cols` with `…`. Control characters (a newline in a
+/// command line, an escape in a tab name) become spaces: they would break
+/// the line or the column count.
 fn truncate(text: &str, cols: usize) -> String {
+    let clean = text.chars().map(|c| if c.is_control() { ' ' } else { c });
     if text.chars().count() <= cols {
-        return text.to_string();
+        return clean.collect();
     }
-    let mut out: String = text.chars().take(cols.saturating_sub(1)).collect();
+    let mut out: String = clean.take(cols.saturating_sub(1)).collect();
     if cols > 0 {
         out.push('…');
     }
@@ -652,6 +656,8 @@ pub fn render(
             .and_then(|m| m.ssh.clone())
     };
     let mut group: Option<usize> = None;
+    // The panes of the tab whose card is open: agents of no tab follow it.
+    let mut tab_panes: &[u32] = &[];
     // A blank line after each tab card, part of the card so it folds too.
     let close = |body: &mut Vec<Line>, group: &mut Option<usize>| {
         if let Some(g) = group.take() {
@@ -719,6 +725,7 @@ pub fn render(
                     keep: active,
                 });
                 group = Some(groups.len() - 1);
+                tab_panes = &tab.panes;
                 let spine = if active { "▌" } else { " " };
                 let (glyph, style) = match tab_state {
                     Some(AgentState::Working) => (spinner(tick), GREEN),
@@ -746,8 +753,17 @@ pub fn render(
                 body.push(Line::new(format!("  {text}"), shift(hits, 2), group));
             }
             Row::Agent { agent, local } => {
+                let in_card = |a: &Agent| {
+                    a.pane
+                        .as_ref()
+                        .is_some_and(|p| tab_panes.contains(&p.pane_id))
+                };
+                if !in_card(agent) {
+                    close(&mut body, &mut group);
+                }
                 let in_tab = group.is_some();
-                let more = in_tab && matches!(tree.get(i + 1), Some(Row::Agent { .. }));
+                let more = in_tab
+                    && matches!(tree.get(i + 1), Some(Row::Agent { agent: next, .. }) if in_card(next));
                 let is_sel = selected == Some(agent.id.as_str());
                 let branch = match (in_tab, more) {
                     (false, _) => "   ",
@@ -1352,6 +1368,23 @@ mod tests {
         );
         assert_eq!(hit(&hits[2], 0), None, "the current session is no target");
         assert_eq!(lines.len(), hits.len());
+    }
+
+    #[test]
+    fn control_characters_cannot_break_a_line() {
+        assert_eq!(truncate("a\nb\x1b[2Jc", 20), "a b [2Jc");
+        assert_eq!(truncate("a\nbcdef", 3), "a …");
+    }
+
+    #[test]
+    fn agents_of_no_tab_sit_outside_the_last_card() {
+        let st = state(3);
+        let layouts = code_tab(vec![1]);
+        let tree = view::tree(&st, Some("dev"), &layouts);
+        let lines = plain(&render(frame(&st), &tree, (20, 40)).0);
+        let row = |name: &str| lines.iter().find(|l| l.contains(name)).unwrap().clone();
+        assert!(row("proj1").starts_with("  └ "), "{lines:#?}");
+        assert!(row("proj2").starts_with("    "), "{lines:#?}");
     }
 
     #[test]

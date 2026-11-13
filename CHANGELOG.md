@@ -6,6 +6,21 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- A hidden rail no longer rebuilds its view four times a second; it catches
+  up when it shows.
+
+### Fixed
+
+- A script run as `./build.sh` (seen as `bash ./build.sh`) or a
+  `bash -c '…'` command pane shows as a command row and lands under
+  `earlier`, instead of passing for a shell at its prompt.
+- Agents of a session that fit no tab yet no longer draw inside the last
+  tab's card, branching from it and folding away with it.
+- A newline or escape in a command line, pane title or tab name no longer
+  splits a rail line and shifts every click target below it.
+
 ## [0.3.3] - 2026-10-30
 
 ### Fixed

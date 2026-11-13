@@ -202,6 +202,7 @@ impl<H: Host> App<H> {
             Event::Visible(visible) => {
                 self.visible = visible;
                 if visible {
+                    self.refresh_view();
                     self.check_restore();
                 } else {
                     self.in_use = false;
@@ -211,8 +212,11 @@ impl<H: Host> App<H> {
             Event::Timer(_) => {
                 self.host.set_timeout(TICK_SECS);
                 self.tick += 1;
-                // Commands become rows once they have run a while.
-                self.refresh_view();
+                // Commands become rows once they have run a while; a hidden
+                // rail catches up when it shows.
+                if self.visible {
+                    self.refresh_view();
+                }
                 self.visible
             }
             Event::PermissionRequestResult(PermissionStatus::Granted) => {

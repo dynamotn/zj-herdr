@@ -61,8 +61,8 @@ impl Activity {
         self.ledger.truncate(LEDGER_MAX);
     }
 
-    /// Pane `pane` now runs `argv` in the foreground (empty or a shell: it
-    /// is back at its prompt).
+    /// Pane `pane` now runs `argv` in the foreground (empty or a shell with
+    /// only options: it is back at its prompt; `bash ./x.sh` runs a script).
     pub fn command(&mut self, pane: u32, argv: &[String], now: u64) {
         let line = argv.join(" ");
         if self.running.get(&pane).is_some_and(|r| r.line == line) {
@@ -70,7 +70,8 @@ impl Activity {
         }
         // Whatever ran before is over: back at the prompt, or replaced.
         self.finish(pane, false, now);
-        let at_prompt = argv.first().is_none_or(|p| command::is_shell(p));
+        let at_prompt = argv.first().is_none_or(|p| command::is_shell(p))
+            && argv.iter().skip(1).all(|a| a.starts_with('-'));
         let agent = argv.iter().any(|w| AGENTS.contains(&basename(w)));
         let class = command::classify(&line);
         if at_prompt || agent || class == Class::Interactive {
@@ -318,6 +319,8 @@ mod tests {
             "claude --resume x",
             "node /opt/bin/codex",
             "fish",
+            "-zsh",
+            "bash -l",
             "",
         ] {
             a.command(1, &argv(line), 0);
@@ -327,6 +330,11 @@ mod tests {
         a.command(1, &argv("make"), 0);
         a.command(1, &argv("nvim x"), 5);
         assert_eq!(a.ledger[0].label, "make");
+        // A script runs under its interpreter's name.
+        for line in ["bash ./scripts/test.sh", "sh -c 'cargo test'"] {
+            a.command(2, &argv(line), 0);
+            assert!(a.is_running(2), "{line:?}");
+        }
     }
 
     #[test]

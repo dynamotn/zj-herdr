@@ -11,7 +11,7 @@ use zj_herdr::detect::{self, AiderDetector, ClaudeDetector, CodexDetector, Detec
 use zj_herdr::procs::{ProcInfo, RawProc};
 use zj_herdr::scan::Scanner;
 use zj_herdr::transcript::claude_slug;
-use zj_herdr_core::{AgentState, Pane};
+use zj_herdr_core::{AgentState, Pane, TaskState};
 
 const T0: u64 = 1_750_000_000;
 const CODEX_NEW: &str = "rollout-2025-05-01T10-00-00-0196a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b.jsonl";
@@ -623,6 +623,37 @@ fn claude_waiting_on_background_work_is_working_but_not_on_a_server() {
     let server = status("npm run dev");
     assert_eq!(server.state, AgentState::Idle, "a dev server never ends");
     assert_eq!(server.tasks[0].label, "npm run dev");
+}
+
+#[test]
+fn claude_lists_background_work_that_ended_lately() {
+    let tmp = tempfile::tempdir().unwrap();
+    claude_background(tmp.path(), "make", "2025-06-15T15:06:40Z");
+    let path = tmp
+        .path()
+        .join(claude_slug(Path::new("/work/proj")))
+        .join("s1.jsonl");
+    let note = r#"{"type":"user","timestamp":"2025-06-15T15:07:00Z","message":{"content":"<task-notification><task-id>b1</task-id><status>completed</status></task-notification>"}}"#;
+    let mut text = fs::read_to_string(&path).unwrap();
+    text.push_str(note);
+    text.push('\n');
+    fs::write(&path, text).unwrap();
+    set_mtime(&path, T0 + 20);
+    let detector = ClaudeDetector::new(tmp.path().to_path_buf());
+    let status = detector
+        .detect(&proc("claude", "/work/proj", T0 + 60, 0.0))
+        .unwrap();
+    assert_eq!(status.tasks.len(), 1, "ended within the linger");
+    assert_eq!(status.tasks[0].state, TaskState::Completed);
+    let later = detector
+        .detect(&proc(
+            "claude",
+            "/work/proj",
+            T0 + 20 + detect::TASK_LINGER_SECS,
+            0.0,
+        ))
+        .unwrap();
+    assert!(later.tasks.is_empty(), "gone after the linger");
 }
 
 #[test]

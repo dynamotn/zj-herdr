@@ -44,6 +44,18 @@ pub fn bind(path: &Path) -> io::Result<UnixListener> {
         _ => Path::new("."),
     };
     paths::ensure_socket_dir(dir, paths::uid())?;
+    // Every rail starts a daemon at once: without the lock, two can judge
+    // the same socket stale and the second removes the first's live one.
+    // Released when `bind` returns, the socket being in place by then. It
+    // never waits: in a shared `/tmp` anyone could hold it.
+    let guard = fs::File::open(dir)?;
+    if unsafe { libc::flock(guard.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let e = io::Error::last_os_error();
+        return Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            format!("another daemon is starting on {} ({e})", path.display()),
+        ));
+    }
     if fs::symlink_metadata(path).is_ok() {
         paths::check_socket_owner(path, paths::uid()).map_err(|e| {
             io::Error::new(
@@ -213,8 +225,11 @@ pub fn handle(stream: UnixStream, ctx: &Context) -> io::Result<()> {
     Ok(())
 }
 
+/// Event lines a subscriber may fall behind by before it is dropped.
+const SUBSCRIBER_BACKLOG: usize = 4096;
+
 fn stream_events(mut writer: UnixStream, ctx: &Context) -> io::Result<()> {
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = mpsc::sync_channel(SUBSCRIBER_BACKLOG);
     ctx.registry.subscribe(tx);
     for line in rx {
         writer.write_all(line.as_bytes())?;

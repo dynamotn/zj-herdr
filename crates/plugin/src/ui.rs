@@ -383,7 +383,7 @@ fn task_lines(tasks: &[Task], stem: &str, tick: u64, now: u64, cols: usize) -> V
                 TaskState::Running => (spinner(tick), GREEN),
                 TaskState::Completed => ("●", GREEN),
                 TaskState::Failed => ("✗", RED),
-                TaskState::Killed => ("○", DIM),
+                TaskState::Killed | TaskState::Unknown => ("○", DIM),
             };
             let age = match t.state {
                 TaskState::Running if !steady && t.started > 0 => {

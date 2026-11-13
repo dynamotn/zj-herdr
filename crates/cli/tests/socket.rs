@@ -320,6 +320,21 @@ fn bound_socket_is_private_and_not_stolen() {
 }
 
 #[test]
+fn a_daemon_starting_alongside_another_backs_off() {
+    use std::os::unix::io::AsRawFd;
+    let tmp = tempfile::tempdir().unwrap();
+    // Another daemon is between its stale check and its link.
+    let held = std::fs::File::open(tmp.path()).unwrap();
+    assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX) }, 0);
+    let err = server::bind(&tmp.path().join("s.sock")).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::AddrInUse, "{err}");
+    assert!(
+        err.to_string().contains("another daemon is starting"),
+        "{err}"
+    );
+}
+
+#[test]
 fn list_returns_every_machine() {
     let d = Daemon::new();
     d.registry.publish(
@@ -499,16 +514,20 @@ fn wait_and_subscribe_see_changes() {
     let wait_conn = d.connect();
     let waiter = thread::spawn(move || client::request_on(wait_conn, &wait));
     let sub_conn = d.connect();
+    let (subscribed, ready) = std::sync::mpsc::channel();
     let events = thread::spawn(move || {
         let mut seen = Vec::new();
         client::subscribe_on(sub_conn, |e| {
             seen.push(e);
+            let _ = subscribed.send(());
             seen.len() < 2
         })
         .unwrap();
         seen
     });
-    thread::sleep(Duration::from_millis(100));
+    // Publish only once the snapshot arrived: the subscriber is registered,
+    // so the change reaches it (a sleep could lose it and hang the test).
+    ready.recv_timeout(Duration::from_secs(10)).unwrap();
     d.registry.publish(
         machine(
             "box",

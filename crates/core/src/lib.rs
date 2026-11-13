@@ -27,8 +27,9 @@ pub enum AgentState {
     Idle,
     /// The process has exited.
     Done,
-    /// Not enough signal to decide.
+    /// Not enough signal to decide; also any state a newer release adds.
     #[default]
+    #[serde(other)]
     Unknown,
 }
 
@@ -197,6 +198,10 @@ pub enum TaskState {
     Completed,
     Failed,
     Killed,
+    /// A state a newer release adds: one unknown word must not fail the
+    /// whole snapshot.
+    #[serde(other)]
+    Unknown,
 }
 
 /// A background shell command or subagent of an agent.
@@ -272,6 +277,8 @@ impl Agent {
 pub enum MachineStatus {
     #[default]
     Ok,
+    /// Also any status a newer release adds.
+    #[serde(other)]
     Unreachable,
 }
 
@@ -556,6 +563,18 @@ mod tests {
             StateV1::from_json(&json),
             Err(WireError::Schema { .. })
         ));
+    }
+
+    #[test]
+    fn states_a_newer_release_adds_parse_as_unknown() {
+        let json = r#"{"schema":"zj_herdr.state.v1","generated_at":1,"machines":[
+            {"name":"m","status":"asleep","agents":[{"id":"m/1","machine":"m","kind":"pi","pid":1,
+            "state":"paused","since":0,"tasks":[{"kind":"shell","label":"x","state":"parked","started":0,"ended":0}]}]}]}"#;
+        let state = StateV1::from_json(json).unwrap();
+        assert_eq!(state.machines[0].status, MachineStatus::Unreachable);
+        let agent = state.agents().next().unwrap();
+        assert_eq!(agent.state, AgentState::Unknown);
+        assert_eq!(agent.tasks[0].state, TaskState::Unknown);
     }
 
     #[test]

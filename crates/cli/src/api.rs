@@ -37,6 +37,14 @@ fn yes() -> bool {
     true
 }
 
+/// A state a client asks for: a typo is an error, though a snapshot reads
+/// any state it does not know as `unknown`.
+fn strict_state<'de, D: serde::Deserializer<'de>>(d: D) -> Result<AgentState, D::Error> {
+    String::deserialize(d)?
+        .parse()
+        .map_err(serde::de::Error::custom)
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "lowercase")]
 pub enum Request {
@@ -45,6 +53,7 @@ pub enum Request {
     /// Return once `agent` is in `state`, or fail after `timeout` seconds.
     Wait {
         agent: String,
+        #[serde(deserialize_with = "strict_state")]
         state: AgentState,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         timeout: Option<f64>,

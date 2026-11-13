@@ -1667,6 +1667,24 @@ mod app_tests {
     }
 
     #[test]
+    fn only_a_shown_rail_rebuilds_on_the_clock() {
+        let mut app = ready(&[]);
+        send_state(
+            &mut app,
+            &state(vec![agent(1, AgentState::Idle, Some(Pane::new("dev", 1)))]),
+        );
+        app.update(Event::Visible(false));
+        app.state = None;
+        app.update(Event::Timer(0.25));
+        assert!(app.state.is_none(), "a hidden rail rebuilds nothing");
+        app.update(Event::Visible(true));
+        assert!(app.state.is_some(), "it catches up when shown");
+        app.state = None;
+        app.update(Event::Timer(0.25));
+        assert!(app.state.is_some());
+    }
+
+    #[test]
     fn panes_tabs_commands_and_the_clock_update_the_view() {
         let mut app = ready(&[("pinned", "true")]);
         layout_events(&mut app);

@@ -12,6 +12,9 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   up when it shows.
 - Each scan no longer walks every thread on the machine, only processes:
   about a third of the CPU per scan on a desktop with a few thousand threads.
+- A `zj-herdr watch` that stops reading (suspended, or piped into a pager
+  nobody scrolls) is disconnected once it falls far behind, instead of the
+  daemon queueing events for it without end.
 
 ### Fixed
 
@@ -27,6 +30,17 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   being taken for Claude Code's own machinery.
 - A resumed Claude session no longer stays `working` because of background
   work its earlier process launched and never saw end.
+- A rail or remote one release behind no longer rejects a whole snapshot
+  over a state it does not know: the agent, task or machine reads as
+  unknown (or unreachable) and the rest still shows.
+- Several daemons starting at once (one per tab) can no longer remove each
+  other's socket and leave one running unreachable, writing `sessions.json`
+  alongside the other.
+- A conversation restored into a new pane is recorded once: it no longer
+  stays recorded in its old pane too and reopens twice on the next restore.
+- A remote's long error output is cut to one short line, so it can no longer
+  push the state sent to Zellij past the size of one argument and freeze
+  every rail.
 - A newline or escape in a command line, pane title or tab name no longer
   splits a rail line and shifts every click target below it.
 

@@ -2,7 +2,7 @@
 //! and wake-ups for waiters and subscribers.
 
 use std::collections::BTreeMap;
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::SyncSender;
 use std::sync::{Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -96,7 +96,7 @@ struct Inner {
     changes: u64,
     /// Agents marked seen, with the `since` of the idle spell they saw.
     acks: BTreeMap<String, u64>,
-    subscribers: Vec<Sender<String>>,
+    subscribers: Vec<SyncSender<String>>,
 }
 
 /// Mark `machine`'s agents seen per `acks`, forgetting the marks of its
@@ -128,9 +128,14 @@ fn broadcast(inner: &mut Inner, lines: &[String]) {
     if !lines.is_empty() {
         inner
             .subscribers
-            .retain(|tx| lines.iter().all(|l| tx.send(l.clone()).is_ok()));
+            // A subscriber too far behind (a `watch` suspended or piped into
+            // a pager nobody scrolls) is dropped, not queued for forever.
+            .retain(|tx| lines.iter().all(|l| tx.try_send(l.clone()).is_ok()));
     }
 }
+
+/// How much of a machine's error is kept.
+const MAX_ERROR_CHARS: usize = 300;
 
 /// Shared between the scan loop, the remote pollers and socket clients.
 #[derive(Default)]
@@ -196,7 +201,10 @@ impl Registry {
         };
         let fresh = slot.status != MachineStatus::Unreachable;
         slot.status = MachineStatus::Unreachable;
-        slot.error = Some(error);
+        // A remote's whole stderr (up to megabytes) would ride along in every
+        // push, which Zellij gets as one argument of at most 128 KiB.
+        let error = error.chars().map(|c| if c.is_control() { ' ' } else { c });
+        slot.error = Some(error.take(MAX_ERROR_CHARS).collect());
         if fresh {
             let line = machine_line(slot);
             inner.changes += 1;
@@ -216,7 +224,7 @@ impl Registry {
     }
 
     /// Register a subscriber; it first receives the current snapshot.
-    pub fn subscribe(&self, tx: Sender<String>) {
+    pub fn subscribe(&self, tx: SyncSender<String>) {
         let mut inner = self.lock();
         let snapshot = StateV1::new(inner.generated_at, inner.machines.clone());
         if tx
@@ -437,7 +445,7 @@ mod tests {
         let reg = Registry::default();
         reg.publish(machine(vec![agent(1, AgentState::Idle, 0)]), 0);
         reg.publish(machine(vec![]), 1);
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(16);
         reg.subscribe(tx);
         rx.recv().unwrap();
         reg.publish(machine(vec![]), 1 + DONE_RETAIN_SECS);
@@ -449,10 +457,21 @@ mod tests {
     }
 
     #[test]
+    fn a_subscriber_that_falls_behind_is_dropped() {
+        let reg = Registry::default();
+        let (tx, rx) = mpsc::sync_channel(1);
+        reg.subscribe(tx);
+        // The snapshot fills its backlog; the change finds no room.
+        reg.publish(machine(vec![agent(1, AgentState::Idle, 0)]), 0);
+        assert!(rx.recv().unwrap().contains("snapshot"));
+        assert!(rx.recv().is_err(), "dropped, not blocked or queued");
+    }
+
+    #[test]
     fn subscribers_hear_machines_go_and_come_back() {
         let reg = Registry::default();
         reg.publish(machine(vec![]), 0);
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(16);
         reg.subscribe(tx);
         rx.recv().unwrap();
         reg.mark_unreachable(machine(vec![]), "timeout".into());
@@ -461,6 +480,10 @@ mod tests {
             line.contains("\"event\":\"machine\"") && line.contains("\"unreachable\""),
             "{line}"
         );
+        let long = format!("ssh: failed\n{}", "x".repeat(1 << 20));
+        reg.mark_unreachable(machine(vec![]), long);
+        let error = reg.snapshot().machines[0].error.clone().unwrap();
+        assert!(error.starts_with("ssh: failed x") && error.len() == MAX_ERROR_CHARS);
         // Still unreachable: nothing new to say.
         reg.mark_unreachable(machine(vec![]), "timeout".into());
         assert!(rx.try_recv().is_err());
@@ -522,7 +545,7 @@ mod tests {
     #[test]
     fn subscribers_get_snapshot_then_changes() {
         let reg = Registry::default();
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(16);
         reg.subscribe(tx);
         assert!(rx.recv().unwrap().starts_with("{\"event\":\"snapshot\""));
         reg.publish(machine(vec![agent(1, AgentState::Idle, 0)]), 1);

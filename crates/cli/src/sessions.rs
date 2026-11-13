@@ -146,7 +146,15 @@ impl Store {
     /// they are exactly what a restore after a reboot needs.
     pub fn record(&mut self, agents: &[Agent], now: u64) -> bool {
         let mut changed = false;
-        for a in agents.iter().filter(|a| a.state != AgentState::Done) {
+        let live = agents.iter().filter(|a| a.state != AgentState::Done);
+        // Panes a live conversation holds right now: never superseded below.
+        let held: Vec<String> = live
+            .clone()
+            .filter(|a| a.session_id.is_some())
+            .filter_map(|a| a.pane.as_ref())
+            .map(|p| format!("{}:{}", p.session, p.pane_id))
+            .collect();
+        for a in live {
             let Some(pane) = &a.pane else {
                 continue;
             };
@@ -177,6 +185,11 @@ impl Store {
                 .get(&rec.key())
                 .is_none_or(|old| !old.same_session(&rec))
             {
+                // The conversation moved here (a restore opens a new pane):
+                // its old pane must not reopen it a second time.
+                self.panes.retain(|k, old| {
+                    held.contains(k) || (&old.kind, &old.session_id) != (&rec.kind, &rec.session_id)
+                });
                 self.panes.insert(rec.key(), rec);
                 changed = true;
             }
@@ -195,6 +208,15 @@ impl Store {
             .values()
             .filter(|r| session.is_none_or(|s| r.session == s))
         {
+            // Files written before records were deduplicated may list one
+            // conversation in several panes: reopen it once, where it was last.
+            let newer = self.panes.values().any(|o| {
+                (&o.kind, &o.session_id) == (&rec.kind, &rec.session_id)
+                    && (o.updated_at, o.key()) > (rec.updated_at, rec.key())
+            });
+            if newer {
+                continue;
+            }
             let running = live.iter().any(|a| {
                 a.state != AgentState::Done
                     && a.kind == rec.kind
@@ -293,6 +315,32 @@ mod tests {
         let other = [agent(3, "aider", "dev", 1, None, AgentState::Idle)];
         assert!(store.record(&other, 30));
         assert!(store.panes.is_empty());
+    }
+
+    #[test]
+    fn a_conversation_that_moved_pane_is_recorded_once() {
+        let mut store = Store::default();
+        store.record(
+            &[agent(1, "claude", "dev", 3, Some("c1"), AgentState::Idle)],
+            10,
+        );
+        // Restored into pane 12 after a reboot.
+        let moved = [agent(2, "claude", "dev", 12, Some("c1"), AgentState::Idle)];
+        assert!(store.record(&moved, 20));
+        assert_eq!(store.panes.keys().collect::<Vec<_>>(), ["dev:12"]);
+        // Open in two panes at once: both stay, and nothing churns.
+        let both = [
+            agent(3, "claude", "dev", 3, Some("c1"), AgentState::Idle),
+            agent(2, "claude", "dev", 12, Some("c1"), AgentState::Idle),
+        ];
+        assert!(store.record(&both, 30));
+        assert!(!store.record(&both, 40));
+        assert_eq!(store.panes.len(), 2);
+        // A restore reopens it once, from the pane it was last in.
+        store.panes.get_mut("dev:3").unwrap().updated_at = 50;
+        let (plans, _) = store.plan(None, &[]);
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].record.pane_id, 3);
     }
 
     #[test]

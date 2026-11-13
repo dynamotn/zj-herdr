@@ -6,6 +6,8 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.5] - 2026-11-13
+
 ### Changed
 
 - The daemon spawns far fewer `zellij` processes: it asks each session
@@ -13,6 +15,11 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   for its tabs every 15 s instead of 5 s. With many sessions the old rate
   kept every Zellij server, and the terminal showing them, busy. A client
   that attaches is now noticed within 10 s, and a moved tab within 15 s.
+
+## [0.3.4] - 2026-11-13
+
+### Changed
+
 - A hidden rail no longer rebuilds its view four times a second; it catches
   up when it shows.
 - Each scan no longer walks every thread on the machine, only processes:
@@ -178,7 +185,9 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `start_daemon` to launch the daemon from Zellij.
 - Release archives of the CLI for Linux and macOS, and the plugin wasm.
 
-[Unreleased]: https://github.com/dynamotn/zj-herdr/compare/v0.3.3...HEAD
+[Unreleased]: https://github.com/dynamotn/zj-herdr/compare/v0.3.5...HEAD
+[0.3.5]: https://github.com/dynamotn/zj-herdr/compare/v0.3.4...v0.3.5
+[0.3.4]: https://github.com/dynamotn/zj-herdr/compare/v0.3.3...v0.3.4
 [0.3.3]: https://github.com/dynamotn/zj-herdr/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/dynamotn/zj-herdr/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/dynamotn/zj-herdr/compare/v0.3.0...v0.3.1

@@ -19,9 +19,10 @@ Every two seconds the daemon checks which Zellij sessions have a client
 attached and pushes the state to them with
 `zellij --session S pipe --name zj_herdr.state.v1`. A session gets it when
 something changed, when five seconds passed since the last push, or when a
-client has just attached. A session nobody is attached to gets nothing, and
-catches up when one attaches. It also asks each such session for its tab
-layout (`zellij action list-panes --json --tab`, at most every 5 s) and sends
+client has just attached (noticed within 10 s: each session is asked for its
+clients at most that often). A session nobody is attached to gets nothing,
+and catches up when one attaches. It also asks each such session for its tab
+layout (`zellij action list-panes --json --tab`, at most every 15 s) and sends
 the result as `pane.tab` (`{"position":0,"name":"api"}`, absent when
 unknown).
 

@@ -29,8 +29,12 @@ const PUSH_POLL: Duration = Duration::from_secs(2);
 /// Re-push unchanged state this often so a plugin loaded after the last
 /// change, or a new session, fills in within a few seconds.
 const PUSH_HEARTBEAT: Duration = Duration::from_secs(5);
+/// Ask a session whether a client is attached at most this often. Every
+/// question spawns `zellij` and wakes that session's server, so asking each
+/// session every [`PUSH_POLL`] grew with the number of sessions.
+const ATTACH_REFRESH: Duration = Duration::from_secs(10);
 /// Ask a session for its panes' tabs at most this often.
-pub const TAB_REFRESH_SECS: u64 = 5;
+pub const TAB_REFRESH_SECS: u64 = 15;
 
 /// The tab of every agent's pane, so the plugin can group agents of
 /// sessions Zellij did not describe to it. One `list-panes` per session
@@ -222,9 +226,25 @@ struct Pusher {
     last: Option<Instant>,
     /// Sessions attached at the last round.
     before: Vec<String>,
+    /// Per session: when `list-clients` was last asked, and its answer.
+    clients: HashMap<String, (Instant, bool)>,
 }
 
 impl Pusher {
+    /// Whether `session` has a client, asking Zellij only when the cached
+    /// answer is older than [`ATTACH_REFRESH`]. An unanswered `list-clients`
+    /// counts as attached: better a wasted pipe than a rail left stale.
+    fn attached(&mut self, zellij: &dyn Zellij, session: &str, now: Instant) -> bool {
+        match self.clients.get(session) {
+            Some(&(at, yes)) if now.duration_since(at) < ATTACH_REFRESH => yes,
+            _ => {
+                let yes = zellij.attached(session).unwrap_or(true);
+                self.clients.insert(session.to_string(), (now, yes));
+                yes
+            }
+        }
+    }
+
     /// One round at `now`: deliver the state where [`push_targets`] says.
     fn round(
         &mut self,
@@ -238,11 +258,10 @@ impl Pusher {
                 .last
                 .is_none_or(|l| now.duration_since(l) >= PUSH_HEARTBEAT);
         let sessions = zellij.sessions()?;
-        // An unanswered `list-clients` counts as attached: better a wasted
-        // pipe than a rail left stale.
+        self.clients.retain(|s, _| sessions.contains(s));
         let attached: Vec<String> = sessions
             .into_iter()
-            .filter(|s| zellij.attached(s).unwrap_or(true))
+            .filter(|s| self.attached(zellij, s, now))
             .collect();
         let targets = push_targets(&attached, &self.before, due);
         self.before = attached;
@@ -318,13 +337,14 @@ mod tests {
     }
 
     /// Sessions `a` (attached), `b` (detached) and `c` (unanswered, and its
-    /// pipe fails unless `healthy`); records each pipe, run and `panes`
-    /// question. `panes` answers for `dev` only.
+    /// pipe fails unless `healthy`); records each pipe, run, `list-clients`
+    /// and `panes` question. `panes` answers for `dev` only.
     #[derive(Default)]
     struct FakeZellij {
         down: bool,
         healthy: bool,
         piped: Mutex<Vec<String>>,
+        clients: Mutex<Vec<String>>,
         asked: Mutex<Vec<String>>,
         ran: Mutex<Vec<String>>,
     }
@@ -337,6 +357,7 @@ mod tests {
             Ok(vec!["a".into(), "b".into(), "c".into()])
         }
         fn attached(&self, session: &str) -> Result<bool, String> {
+            self.clients.lock().unwrap().push(session.to_string());
             match session {
                 "c" => Err("timeout".into()),
                 s => Ok(s == "a"),
@@ -419,6 +440,27 @@ mod tests {
         };
         assert_eq!(Pusher::default().round(&registry, &healthy, later), Ok(()));
         assert_eq!(*healthy.piped.lock().unwrap(), ["a", "c"]);
+    }
+
+    #[test]
+    fn pusher_asks_each_session_for_clients_once_per_refresh() {
+        let registry = Registry::default();
+        let zellij = FakeZellij::default();
+        let asked = || std::mem::take(&mut *zellij.clients.lock().unwrap());
+        let mut pusher = Pusher::default();
+        let t0 = Instant::now();
+        let _ = pusher.round(&registry, &zellij, t0);
+        assert_eq!(asked(), ["a", "b", "c"]);
+        // Within the refresh the cached answers serve, even on a heartbeat.
+        let _ = pusher.round(&registry, &zellij, t0 + PUSH_HEARTBEAT);
+        assert!(asked().is_empty());
+        assert_eq!(pusher.before, ["a", "c"]);
+        let _ = pusher.round(&registry, &zellij, t0 + ATTACH_REFRESH);
+        assert_eq!(asked(), ["a", "b", "c"]);
+        // A session that is gone is forgotten.
+        pusher.clients.insert("old".into(), (t0, true));
+        let _ = pusher.round(&registry, &zellij, t0 + ATTACH_REFRESH);
+        assert!(!pusher.clients.contains_key("old"));
     }
 
     #[test]

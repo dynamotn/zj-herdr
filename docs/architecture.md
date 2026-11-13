@@ -39,10 +39,11 @@ A Cargo workspace of three crates:
 - **Push.** Every two seconds the daemon lists the Zellij sessions that have
   a client attached and pipes the snapshot to those that need it: when
   something changed, every five seconds as a heartbeat, or when a client
-  just attached. The pipe is `zellij --session S pipe --name
+  just attached. Each session is asked whether it has a client at most
+  every 10 s. The pipe is `zellij --session S pipe --name
   zj_herdr.state.v1 -- <json>`. A session nobody watches is not touched.
   The daemon also asks each such session for its panes' tabs, at most every
-  5 s, so the rail can place agents in tabs Zellij does not describe.
+  15 s, so the rail can place agents in tabs Zellij does not describe.
 - **Rail.** The plugin receives the snapshot and draws it. It reaches Zellij
   only through a `Host` trait (`app.rs`), which is why its behaviour is
   tested natively. How it builds the tree is in

@@ -8,6 +8,11 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- The daemon spawns far fewer `zellij` processes: it asks each session
+  whether a client is attached at most every 10 s instead of every 2 s, and
+  for its tabs every 15 s instead of 5 s. With many sessions the old rate
+  kept every Zellij server, and the terminal showing them, busy. A client
+  that attaches is now noticed within 10 s, and a moved tab within 15 s.
 - A hidden rail no longer rebuilds its view four times a second; it catches
   up when it shows.
 - Each scan no longer walks every thread on the machine, only processes:

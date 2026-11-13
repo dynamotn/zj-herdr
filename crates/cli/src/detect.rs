@@ -108,7 +108,12 @@ fn status(proc: &ProcInfo, transcript: Transcript) -> AgentStatus {
     let tasks: Vec<Task> = transcript
         .tasks
         .into_iter()
-        .filter(|t| t.state == TaskState::Running || now.saturating_sub(t.ended) < TASK_LINGER_SECS)
+        .filter(|t| match t.state {
+            // Launched by an earlier process of a resumed session: it died
+            // with that process, and no notification will ever end it.
+            TaskState::Running => t.started >= proc.start_time,
+            _ => now.saturating_sub(t.ended) < TASK_LINGER_SECS,
+        })
         .collect();
     // A turn that ended while bounded work it started still runs is not
     // over: each finished task wakes the agent again. Services never hold.

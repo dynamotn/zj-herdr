@@ -626,6 +626,21 @@ fn claude_waiting_on_background_work_is_working_but_not_on_a_server() {
 }
 
 #[test]
+fn claude_resumed_after_its_background_work_died_is_idle() {
+    let tmp = tempfile::tempdir().unwrap();
+    claude_background(tmp.path(), "make", "2025-06-15T15:06:40Z");
+    // The resumed process has written since it started.
+    let slug = claude_slug(Path::new("/work/proj"));
+    set_mtime(&tmp.path().join(slug).join("s1.jsonl"), T0 + 45);
+    let detector = ClaudeDetector::new(tmp.path().to_path_buf());
+    let mut p = proc("claude", "/work/proj", T0 + 60, 0.0);
+    p.start_time = T0 + 30;
+    let status = detector.detect(&p).unwrap();
+    assert_eq!(status.state, AgentState::Idle);
+    assert!(status.tasks.is_empty());
+}
+
+#[test]
 fn claude_session_file_says_background_spare_and_name() {
     let (_tmp, projects, sessions) = claude_config();
     install_claude(&projects, "/work/proj", "turn-ended", "s1", T0);

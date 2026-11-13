@@ -10,6 +10,8 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - A hidden rail no longer rebuilds its view four times a second; it catches
   up when it shows.
+- Each scan no longer walks every thread on the machine, only processes:
+  about a third of the CPU per scan on a desktop with a few thousand threads.
 
 ### Fixed
 
@@ -18,6 +20,13 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `earlier`, instead of passing for a shell at its prompt.
 - Agents of a session that fit no tab yet no longer draw inside the last
   tab's card, branching from it and folding away with it.
+- `claude mcp serve` and `codex mcp-server`, started by another agent as
+  MCP servers, no longer show up as a second agent in that agent's pane.
+- A Claude session opened with a prompt that starts with `daemon` or
+  `bg-spare` (`claude "daemon crashes on start"`) is listed again instead of
+  being taken for Claude Code's own machinery.
+- A resumed Claude session no longer stays `working` because of background
+  work its earlier process launched and never saw end.
 - A newline or escape in a command line, pane title or tab name no longer
   splits a rail line and shifts every click target below it.
 

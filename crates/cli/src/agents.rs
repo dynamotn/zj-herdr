@@ -154,10 +154,26 @@ const CLAUDE_SPARE: &str = "bg-spare";
 /// (`"claude bg-spare"`), and newer releases pass it as a flag
 /// (`claude --bg-pty-host <socket>`).
 fn claude_subcommand<'a>(spec: &AgentSpec, argv: &'a [String]) -> Option<&'a str> {
-    (spec.kind == "claude")
-        .then(|| argv.iter().flat_map(|a| a.split_whitespace()).nth(1))
-        .flatten()
+    // Only a retitled `argv[0]` is split: `claude "daemon crashes"` opens
+    // with a prompt, not the `daemon` subcommand.
+    let first = argv.first().filter(|_| spec.kind == "claude")?;
+    first
+        .split_whitespace()
+        .nth(1)
+        .or_else(|| argv.get(1).map(String::as_str))
         .map(|w| w.trim_start_matches("--"))
+}
+
+/// Whether the process serves the agent over MCP to another one
+/// (`claude mcp serve`, `codex mcp-server`): a child in its parent's pane,
+/// never a session of its own.
+pub fn is_mcp_server(argv: &[String]) -> bool {
+    let program = argv
+        .iter()
+        .position(|a| !INTERPRETERS.contains(&basename(a)));
+    program
+        .and_then(|i| argv.get(i + 1))
+        .is_some_and(|w| w == "mcp" || w == "mcp-server")
 }
 
 /// Whether the process hosts the pty of a Claude Code background session:
@@ -363,6 +379,17 @@ mod tests {
             &argv(&["claude bg-pty-host", "--bg-pty-host", "x"])
         ));
         assert!(!is_session_host(claude, &argv(&[bin, "--session-id", "s"])));
+        // An opening prompt is no subcommand.
+        assert!(!is_machinery(claude, &argv(&[bin, "daemon crashes"]), None));
+        assert!(is_machinery(claude, &argv(&[bin, "daemon", "run"]), None));
+        assert!(is_mcp_server(&argv(&[bin, "mcp", "serve"])));
+        assert!(is_mcp_server(&argv(&[
+            "node",
+            "/opt/bin/codex",
+            "mcp-server"
+        ])));
+        assert!(!is_mcp_server(&argv(&[bin, "mcp is broken"])));
+        assert!(!is_mcp_server(&argv(&["python3"])));
         let observer = argv(&[
             bin,
             "--output-format",

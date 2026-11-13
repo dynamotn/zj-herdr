@@ -84,6 +84,7 @@ pub fn find_agents(procs: &[RawProc], self_pid: u32, sampled_at: u64) -> Vec<Pro
             !agents::is_machinery(spec, &p.argv, p.cwd.as_deref())
                 && !agents::is_one_shot(spec, &p.argv)
                 && !agents::is_toolless(spec, &p.argv)
+                && !agents::is_mcp_server(&p.argv)
         })
         .collect();
 
@@ -180,7 +181,10 @@ impl ProcessTable {
     }
 
     fn refresh(&mut self) {
+        // Threads count as processes by default: every one on the machine
+        // would be walked each tick, only to be filtered out.
         let kind = ProcessRefreshKind::nothing()
+            .without_tasks()
             .with_cpu()
             .with_cmd(UpdateKind::OnlyIfNotSet)
             .with_exe(UpdateKind::OnlyIfNotSet)
@@ -229,6 +233,7 @@ fn raw_proc(p: &sysinfo::Process) -> RawProc {
 pub fn snapshot(pid: u32) -> Option<RawProc> {
     let mut sys = System::new();
     let kind = ProcessRefreshKind::nothing()
+        .without_tasks()
         .with_cmd(UpdateKind::Always)
         .with_exe(UpdateKind::Always)
         .with_environ(UpdateKind::Always)

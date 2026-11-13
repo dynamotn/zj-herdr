@@ -53,6 +53,28 @@ pub struct Activity {
     pub ledger: Vec<Finished>,
 }
 
+/// Shell options whose value is no script: `nix-shell` starts
+/// `bash --rcfile <file>` at its prompt.
+const SHELL_VALUE_OPTIONS: &[&str] = &["--rcfile", "--init-file", "-o", "+o", "-O", "+O"];
+
+/// Whether `argv` is a shell at its prompt (or nothing): a shell given a
+/// script or `-c` runs a command (`bash ./x.sh`, `bash -lc 'make'`).
+fn at_prompt(argv: &[String]) -> bool {
+    let Some((first, rest)) = argv.split_first() else {
+        return true;
+    };
+    let mut words = rest.iter();
+    while let Some(w) = words.next() {
+        if !w.starts_with(['-', '+']) {
+            return false;
+        }
+        if SHELL_VALUE_OPTIONS.contains(&w.as_str()) {
+            words.next();
+        }
+    }
+    command::is_shell(first)
+}
+
 impl Activity {
     /// List `done` first, in place of an older entry for the same thing.
     fn push(&mut self, done: Finished) {
@@ -70,8 +92,7 @@ impl Activity {
         }
         // Whatever ran before is over: back at the prompt, or replaced.
         self.finish(pane, false, now);
-        let at_prompt = argv.first().is_none_or(|p| command::is_shell(p))
-            && argv.iter().skip(1).all(|a| a.starts_with('-'));
+        let at_prompt = at_prompt(argv);
         let agent = argv.iter().any(|w| AGENTS.contains(&basename(w)));
         let class = command::classify(&line);
         if at_prompt || agent || class == Class::Interactive {
@@ -321,6 +342,7 @@ mod tests {
             "fish",
             "-zsh",
             "bash -l",
+            "bash --rcfile /tmp/nix-shell.x1",
             "",
         ] {
             a.command(1, &argv(line), 0);
@@ -331,7 +353,11 @@ mod tests {
         a.command(1, &argv("nvim x"), 5);
         assert_eq!(a.ledger[0].label, "make");
         // A script runs under its interpreter's name.
-        for line in ["bash ./scripts/test.sh", "sh -c 'cargo test'"] {
+        for line in [
+            "bash ./scripts/test.sh",
+            "sh -c 'cargo test'",
+            "bash -o vi run.sh",
+        ] {
             a.command(2, &argv(line), 0);
             assert!(a.is_running(2), "{line:?}");
         }

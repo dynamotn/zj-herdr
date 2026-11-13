@@ -47,13 +47,15 @@ pub fn bind(path: &Path) -> io::Result<UnixListener> {
     // Every rail starts a daemon at once: without the lock, two can judge
     // the same socket stale and the second removes the first's live one.
     // Released when `bind` returns, the socket being in place by then. It
-    // never waits: in a shared `/tmp` anyone could hold it.
+    // never waits: in a shared `/tmp` anyone could hold it. Where locks are
+    // unsupported (NFS refuses one on a directory) it goes on without.
     let guard = fs::File::open(dir)?;
-    if unsafe { libc::flock(guard.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        let e = io::Error::last_os_error();
+    let busy = unsafe { libc::flock(guard.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0
+        && io::Error::last_os_error().kind() == io::ErrorKind::WouldBlock;
+    if busy {
         return Err(io::Error::new(
             io::ErrorKind::AddrInUse,
-            format!("another daemon is starting on {} ({e})", path.display()),
+            format!("another daemon is starting on {}", path.display()),
         ));
     }
     if fs::symlink_metadata(path).is_ok() {
